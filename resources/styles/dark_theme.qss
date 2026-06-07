@@ -1,0 +1,147 @@
+/* ============================================================
+ * 机械三维二维图互转 — 深色主题样式表
+ * ============================================================ */
+
+/* --- 全局 --- */
+QMainWindow {
+    background-color: #1e1e1e;
+}
+
+QWidget {
+    font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 9pt;
+    color: #d4d4d4;
+    background-color: #1e1e1e;
+}
+
+/* --- 菜单栏 --- */
+QMenuBar {
+    background-color: #2d2d2d;
+    border-bottom: 1px solid #3c3c3c;
+    color: #d4d4d4;
+}
+
+QMenuBar::item:selected {
+    background-color: #3c3c3c;
+}
+
+QMenu {
+    background-color: #2d2d2d;
+    border: 1px solid #4c4c4c;
+    color: #d4d4d4;
+}
+
+QMenu::item:selected {
+    background-color: #0078d4;
+}
+
+QMenu::separator {
+    background-color: #4c4c4c;
+}
+
+/* --- 工具栏 --- */
+QToolBar {
+    background-color: #2d2d2d;
+    border-bottom: 1px solid #3c3c3c;
+}
+
+QToolButton:hover {
+    background-color: #3c3c3c;
+}
+
+/* --- 状态栏 --- */
+QStatusBar {
+    background-color: #007acc;
+    color: #ffffff;
+}
+
+/* --- Dock 面板 --- */
+QDockWidget::title {
+    background-color: #2d2d2d;
+    border-bottom: 1px solid #3c3c3c;
+    color: #d4d4d4;
+}
+
+/* --- 树形视图 --- */
+QTreeView {
+    background-color: #252526;
+    border: 1px solid #3c3c3c;
+    alternate-background-color: #2d2d2d;
+    color: #d4d4d4;
+}
+
+QTreeView::item:selected {
+    background-color: #0078d4;
+}
+
+QTreeView::item:hover {
+    background-color: #2a2d2e;
+}
+
+/* --- 表格 --- */
+QTableWidget {
+    background-color: #252526;
+    border: 1px solid #3c3c3c;
+    gridline-color: #3c3c3c;
+    alternate-background-color: #2d2d2d;
+    color: #d4d4d4;
+}
+
+QHeaderView::section {
+    background-color: #2d2d2d;
+    border-bottom: 1px solid #3c3c3c;
+    color: #d4d4d4;
+}
+
+/* --- 分割器 --- */
+QSplitter::handle {
+    background-color: #4c4c4c;
+}
+
+/* --- 按钮 --- */
+QPushButton {
+    padding: 6px 16px;
+    border: 1px solid #4c4c4c;
+    border-radius: 4px;
+    background-color: #3c3c3c;
+    color: #d4d4d4;
+}
+
+QPushButton:hover {
+    background-color: #4c4c4c;
+}
+
+QPushButton:default {
+    background-color: #0078d4;
+    border-color: #005a9e;
+}
+
+/* --- 输入控件 --- */
+QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
+    background-color: #3c3c3c;
+    border: 1px solid #4c4c4c;
+    color: #d4d4d4;
+}
+
+QComboBox:hover, QLineEdit:focus {
+    border-color: #0078d4;
+}
+
+/* --- 滚动条 --- */
+QScrollBar:horizontal, QScrollBar:vertical {
+    background-color: #1e1e1e;
+}
+
+QScrollBar::handle {
+    background-color: #5c5c5c;
+}
+
+QScrollBar::handle:hover {
+    background-color: #7c7c7c;
+}
+
+/* --- 对话框 --- */
+QGroupBox {
+    border-color: #4c4c4c;
+    color: #d4d4d4;
+}
