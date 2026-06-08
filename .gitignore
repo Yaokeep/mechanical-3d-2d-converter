@@ -27,9 +27,11 @@ Thumbs.db
 desktop.ini
 
 # 输出产物
-*.dwg
 *.dxf.bak
 *.bak
+
+# 安装器/二进制大文件
+*.exe
 
 # 临时文件
 *.tmp
