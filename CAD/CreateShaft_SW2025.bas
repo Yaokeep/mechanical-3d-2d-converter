@@ -1,196 +1,3 @@
-#!/usr/bin/env python
-"""为 SolidWorks 2025 生成 VBA 阶梯轴建模宏（从 DXF 参数提取）。
-
-用法:
-    python generate_sw_macro.py
-    输出: CAD/CreateShaft_SW2025.bas
-
-SolidWorks 2025 API 关键约定:
-  - 所有长度单位均为 米（meters），宏内部统一用 mm/1000 转换
-  - 所有角度单位均为 弧度（radians）
-  - FeatureRevolve2: 20 参数（SW 2024/2025/2026 统一签名）
-  - InsertFeatureChamfer: 8 参数（替代旧版 FeatureChamfer）
-  - FeatureFillet3: 推荐使用 ISimpleFilletFeatureData2 方式
-  - InsertRefPlane: 偏移约束距离单位为米
-  - FeatureCut3: 26 参数
-"""
-
-import os
-import sys
-
-# ============================================================================
-# 阶梯轴参数（从 DXF 提取，单位: mm）
-# ============================================================================
-SECTIONS = [
-    {"x_start": -233.066, "x_end": -158.466, "radius": 16.0},
-    {"x_start": -157.266, "x_end": -108.466, "radius": 18.5},
-    {"x_start": -107.266, "x_end":  -85.466, "radius": 20.0},
-    {"x_start":  -84.266, "x_end":   79.534, "radius": 23.0},
-    {"x_start":   80.734, "x_end":   86.734, "radius": 25.0},
-    {"x_start":   87.934, "x_end":  171.734, "radius": 21.5},
-    {"x_start":  172.934, "x_end":  221.734, "radius": 20.0},
-]
-
-KEYWAYS = [
-    {"x_start": -216.266, "x_end": -176.266, "width": 10.0, "depth": 5.0, "shaft_radius": 16.0},
-    {"x_start":  110.734, "x_end":  148.734, "width": 12.0, "depth": 6.0, "shaft_radius": 21.5},
-]
-
-CHAMFER_SIZE = 1.2  # mm (C1.2)
-FILLET_R = 1.2      # mm (R1.2)
-
-
-def generate_vba_module(output_path: str):
-    """生成 SW 2025 兼容的 VBA 宏模块。"""
-
-    left_x = SECTIONS[0]["x_start"]
-    left_r = SECTIONS[0]["radius"]
-    right_x = SECTIONS[-1]["x_end"]
-    right_r = SECTIONS[-1]["radius"]
-
-    # ---- 计算阶跃面位置（相邻段间隙中点）----
-    step_x = []
-    for i in range(len(SECTIONS) - 1):
-        mid = (SECTIONS[i]["x_end"] + SECTIONS[i + 1]["x_start"]) / 2.0
-        step_x.append(mid)
-
-    # ---- 构建半剖面轮廓线 ----
-    sketch_lines = []
-
-    def add_line(x1, y1, x2, y2):
-        if abs(x2 - x1) < 1e-6 and abs(y2 - y1) < 1e-6:
-            return
-        sketch_lines.append((x1, y1, x2, y2))
-
-    # 左端面: 中心线 → 顶部
-    add_line(left_x, 0.0, left_x, left_r)
-
-    # 所有段的上表面 + 阶跃
-    for i, s in enumerate(SECTIONS):
-        r = s["radius"]
-        if i == 0:
-            add_line(left_x, r, s["x_end"], r)
-        else:
-            prev_step = step_x[i - 1]
-            prev_r = SECTIONS[i - 1]["radius"]
-            add_line(prev_step, prev_r, prev_step, r)
-            add_line(prev_step, r, s["x_end"], r)
-        if i < len(SECTIONS) - 1:
-            add_line(s["x_end"], r, step_x[i], r)
-
-    # 右端面: 顶部 → 中心线
-    add_line(right_x, right_r, right_x, 0.0)
-
-    # 底部封闭: 沿中心线回到起点
-    add_line(right_x, 0.0, left_x, 0.0)
-
-    # ---- 生成 CreateLine2 调用 ----
-    line_calls = []
-    for x1, y1, x2, y2 in sketch_lines:
-        line_calls.append(
-            "        .CreateLine2 {:.6f}#, {:.6f}#, 0#, {:.6f}#, {:.6f}#, 0#".format(
-                x1, y1, x2, y2
-            )
-        )
-
-    nsteps = len(step_x)
-
-    # ---- 生成 VBA 代码 ----
-    # 圆角边缘选择代码
-    fillet_edge_selects = []
-    for i, sx in enumerate(step_x):
-        r_big = max(SECTIONS[i]["radius"], SECTIONS[i + 1]["radius"])
-        fillet_edge_selects.append(
-            "    ' 阶跃 {}: X={:.3f}, R={:.1f}\n"
-            '    boolstatus = swModel.Extension.SelectByRay( {:.6f}#, {:.6f}#, -0.001, _\n'
-            '        {:.6f}#, {:.6f}#, 0.001, 0.0001, 2, True, 0, Nothing)'.format(
-                i + 1, sx, r_big,
-                sx, r_big,
-                sx, r_big,
-            )
-        )
-
-    # 键槽注释和调用
-    keyway_comment_lines = []
-    keyway_call_lines = []
-    for i, kw in enumerate(KEYWAYS):
-        w = kw["width"]
-        d = kw["depth"]
-        keyway_comment_lines.append(
-            "'   {}. Keyway-{} — {}×{}mm".format(i + 5, i + 1, int(w), int(d))
-        )
-        cx = (kw["x_start"] + kw["x_end"]) / 2.0
-        length = kw["x_end"] - kw["x_start"]
-        hw = w / 2.0
-        sr = kw["shaft_radius"]
-        keyway_call_lines.append(
-            '    CreateKeywayFeature {:.6f}#, {:.6f}#, {:.6f}#, {:.6f}#, {:.6f}#, "Keyway-{}"'.format(
-                cx, length, hw, sr, d, i + 1
-            )
-        )
-
-    # ---- VBA 模板 ----
-    vba = _build_vba_template(
-        left_x=left_x,
-        left_r=left_r,
-        right_x=right_x,
-        right_r=right_r,
-        chamfer=CHAMFER_SIZE,
-        chamfer_m=CHAMFER_SIZE / 1000.0,
-        fillet=R"1.2",
-        fillet_r_m=FILLET_R / 1000.0,
-        nsteps=nsteps,
-        line_block="\n".join(line_calls),
-        contour_count=len(sketch_lines),
-        fillet_edge_selects="\n".join(fillet_edge_selects),
-        keyway_comments="\n".join(keyway_comment_lines),
-        keyway_calls="\n".join(keyway_call_lines),
-        keyway_count=len(KEYWAYS),
-    )
-
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(vba)
-
-    print(f"VBA Macro generated: {output_path}")
-    print(f"Size: {os.path.getsize(output_path):,} bytes")
-    print(f"Contour lines: {len(sketch_lines)}")
-    print(f"Step fillets: {nsteps}")
-    print(f"Keyways: {len(KEYWAYS)}")
-    print(f"Target: SolidWorks 2025")
-    return output_path
-
-
-def _build_vba_template(
-    left_x, left_r, right_x, right_r,
-    chamfer, chamfer_m, fillet, fillet_r_m,
-    nsteps,
-    line_block, contour_count,
-    fillet_edge_selects,
-    keyway_comments, keyway_calls, keyway_count,
-):
-    """构建完整的 VBA 模块字符串。"""
-
-    PI = 3.14159265358979
-    TWO_PI = 2 * PI
-
-    # ---- 构建特征树说明 ----
-    feature_tree_lines = [
-        '           "  1. Revolve-ShaftBody (旋转基体)" & vbCrLf & _',
-        '           "  2. Chamfer-LeftEnd (左端倒角 C{:.1f})" & vbCrLf & _'.format(chamfer),
-        '           "  3. Chamfer-RightEnd (右端倒角 C{:.1f})" & vbCrLf & _'.format(chamfer),
-        '           "  4. Fillet-Transitions (过渡圆角 R{})" & vbCrLf & _'.format(fillet),
-    ]
-    for i in range(keyway_count):
-        kw = KEYWAYS[i]
-        feature_tree_lines.append(
-            '           "  {}. Keyway-{} (键槽 {}×{}mm)" & vbCrLf & _'.format(
-                i + 5, i + 1, int(kw["width"]), int(kw["depth"])
-            )
-        )
-
-    # ---- 完整 VBA 模块 ----
-    vba = """Attribute VB_Name = "CreateShaft_SW2025"
 Option Explicit
 
 '============================================================================
@@ -201,10 +8,11 @@ Option Explicit
 '
 ' 特征树（全部可编辑）:
 '   1. Revolve-ShaftBody   — 360°旋转基体
-'   2. Chamfer-LeftEnd     — 左端面 C{chamfer_r:.1f}
-'   3. Chamfer-RightEnd    — 右端面 C{chamfer_r:.1f}
-'   4. Fillet-Transitions  — 各段过渡 R{fillet_r}（共 {nsteps_} 处）
-'{keyway_comment_block_}
+'   2. Chamfer-LeftEnd     — 左端面 C1.2
+'   3. Chamfer-RightEnd    — 右端面 C1.2
+'   4. Fillet-Transitions  — 各段过渡 R1.2（共 6 处）
+''   5. Keyway-1 — 10×5mm
+'   6. Keyway-2 — 12×6mm
 '
 ' 使用方法:
 '   1. SolidWorks 2025 → 工具 → 宏 → 新建 → 粘贴此代码
@@ -270,14 +78,14 @@ Sub main()
     CreateRevolveShaftBody
 
     ' ====================================================================
-    ' 步骤 2: 端面倒角 C{chamfer_r:.1f} (左 + 右)
+    ' 步骤 2: 端面倒角 C1.2 (左 + 右)
     ' ====================================================================
     Debug.Print vbCrLf & "=== 步骤 2: 端面倒角 ==="
-    CreateEndChamfer {left_x_:.6f}#, {left_r_:.6f}#, {chamfer_m_:.6f}#, "Chamfer-LeftEnd"
-    CreateEndChamfer {right_x_:.6f}#, {right_r_:.6f}#, {chamfer_m_:.6f}#, "Chamfer-RightEnd"
+    CreateEndChamfer -233.066000#, 16.000000#, 0.001200#, "Chamfer-LeftEnd"
+    CreateEndChamfer 221.734000#, 20.000000#, 0.001200#, "Chamfer-RightEnd"
 
     ' ====================================================================
-    ' 步骤 3: 阶跃过渡圆角 R{fillet_r}（共 {nsteps_} 处）
+    ' 步骤 3: 阶跃过渡圆角 R1.2（共 6 处）
     ' ====================================================================
     Debug.Print vbCrLf & "=== 步骤 3: Fillet-Transitions 过渡圆角 ==="
     CreateStepFillets
@@ -286,7 +94,8 @@ Sub main()
     ' 步骤 4: 键槽拉伸切除 (Cut-Extrude)
     ' ====================================================================
     Debug.Print vbCrLf & "=== 步骤 4: 键槽 ==="
-{keyway_call_block_}
+    CreateKeywayFeature -196.266000#, 40.000000#, 5.000000#, 16.000000#, 5.000000#, "Keyway-1"
+    CreateKeywayFeature 129.734000#, 38.000000#, 6.000000#, 21.500000#, 6.000000#, "Keyway-2"
 
     ' ====================================================================
     ' 完成
@@ -296,7 +105,12 @@ Sub main()
 
     MsgBox "阶梯轴模型创建完成！" & vbCrLf & vbCrLf & _
            "特征树:" & vbCrLf & _
-{feature_tree_block_}
+           "  1. Revolve-ShaftBody (旋转基体)" & vbCrLf & _
+           "  2. Chamfer-LeftEnd (左端倒角 C1.2)" & vbCrLf & _
+           "  3. Chamfer-RightEnd (右端倒角 C1.2)" & vbCrLf & _
+           "  4. Fillet-Transitions (过渡圆角 R1.2)" & vbCrLf & _
+           "  5. Keyway-1 (键槽 10×5mm)" & vbCrLf & _
+           "  6. Keyway-2 (键槽 12×6mm)" & vbCrLf & _
            "" & vbCrLf & _
            "请执行: 文件 → 另存为 → 选择 SLDPRT 格式保存", _
            vbInformation, "CreateShaft_SW2025 — 完成"
@@ -321,9 +135,30 @@ Private Sub CreateRevolveShaftBody()
 
     ' 绘制半剖面轮廓 (上半部分 + 中心线)
     With swSketchMgr
-{line_block_}
+        .CreateLine2 -233.066000#, 0.000000#, 0#, -233.066000#, 16.000000#, 0#
+        .CreateLine2 -233.066000#, 16.000000#, 0#, -158.466000#, 16.000000#, 0#
+        .CreateLine2 -158.466000#, 16.000000#, 0#, -157.866000#, 16.000000#, 0#
+        .CreateLine2 -157.866000#, 16.000000#, 0#, -157.866000#, 18.500000#, 0#
+        .CreateLine2 -157.866000#, 18.500000#, 0#, -108.466000#, 18.500000#, 0#
+        .CreateLine2 -108.466000#, 18.500000#, 0#, -107.866000#, 18.500000#, 0#
+        .CreateLine2 -107.866000#, 18.500000#, 0#, -107.866000#, 20.000000#, 0#
+        .CreateLine2 -107.866000#, 20.000000#, 0#, -85.466000#, 20.000000#, 0#
+        .CreateLine2 -85.466000#, 20.000000#, 0#, -84.866000#, 20.000000#, 0#
+        .CreateLine2 -84.866000#, 20.000000#, 0#, -84.866000#, 23.000000#, 0#
+        .CreateLine2 -84.866000#, 23.000000#, 0#, 79.534000#, 23.000000#, 0#
+        .CreateLine2 79.534000#, 23.000000#, 0#, 80.134000#, 23.000000#, 0#
+        .CreateLine2 80.134000#, 23.000000#, 0#, 80.134000#, 25.000000#, 0#
+        .CreateLine2 80.134000#, 25.000000#, 0#, 86.734000#, 25.000000#, 0#
+        .CreateLine2 86.734000#, 25.000000#, 0#, 87.334000#, 25.000000#, 0#
+        .CreateLine2 87.334000#, 25.000000#, 0#, 87.334000#, 21.500000#, 0#
+        .CreateLine2 87.334000#, 21.500000#, 0#, 171.734000#, 21.500000#, 0#
+        .CreateLine2 171.734000#, 21.500000#, 0#, 172.334000#, 21.500000#, 0#
+        .CreateLine2 172.334000#, 21.500000#, 0#, 172.334000#, 20.000000#, 0#
+        .CreateLine2 172.334000#, 20.000000#, 0#, 221.734000#, 20.000000#, 0#
+        .CreateLine2 221.734000#, 20.000000#, 0#, 221.734000#, 0.000000#, 0#
+        .CreateLine2 221.734000#, 0.000000#, 0#, -233.066000#, 0.000000#, 0#
         ' 旋转中心线 (X 轴)
-        .CreateCenterLine2 {left_x_:.6f}#, 0#, 0#, {right_x_:.6f}#, 0#, 0#
+        .CreateCenterLine2 -233.066000#, 0#, 0#, 221.734000#, 0#, 0#
     End With
 
     ' 退出草图
@@ -345,7 +180,7 @@ Private Sub CreateRevolveShaftBody()
         False,      ' BothDirectionUpToSameEntity
         0,          ' Dir1Type = swEndCondBlind (盲孔)
         0,          ' Dir2Type (未使用)
-        {two_pi_}#, ' Dir1Angle = 360° 弧度
+        6.28318530717958#, ' Dir1Angle = 360° 弧度
         0#,         ' Dir2Angle (未使用)
         False,      ' OffsetReverse1
         False,      ' OffsetReverse2
@@ -363,7 +198,7 @@ Private Sub CreateRevolveShaftBody()
             "旋转基体创建失败！请检查草图轮廓是否正确封闭。"
     End If
     swFeat.Name = "Revolve-ShaftBody"
-    Debug.Print "  [OK] Revolve-ShaftBody (360 度旋转, {contour_count} 条轮廓线)"
+    Debug.Print "  [OK] Revolve-ShaftBody (360 度旋转, 22 条轮廓线)"
 End Sub
 
 
@@ -419,7 +254,7 @@ End Sub
 
 
 ' ===========================================================================
-' CreateStepFillets — 对每个阶跃面选择外圆边并创建 R{fillet_r} 过渡圆角
+' CreateStepFillets — 对每个阶跃面选择外圆边并创建 R1.2 过渡圆角
 ' ===========================================================================
 ' 使用预选择边 + FeatureFillet3 方式
 Private Sub CreateStepFillets()
@@ -430,12 +265,29 @@ Private Sub CreateStepFillets()
     totalEdges = 0
 
     ' 用射线逐一选择每个阶跃处的外圆边
-{fillet_edge_selects_block_}
+    ' 阶跃 1: X=-157.866, R=18.5
+    boolstatus = swModel.Extension.SelectByRay( -157.866000#, 18.500000#, -0.001, _
+        -157.866000#, 18.500000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    ' 阶跃 2: X=-107.866, R=20.0
+    boolstatus = swModel.Extension.SelectByRay( -107.866000#, 20.000000#, -0.001, _
+        -107.866000#, 20.000000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    ' 阶跃 3: X=-84.866, R=23.0
+    boolstatus = swModel.Extension.SelectByRay( -84.866000#, 23.000000#, -0.001, _
+        -84.866000#, 23.000000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    ' 阶跃 4: X=80.134, R=25.0
+    boolstatus = swModel.Extension.SelectByRay( 80.134000#, 25.000000#, -0.001, _
+        80.134000#, 25.000000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    ' 阶跃 5: X=87.334, R=25.0
+    boolstatus = swModel.Extension.SelectByRay( 87.334000#, 25.000000#, -0.001, _
+        87.334000#, 25.000000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    ' 阶跃 6: X=172.334, R=21.5
+    boolstatus = swModel.Extension.SelectByRay( 172.334000#, 21.500000#, -0.001, _
+        172.334000#, 21.500000#, 0.001, 0.0001, 2, True, 0, Nothing)
 
     totalEdges = swModel.Extension.GetSelectionCount
-    Debug.Print "  共选中 " & totalEdges & " 条阶跃边 (预期 {nsteps_} 条)"
+    Debug.Print "  共选中 " & totalEdges & " 条阶跃边 (预期 6 条)"
 
-    If totalEdges >= {nsteps_} Then
+    If totalEdges >= 6 Then
         ' FeatureFillet3 — SW 2024/2025 推荐方法
         ' 参数: Options, Radius1, SetbackDist, SetbackType,
         '        TangentPropagation, OverflowType,
@@ -443,7 +295,7 @@ Private Sub CreateStepFillets()
         On Error Resume Next
         Set swFeat = swFeatMgr.FeatureFillet3( _
             0,                  ' Options = swFeatureFilletSimple
-            {fillet_r_m_:.6f}#, ' Radius (米) — R{fillet_r}mm = {fillet_r_m_:.6f}m
+            0.001200#, ' Radius (米) — R1.2mm = 0.001200m
             0, 0,               ' Setback (不使用)
             True,               ' TangentPropagation — 切线延伸
             0,                  ' OverflowType
@@ -452,13 +304,13 @@ Private Sub CreateStepFillets()
 
         If Not swFeat Is Nothing Then
             swFeat.Name = "Fillet-Transitions"
-            Debug.Print "  [OK] Fillet-Transitions (R{fillet_r}, " & totalEdges & " 条边)"
+            Debug.Print "  [OK] Fillet-Transitions (R1.2, " & totalEdges & " 条边)"
         Else
-            Debug.Print "  [WARN] FeatureFillet3 失败，请手动选择所有阶跃边后添加 R{fillet_r} 圆角"
+            Debug.Print "  [WARN] FeatureFillet3 失败，请手动选择所有阶跃边后添加 R1.2 圆角"
         End If
     Else
-        Debug.Print "  [WARN] 仅选中 " & totalEdges & " 条边 (需要 {nsteps_} 条)"
-        Debug.Print "  [INFO] 请手动选择所有 " & {nsteps_} & " 处阶跃外圆边 → 圆角 R{fillet_r}"
+        Debug.Print "  [WARN] 仅选中 " & totalEdges & " 条边 (需要 6 条)"
+        Debug.Print "  [INFO] 请手动选择所有 " & 6 & " 处阶跃外圆边 → 圆角 R1.2"
     End If
 End Sub
 
@@ -573,37 +425,3 @@ Private Sub CreateKeywayFeature( _
     swModel.BlankSketch
     On Error GoTo 0
 End Sub
-""".format(
-        # 主参数
-        left_x_=left_x,
-        left_r_=left_r,
-        right_x_=right_x,
-        right_r_=right_r,
-        chamfer_r=chamfer,
-        chamfer_m_=chamfer_m,
-        fillet_r=fillet,
-        fillet_r_m_=fillet_r_m,
-        nsteps_=nsteps,
-        two_pi_=TWO_PI,
-        contour_count=contour_count,
-        # 替换块
-        line_block_=line_block,
-        fillet_edge_selects_block_=fillet_edge_selects,
-        keyway_comment_block_=keyway_comments,
-        keyway_call_block_=keyway_calls,
-        feature_tree_block_="\n".join(feature_tree_lines),
-    )
-
-    # 修复 Python format 无法处理 VBA 花括号的问题
-    # VBA 模板中不含 { } 字符（除了 Python format 占位符），所以无需额外处理
-    return vba
-
-
-# ===========================================================================
-# 命令行入口
-# ===========================================================================
-if __name__ == "__main__":
-    out = "CAD/CreateShaft_SW2025.bas"
-    if len(sys.argv) > 1:
-        out = sys.argv[1]
-    generate_vba_module(out)

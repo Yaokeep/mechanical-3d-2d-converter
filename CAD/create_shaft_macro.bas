@@ -1,4 +1,3 @@
-Attribute VB_Name = "CreateShaft"
 Option Explicit
 
 '============================================================================
@@ -17,6 +16,9 @@ Option Explicit
 '
 ' 生成自: generate_sw_macro.py
 ' 单位: 毫米 (mm)
+'
+' ⚠️ 已修复 SW 2025 单位转换: API 所有长度单位为米，mm→m 需除以 1000
+' ⚠️ 如需更完整版本，请使用 CAD/CreateShaft_SW2025.bas
 '============================================================================
 
 Dim swApp As SldWorks.SldWorks
@@ -142,7 +144,7 @@ Sub main()
     ' 尝试用当前选择创建圆角
     longstatus = swModel.Extension.GetSelectionCount
     If longstatus >= 6 Then
-        Set swFeat = swModel.FeatureManager.FeatureFillet(1200, 1, 0, 0, 0, 0, 0)
+        Set swFeat = swModel.FeatureManager.FeatureFillet(1.2 / 1000#, 1, 0, 0, 0, 0, 0)  ' R1.2mm = 0.0012m
         If Not swFeat Is Nothing Then
             swFeat.Name = "Fillet-StepTransitions"
             Debug.Print "  圆角特征创建成功: R1.2"
@@ -209,7 +211,9 @@ Private Sub CreateEndChamfer(faceX As Double, radius As Double, _
     selCount = swModel.Extension.GetSelectionCount
     If selCount > 0 Then
         ' FeatureChamfer: chamferType=1 (距离-距离), 两方向距离都等于 chamferSize
-        Set swFeat = swModel.FeatureManager.FeatureChamfer(1, chamferSize * 1000#, chamferSize * 1000#, _
+        Set swFeat = swModel.FeatureManager.InsertFeatureChamfer(0, 2, 0#, 0#, chamferSize / 1000#, 0#, 0#, 0#)
+        ' (旧版 FeatureChamfer 已替换为 SW2025 InsertFeatureChamfer)
+        ' Set swFeat = swModel.FeatureManager.FeatureChamfer(1, chamferSize / 1000#, chamferSize / 1000#, _
             0, 0, 0, 0, 0, 0)
         If Not swFeat Is Nothing Then
             swFeat.Name = featName
@@ -247,7 +251,7 @@ Private Sub CreateKeyway(xStart As Double, xEnd As Double, _
     ' 选择 Front Plane (XY) 并创建偏移基准面
     swModel.ClearSelection2 True
     swModel.Extension.SelectByID2 "Front Plane", "PLANE", 0, 0, 0, False, 0, Nothing, 0
-    Set swPlane = swModel.FeatureManager.InsertRefPlane(8, shaftRadius * 1000#, 0, 0, 0, 0)
+    Set swPlane = swModel.FeatureManager.InsertRefPlane(8, shaftRadius / 1000#, 0, 0, 0, 0)  ' mm→m
     ' refPlaneType=8: Offset distance
 
     If Not swPlane Is Nothing Then
@@ -283,7 +287,7 @@ Private Sub CreateKeyway(xStart As Double, xEnd As Double, _
 
     ' 拉伸切除: 方向向下 (沿 -Y)，深度 = kwDepth
     Set swFeat = swModel.FeatureManager.FeatureCut3(True, False, False, _
-        0, 0, kwDepth * 1000#, kwDepth * 1000#, False, False, False, False, _
+        0, 0, kwDepth / 1000#, kwDepth / 1000#, False, False, False, False, _  ' mm→m
         0, 0, False, False, False, False, False, True, True, True, True, False, 0, 0)
 
     If Not swFeat Is Nothing Then
