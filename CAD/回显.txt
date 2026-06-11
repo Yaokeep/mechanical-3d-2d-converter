@@ -1,0 +1,50 @@
+SW: 33.0.0
+
+=== 0.阶梯轴基体 ===
+  Revolve2=PASS Err=0 feat=13->14
+
+=== 1.Extrusion2 凸台 ===
+  Ext2=PASS Err=0 feat=15->16
+
+=== 2.RevolveCut 退刀槽 ===
+  RevolveCut=PASS Err=0 feat=17->18
+
+=== 3.Cut3 键槽 ===
+  Cut3=PASS Err=0 feat=19->20
+
+=== 4.Extrusion3 轴肩 ===
+  Ext3=PASS Err=0 feat=21->22
+
+=== 5.Chamfer 轴端 ===
+  选边 Err=0
+  Chamfer=PASS Err=0 feat=22->23
+
+=== 6.Fillet 圆角 ===
+  选边 Err=0
+  Fillet=PASS Err=0 feat=23->24
+
+========== 报告 ==========
+特征总数: 24
+  [1] Chamfer
+  [2] Shoulder
+  [3] 草图5
+  [4] Keyway
+  [5] 草图4
+  [6] Groove
+  [7] 草图3
+  [8] Boss-Ring
+  [9] 草图2
+  [10] Shaft
+  [11] 草图1
+  [12] 原点
+  [13] 右视基准面
+  [14] 上视基准面
+  [15] 前视基准面
+  [16] 材质 <未指定>
+  [17] 方程式
+  [18] 注解
+  [19] 光源与相机
+  [20] 实体
+  [21] 曲面实体
+  [22] 设计活页夹
+  [23] 评论
