@@ -13,6 +13,11 @@ pythonocc-core>=7.7.2,<8.0.0
 # --- 文件格式支持 ---
 ezdxf>=1.1.0,<2.0.0       # DXF 读写
 
+# --- SolidWorks 自动化 (可选) ---
+# Windows 需通过 pip 安装:
+#   pip install pywin32
+pywin32>=306               # SW COM 驱动（Windows only）
+
 # --- 工具库 ---
 loguru>=0.7.2,<1.0.0      # 结构化日志
 numpy>=1.24.0,<2.0.0      # 数值计算

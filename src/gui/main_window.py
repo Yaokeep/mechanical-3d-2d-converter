@@ -2,19 +2,19 @@
 
 import os
 from PyQt6.QtWidgets import (
-    QMainWindow, QSplitter, QMenuBar, QMenu, QToolBar,
-    QStatusBar, QLabel, QDockWidget, QMessageBox,
-    QFileDialog, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QFrame,
+    QMainWindow, QSplitter, QToolBar,
+    QStatusBar, QLabel, QMessageBox,
+    QFileDialog, QWidget, QVBoxLayout,
 )
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
-from PyQt6.QtGui import QAction, QKeySequence, QIcon
+from PyQt6.QtGui import QAction, QKeySequence
 
 from src.gui.view3d.view3d_widget import View3DWidget
 from src.gui.view2d.view2d_widget import View2DWidget
 from src.gui.dock_widgets.project_tree import ProjectTreeDock
 from src.gui.dock_widgets.property_panel import PropertyPanelDock
 from src.gui.dock_widgets.output_console import OutputConsoleDock
+from src.utils.thread_worker import ThreadWorker
 
 
 class MainWindow(QMainWindow):
@@ -25,7 +25,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("机械三维二维图互转 v0.3.0")
+        self.setWindowTitle("机械三维二维图互转 v0.4.0")
         self.resize(1400, 900)
         self.setMinimumSize(1024, 600)
 
@@ -147,6 +147,31 @@ class MainWindow(QMainWindow):
         self._act_import_dxf_section = QAction("从 DXF 导入截面(&D)...", self)
         self._act_import_dxf_section.setToolTip("导入 DXF 文件中的闭合轮廓作为拉伸/旋转截面")
         self._reconstruct_menu.addAction(self._act_import_dxf_section)
+
+        # ---- SolidWorks 菜单 ----
+        self._sw_menu = menubar.addMenu("SolidWorks(&W)")
+
+        self._act_sw_connect = QAction("连接 SolidWorks 2025", self)
+        self._act_sw_connect.setToolTip("测试与 SW 2025 的 COM 连接")
+        self._sw_menu.addAction(self._act_sw_connect)
+
+        self._act_sw_shaft = QAction("阶梯轴参数化建模(&S)...", self)
+        self._act_sw_shaft.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self._act_sw_shaft.setToolTip("在 SolidWorks 2025 中一键生成完整阶梯轴模型")
+        self._sw_menu.addAction(self._act_sw_shaft)
+
+        self._sw_menu.addSeparator()
+
+        self._act_sw_dxf_to_sw = QAction("从 DXF 提取轴参数...", self)
+        self._act_sw_dxf_to_sw.setToolTip("导入 DXF 工程图，提取阶梯轴参数用于 SW 建模")
+        self._sw_menu.addAction(self._act_sw_dxf_to_sw)
+
+        self._sw_menu.addSeparator()
+
+        self._act_sw_export = QAction("导出当前模型到 SW...", self)
+        self._act_sw_export.setToolTip("将 3D 模型以 STEP 格式导入到 SolidWorks（开发中）")
+        self._act_sw_export.setEnabled(False)
+        self._sw_menu.addAction(self._act_sw_export)
 
         # ---- 帮助菜单 ----
         self._help_menu = menubar.addMenu("帮助(&H)")
@@ -271,6 +296,11 @@ class MainWindow(QMainWindow):
         # 2D→3D 重建信号（骨架阶段打印日志）
         self._act_extrude.triggered.connect(self._on_extrude)
         self._act_revolve.triggered.connect(self._on_revolve)
+
+        # SolidWorks 信号
+        self._act_sw_connect.triggered.connect(self._on_sw_connect)
+        self._act_sw_shaft.triggered.connect(self._on_sw_shaft)
+        self._act_sw_dxf_to_sw.triggered.connect(self._on_sw_dxf_to_sw)
 
         # DXF 导入信号
         self._act_import_dxf.triggered.connect(self._on_import_dxf)
@@ -402,19 +432,114 @@ class MainWindow(QMainWindow):
             return
         self._status_label.setText(f"DXF 截面导入 — 功能开发中: {os.path.basename(path)}")
 
+    # ---- SolidWorks 槽函数 ----
+
+    def _on_sw_connect(self) -> None:
+        """测试 SolidWorks 2025 连接。"""
+        self._status_label.setText("正在连接 SolidWorks 2025 ...")
+        self._console_dock.info("SolidWorks 连接诊断中 ...")
+        try:
+            from src.core.sw_automation import check_sw_connection
+
+            # 在后台线程中检查连接
+            def _check():
+                return check_sw_connection(visible=True)
+
+            worker = ThreadWorker(_check)
+            worker.finished.connect(
+                lambda ok: self._status_label.setText(
+                    "SolidWorks 2025 连接正常！" if ok else "SolidWorks 连接失败"
+                )
+            )
+            worker.error.connect(
+                lambda e: self._console_dock.error(f"SW 连接错误: {e}")
+            )
+            worker.start()
+        except ImportError as e:
+            self._console_dock.error(
+                f"无法导入 SW 模块: {e}\n请安装 pywin32: pip install pywin32"
+            )
+            self._status_label.setText("SW 模块导入失败 — 缺少 pywin32")
+            QMessageBox.warning(
+                self, "缺少依赖",
+                f"SolidWorks 自动化需要 pywin32 库。\n\n"
+                f"请运行: pip install pywin32\n\n"
+                f"错误: {e}"
+            )
+
+    def _on_sw_shaft(self) -> None:
+        """打开 SolidWorks 阶梯轴参数化建模对话框。"""
+        try:
+            from src.gui.dialogs.sw_dialog import SwShaftDialog
+
+            dialog = SwShaftDialog(self)
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.show()
+        except ImportError as e:
+            self._console_dock.error(f"无法打开 SW 对话框: {e}")
+            QMessageBox.warning(
+                self, "缺少依赖",
+                "SolidWorks 自动化需要 pywin32 库。\n\n请运行: pip install pywin32"
+            )
+
+    def _on_sw_dxf_to_sw(self) -> None:
+        """从 DXF 提取参数并打开 SW 建模对话框。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "从 DXF 提取阶梯轴参数", "",
+            "DXF 文件 (*.dxf);;所有文件 (*.*)",
+        )
+        if not path:
+            return
+
+        self._status_label.setText(f"正在从 DXF 提取轴参数: {os.path.basename(path)}")
+        self._console_dock.info(f"DXF → SW 参数提取: {path}")
+
+        try:
+            # 尝试导入转换脚本中的提取函数
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+            from convert_dwg_to_3d import extract_shaft_params
+
+            sections, keyways = extract_shaft_params(path)
+            if sections:
+                from src.gui.dialogs.sw_dialog import SwShaftDialog
+                dialog = SwShaftDialog(self)
+                dialog.set_sections(sections)
+                dialog.set_keyways(keyways)
+                dialog.setWindowModality(Qt.WindowModality.NonModal)
+                dialog.show()
+                self._status_label.setText(
+                    f"DXF 参数已提取: {len(sections)} 轴段, {len(keyways)} 键槽"
+                )
+                self._console_dock.success(
+                    f"DXF 参数提取成功: {len(sections)} 段, {len(keyways)} 键槽"
+                )
+            else:
+                self._console_dock.warning("DXF 参数提取结果为空")
+                QMessageBox.warning(self, "提取失败", "未能从 DXF 中提取有效的轴段参数。")
+        except ImportError:
+            self._console_dock.warning("DXF 参数提取模块未就绪，打开空对话框")
+            # 降级：打开空对话框让用户手动输入
+            from src.gui.dialogs.sw_dialog import SwShaftDialog
+            dialog = SwShaftDialog(self)
+            dialog.show()
+        except Exception as e:
+            self._console_dock.error(f"DXF 参数提取失败: {e}")
+            QMessageBox.critical(self, "提取失败", f"无法从 DXF 提取参数:\n{e}")
+
     def _on_about(self) -> None:
         """显示关于对话框"""
         QMessageBox.about(
             self,
             "关于 机械三维二维图互转",
-            "<h3>机械三维二维图互转 v0.3.0</h3>"
+            "<h3>机械三维二维图互转 v0.4.0</h3>"
             "<p>机械工程 3D ↔ 2D 双向互转桌面工具</p>"
-            "<p>技术栈：PyQt6 + OpenCASCADE (PythonOCC)</p>"
+            "<p>技术栈：PyQt6 + OpenCASCADE (PythonOCC) + SolidWorks COM</p>"
             "<hr>"
             "<p>核心功能：</p>"
             "<p><b>3D → 2D</b>：三视图投影 · 轴测图 · 剖面图 · HLR 消隐 · DXF 导出</p>"
             "<p><b>2D → 3D</b>：DXF 截面导入 · 拉伸建模 · 旋转建模 · STEP/IGES 导出</p>"
-            "<p>支持格式：STEP · IGES · STL · DXF</p>",
+            "<p><b>SW 2025</b>：COM 驱动 · 阶梯轴参数化建模 · DXF→SW 一键生成</p>",
         )
 
     # ------------------------- 公共方法 -------------------------
