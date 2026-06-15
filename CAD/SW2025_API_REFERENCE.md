@@ -391,7 +391,10 @@ swModel.Extension.SelectByID2 "Front Plane", "PLANE", ...    ' ❌ 返回 Nothin
 |------|------|------|
 | `generate_sw_macro.py` | ⚠️ 待更新 | 仍用 CreateLine2, SelectByRay 等旧 API |
 | `sw2025_create_shaft.py` | ⚠️ 待更新 | Python COM 驱动, 同上 |
-| `CreateShaft_SW2025.bas` | ⚠️ 待更新 | 生成的宏含多处未验证 API |
+| `CreateShaft_SW2025.bas` | ✅ 已同步 | 2026-06-15 同步至 V45 成果 |
 | `create_shaft_macro.bas` | ⚠️ 待更新 | 旧版手写宏 |
+| `src/core/sw_automation/sw_driver.py` | ✅ 已同步 | 2026-06-15 同步至 V45 成果 |
+| `src/core/sw_automation/sw_shaft_builder.py` | ✅ 已同步 | 2026-06-15 同步至 V45 成果 |
+| `src/core/sw_automation/sw_constants.py` | ✅ 已同步 | 新增 SW_FILLET_OPTIONS=195 |
 
-> **下一步**: 将 v45 验证成果同步到生产文件。
+> **2026-06-15 同步内容**: FeatureFillet3 Options=195, SelectByRay→SelectByID2, CreateLine2→CreateLine, Chamfer Type=1, 草图不提前关闭, InsertRefPlane 中文名。

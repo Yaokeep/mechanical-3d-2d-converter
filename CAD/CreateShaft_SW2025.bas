@@ -3,7 +3,7 @@ Option Explicit
 '============================================================================
 ' CreateShaft_SW2025 — SolidWorks 2025 阶梯轴参数化建模宏
 '============================================================================
-' 生成自: generate_sw_macro.py (SW2025 API)
+' 同步自: VerifySW2025_v45.bas (V45 验证成果)
 ' 单位系统: 草图使用 mm，API 调用自动转换为 米
 '
 ' 特征树（全部可编辑）:
@@ -11,16 +11,22 @@ Option Explicit
 '   2. Chamfer-LeftEnd     — 左端面 C1.2
 '   3. Chamfer-RightEnd    — 右端面 C1.2
 '   4. Fillet-Transitions  — 各段过渡 R1.2（共 6 处）
-''   5. Keyway-1 — 10×5mm
+'   5. Keyway-1 — 10×5mm
 '   6. Keyway-2 — 12×6mm
+'
+' V45 关键规则:
+'   - FeatureFillet3 Options 必须 = 195 (0 和 1 均静默失败)
+'   - SelectByRay 不存在于 SW2025 → 改用 SelectByID2 "EDGE"
+'   - 草图方法已重命名: CreateLine2→CreateLine, CreateCenterLine2→CreateCenterLine
+'   - 特征方法必须在草图打开时调用 (不要在特征前关闭草图!)
+'   - Chamfer 使用 Type=1 角度-距离模式
+'   - InsertRefPlane 基准面名必须用中文
 '
 ' 使用方法:
 '   1. SolidWorks 2025 → 工具 → 宏 → 新建 → 粘贴此代码
 '   2. 按 F5 或点击"运行"
 '   3. 检查特征树确认所有特征创建成功
 '   4. 文件 → 另存为 → SLDPRT
-'
-' 注意: 如果某特征创建失败，代码会回退到手动提示
 '============================================================================
 
 ' ----- SW 2025 枚举常量（避免依赖类型库引用）-----
@@ -135,34 +141,33 @@ Private Sub CreateRevolveShaftBody()
 
     ' 绘制半剖面轮廓 (上半部分 + 中心线)
     With swSketchMgr
-        .CreateLine2 -233.066000#, 0.000000#, 0#, -233.066000#, 16.000000#, 0#
-        .CreateLine2 -233.066000#, 16.000000#, 0#, -158.466000#, 16.000000#, 0#
-        .CreateLine2 -158.466000#, 16.000000#, 0#, -157.866000#, 16.000000#, 0#
-        .CreateLine2 -157.866000#, 16.000000#, 0#, -157.866000#, 18.500000#, 0#
-        .CreateLine2 -157.866000#, 18.500000#, 0#, -108.466000#, 18.500000#, 0#
-        .CreateLine2 -108.466000#, 18.500000#, 0#, -107.866000#, 18.500000#, 0#
-        .CreateLine2 -107.866000#, 18.500000#, 0#, -107.866000#, 20.000000#, 0#
-        .CreateLine2 -107.866000#, 20.000000#, 0#, -85.466000#, 20.000000#, 0#
-        .CreateLine2 -85.466000#, 20.000000#, 0#, -84.866000#, 20.000000#, 0#
-        .CreateLine2 -84.866000#, 20.000000#, 0#, -84.866000#, 23.000000#, 0#
-        .CreateLine2 -84.866000#, 23.000000#, 0#, 79.534000#, 23.000000#, 0#
-        .CreateLine2 79.534000#, 23.000000#, 0#, 80.134000#, 23.000000#, 0#
-        .CreateLine2 80.134000#, 23.000000#, 0#, 80.134000#, 25.000000#, 0#
-        .CreateLine2 80.134000#, 25.000000#, 0#, 86.734000#, 25.000000#, 0#
-        .CreateLine2 86.734000#, 25.000000#, 0#, 87.334000#, 25.000000#, 0#
-        .CreateLine2 87.334000#, 25.000000#, 0#, 87.334000#, 21.500000#, 0#
-        .CreateLine2 87.334000#, 21.500000#, 0#, 171.734000#, 21.500000#, 0#
-        .CreateLine2 171.734000#, 21.500000#, 0#, 172.334000#, 21.500000#, 0#
-        .CreateLine2 172.334000#, 21.500000#, 0#, 172.334000#, 20.000000#, 0#
-        .CreateLine2 172.334000#, 20.000000#, 0#, 221.734000#, 20.000000#, 0#
-        .CreateLine2 221.734000#, 20.000000#, 0#, 221.734000#, 0.000000#, 0#
-        .CreateLine2 221.734000#, 0.000000#, 0#, -233.066000#, 0.000000#, 0#
+        .CreateLine -233.066000#, 0.000000#, 0#, -233.066000#, 16.000000#, 0#
+        .CreateLine -233.066000#, 16.000000#, 0#, -158.466000#, 16.000000#, 0#
+        .CreateLine -158.466000#, 16.000000#, 0#, -157.866000#, 16.000000#, 0#
+        .CreateLine -157.866000#, 16.000000#, 0#, -157.866000#, 18.500000#, 0#
+        .CreateLine -157.866000#, 18.500000#, 0#, -108.466000#, 18.500000#, 0#
+        .CreateLine -108.466000#, 18.500000#, 0#, -107.866000#, 18.500000#, 0#
+        .CreateLine -107.866000#, 18.500000#, 0#, -107.866000#, 20.000000#, 0#
+        .CreateLine -107.866000#, 20.000000#, 0#, -85.466000#, 20.000000#, 0#
+        .CreateLine -85.466000#, 20.000000#, 0#, -84.866000#, 20.000000#, 0#
+        .CreateLine -84.866000#, 20.000000#, 0#, -84.866000#, 23.000000#, 0#
+        .CreateLine -84.866000#, 23.000000#, 0#, 79.534000#, 23.000000#, 0#
+        .CreateLine 79.534000#, 23.000000#, 0#, 80.134000#, 23.000000#, 0#
+        .CreateLine 80.134000#, 23.000000#, 0#, 80.134000#, 25.000000#, 0#
+        .CreateLine 80.134000#, 25.000000#, 0#, 86.734000#, 25.000000#, 0#
+        .CreateLine 86.734000#, 25.000000#, 0#, 87.334000#, 25.000000#, 0#
+        .CreateLine 87.334000#, 25.000000#, 0#, 87.334000#, 21.500000#, 0#
+        .CreateLine 87.334000#, 21.500000#, 0#, 171.734000#, 21.500000#, 0#
+        .CreateLine 171.734000#, 21.500000#, 0#, 172.334000#, 21.500000#, 0#
+        .CreateLine 172.334000#, 21.500000#, 0#, 172.334000#, 20.000000#, 0#
+        .CreateLine 172.334000#, 20.000000#, 0#, 221.734000#, 20.000000#, 0#
+        .CreateLine 221.734000#, 20.000000#, 0#, 221.734000#, 0.000000#, 0#
+        .CreateLine 221.734000#, 0.000000#, 0#, -233.066000#, 0.000000#, 0#
         ' 旋转中心线 (X 轴)
-        .CreateCenterLine2 -233.066000#, 0#, 0#, 221.734000#, 0#, 0#
+        .CreateCenterLine -233.066000#, 0#, 0#, 221.734000#, 0#, 0#
     End With
 
-    ' 退出草图
-    swSketchMgr.InsertSketch2 True
+    ' V45 规则: 不关闭草图，在打开状态下调用特征方法
 
     ' FeatureRevolve2 — SW 2025: 20 参数
     ' 参数: SingleDir, IsSolid, IsThin, IsCut, ReverseDir,
@@ -203,14 +208,15 @@ End Sub
 
 
 ' ===========================================================================
-' CreateEndChamfer — 使用 InsertFeatureChamfer 创建端面倒角
+' CreateEndChamfer — 使用 InsertFeatureChamfer 创建端面倒角 (V45 验证)
 ' ===========================================================================
 ' 参数:
 '   faceX, radius: 端面外圆边缘的 X, Y 坐标 (mm)
 '   chamferSize_m: 倒角尺寸 (米 — API 要求)
 '   featName:      特征名称
 '
-' 使用 IFeatureManager.InsertFeatureChamfer (SW 2025 推荐, 8 参数)
+' V45: SelectByRay 不存在 → 改用 SelectByID2 "EDGE" + Z=0.003 偏移
+' V45: Type=1 角度-距离模式, Width=0.785=45°
 Private Sub CreateEndChamfer( _
     ByVal faceX As Double, ByVal radius As Double, _
     ByVal chamferSize_m As Double, ByVal featName As String)
@@ -220,25 +226,21 @@ Private Sub CreateEndChamfer( _
     ' 清除已有选择
     swModel.ClearSelection2 True
 
-    ' 射线选择: 从 (faceX, radius, -1) 到 (faceX, radius, 1)，击中圆边
-    boolstatus = swModel.Extension.SelectByRay( _
-        faceX, radius, -0.001, faceX, radius, 0.001, 0.0001, 2, True, 0, Nothing)
+    ' V45: SelectByRay 不存在 (Err=438) → 改用 SelectByID2 + Z 偏移选边
+    swModel.Extension.SelectByID2 "", "EDGE", faceX, radius, 0.003, True, 0, Nothing, 0
 
     edgeCount = swModel.Extension.GetSelectionCount
     Debug.Print "  " & featName & ": 选中 " & edgeCount & " 条边"
 
     If edgeCount > 0 Then
-        ' InsertFeatureChamfer 参数:
-        '   Options, ChamferType, Width, Angle,
-        '   OtherDist, VertexChamDist1, VertexChamDist2, VertexChamDist3
-        ' ChamferType=2 (swChamferDistanceDistance), OtherDist=等距值(米)
+        ' V45: Type=1 角度-距离模式, Width=0.785=45°
         Set swFeat = swFeatMgr.InsertFeatureChamfer( _
-            0,               ' Options (默认)
-            2,               ' ChamferType = swChamferDistanceDistance
-            0#,              ' Width (角度-距离类型使用, 此处不用)
-            0#,              ' Angle (角度-距离类型使用, 此处不用)
-            chamferSize_m,   ' OtherDist = 等距倒角值 (米)
-            0#, 0#, 0#)      ' Vertex 距离 (顶点倒角类型使用)
+            1,               ' Options = 1
+            1,               ' ChamferType = 1 (角度-距离)
+            0.785,           ' Width = 45° 弧度
+            chamferSize_m,   ' OtherDist = 倒角距离 (米)
+            0#, 0#, 0#,      ' Vertex 距离 (未使用)
+            False)           ' 最后一个参数
 
         If Not swFeat Is Nothing Then
             swFeat.Name = featName
@@ -264,42 +266,33 @@ Private Sub CreateStepFillets()
     swModel.ClearSelection2 True
     totalEdges = 0
 
-    ' 用射线逐一选择每个阶跃处的外圆边
+    ' V45: SelectByRay 不存在 → 改用 SelectByID2 + Z 偏移选边
     ' 阶跃 1: X=-157.866, R=18.5
-    boolstatus = swModel.Extension.SelectByRay( -157.866000#, 18.500000#, -0.001, _
-        -157.866000#, 18.500000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    swModel.Extension.SelectByID2 "", "EDGE", -157.866000#, 18.500000#, 0.003, True, 0, Nothing, 0
     ' 阶跃 2: X=-107.866, R=20.0
-    boolstatus = swModel.Extension.SelectByRay( -107.866000#, 20.000000#, -0.001, _
-        -107.866000#, 20.000000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    swModel.Extension.SelectByID2 "", "EDGE", -107.866000#, 20.000000#, 0.003, True, 0, Nothing, 0
     ' 阶跃 3: X=-84.866, R=23.0
-    boolstatus = swModel.Extension.SelectByRay( -84.866000#, 23.000000#, -0.001, _
-        -84.866000#, 23.000000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    swModel.Extension.SelectByID2 "", "EDGE", -84.866000#, 23.000000#, 0.003, True, 0, Nothing, 0
     ' 阶跃 4: X=80.134, R=25.0
-    boolstatus = swModel.Extension.SelectByRay( 80.134000#, 25.000000#, -0.001, _
-        80.134000#, 25.000000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    swModel.Extension.SelectByID2 "", "EDGE", 80.134000#, 25.000000#, 0.003, True, 0, Nothing, 0
     ' 阶跃 5: X=87.334, R=25.0
-    boolstatus = swModel.Extension.SelectByRay( 87.334000#, 25.000000#, -0.001, _
-        87.334000#, 25.000000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    swModel.Extension.SelectByID2 "", "EDGE", 87.334000#, 25.000000#, 0.003, True, 0, Nothing, 0
     ' 阶跃 6: X=172.334, R=21.5
-    boolstatus = swModel.Extension.SelectByRay( 172.334000#, 21.500000#, -0.001, _
-        172.334000#, 21.500000#, 0.001, 0.0001, 2, True, 0, Nothing)
+    swModel.Extension.SelectByID2 "", "EDGE", 172.334000#, 21.500000#, 0.003, True, 0, Nothing, 0
 
     totalEdges = swModel.Extension.GetSelectionCount
     Debug.Print "  共选中 " & totalEdges & " 条阶跃边 (预期 6 条)"
 
     If totalEdges >= 6 Then
-        ' FeatureFillet3 — SW 2024/2025 推荐方法
-        ' 参数: Options, Radius1, SetbackDist, SetbackType,
-        '        TangentPropagation, OverflowType,
-        '        FeatureScope, AutoSelect, ... (更多可选参数)
+        ' V45: FeatureFillet3 Options 必须 = 195 (0 和 1 均静默失败)
         On Error Resume Next
         Set swFeat = swFeatMgr.FeatureFillet3( _
-            0,                  ' Options = swFeatureFilletSimple
-            0.001200#, ' Radius (米) — R1.2mm = 0.001200m
+            195,                ' Options — 必须 195!
+            0.001200#,          ' Radius (米) — R1.2mm = 0.001200m
             0, 0,               ' Setback (不使用)
-            True,               ' TangentPropagation — 切线延伸
+            False,              ' TangentPropagation (V45: False)
             0,                  ' OverflowType
-            True, True)         ' FeatureScope, AutoSelect
+            False, False)       ' FeatureScope, AutoSelect (V45: False)
         On Error GoTo 0
 
         If Not swFeat Is Nothing Then
@@ -352,9 +345,9 @@ Private Sub CreateKeywayFeature( _
     z1 = -halfWidth
     z2 = halfWidth
 
-    ' ---- A: 从 Top Plane 创建偏移基准面 ----
+    ' ---- A: 从 Top Plane 创建偏移基准面 (InsertRefPlane 必须用中文名!)
     swModel.ClearSelection2 True
-    swModel.Extension.SelectByID2 "Top Plane", "PLANE", 0, 0, 0, False, 0, Nothing, 0
+    swModel.Extension.SelectByID2 "上视基准面", "PLANE", 0, 0, 0, False, 0, Nothing, 0
 
     ' InsertRefPlane: 约束类型=8(偏移距离), 距离=offsetM(米)
     Set swPlane = swFeatMgr.InsertRefPlane(8, offsetM, 0, 0, 0, 0)
@@ -371,16 +364,16 @@ Private Sub CreateKeywayFeature( _
 
     With swSketchMgr
         ' 前边 Z=-halfWidth
-        .CreateLine2 x1, yTangent, z1, x2, yTangent, z1
+        .CreateLine x1, yTangent, z1, x2, yTangent, z1
         ' 右边 X=x2
-        .CreateLine2 x2, yTangent, z1, x2, yTangent, z2
+        .CreateLine x2, yTangent, z1, x2, yTangent, z2
         ' 后边 Z=+halfWidth
-        .CreateLine2 x2, yTangent, z2, x1, yTangent, z2
+        .CreateLine x2, yTangent, z2, x1, yTangent, z2
         ' 左边 X=x1
-        .CreateLine2 x1, yTangent, z2, x1, yTangent, z1
+        .CreateLine x1, yTangent, z2, x1, yTangent, z1
     End With
 
-    swSketchMgr.InsertSketch2 True
+    ' V45 规则: 不关闭草图，在打开状态下调用 FeatureCut3
 
     ' ---- C: 拉伸切除 (FeatureCut3, 26 参数) ----
     ' 单方向、盲孔、深度 = depth mm → depth/1000 m

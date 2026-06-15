@@ -191,8 +191,8 @@ class ShaftBuilder:
         # 旋转中心线
         self._driver.draw_centerline(left_x, 0.0, 0.0, right_x, 0.0, 0.0)
 
-        # 退出草图 + 旋转特征
-        self._driver.exit_sketch()
+        # V45 规则: 草图必须保持打开状态调用特征方法！
+        # 不要在此处调用 exit_sketch()
         logger.info(f"  草图: {len(lines)} 条轮廓线, {len(step_x)} 个阶跃面")
 
         if not self._driver.feature_revolve(360.0, is_cut=False,
@@ -309,9 +309,9 @@ class ShaftBuilder:
 
         plane_name = feat_name + "-Plane"
 
-        # A: 创建切线基准面
+        # A: 创建切线基准面 (InsertRefPlane 必须用中文基准面名!)
         if not self._driver.create_ref_plane_offset(
-            "Top Plane", shaft_r_mm, plane_name
+            "上视基准面", shaft_r_mm, plane_name
         ):
             return False
 
@@ -330,7 +330,7 @@ class ShaftBuilder:
         # 左边 X=x1
         self._driver.draw_line(x1, y_tangent, z2, x1, y_tangent, z1)
 
-        self._driver.exit_sketch()
+        # V45 规则: 不关闭草图，直接在打开状态下调用特征
 
         # C: 拉伸切除
         if not self._driver.feature_cut_extrude(depth_mm, feat_name):

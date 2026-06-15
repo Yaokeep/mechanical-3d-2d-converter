@@ -26,8 +26,7 @@ from .sw_constants import (
     swEndCondBlind,
     swStartSketchPlane,
     swRefPlaneOffset,
-    swChamferDistanceDistance,
-    swFeatureFilletSimple,
+    SW_FILLET_OPTIONS,
     swSaveAsCurrentVersion,
     swSaveAsOptions_Silent,
     SW_USER_PREF_UNIT_SYSTEM,
@@ -256,30 +255,28 @@ class SolidWorksDriver:
         )
         return bool(result)
 
-    def select_edge_by_ray(
+    def select_edge_by_point(
         self,
         x: float,
         y: float,
-        z_start: float = -0.001,
-        z_end: float = 0.001,
-        tolerance: float = 0.0001,
+        z: float = 0.003,
     ) -> int:
-        """用射线选择边缘。
+        """用点选 + Z 偏移选中边缘（V45 验证可用）。
 
-        从 (x, y, z_start) 向 (x, y, z_end) 发射拾取射线。
+        SW2025 不支持 SelectByRay (Err=438)，改用 SelectByID2。
+        Z 偏移避开圆柱面，确保选中的是 EDGE 而非 FACE。
 
         Args:
-            x, y: 射线 XY 坐标（米）。
-            z_start, z_end: 射线 Z 起止（米）。
-            tolerance: 拾取容差（米）。
+            x, y: 棱边 XY 坐标（米）。
+            z: Z 偏移（米），默认 0.003 避免打到面上。
 
         Returns:
             int: 当前选中对象总数。
         """
         if self.sw_model is None:
             return 0
-        self.sw_model.Extension.SelectByRay(
-            x, y, z_start, x, y, z_end, tolerance, 2, True, 0, None
+        self.sw_model.Extension.SelectByID2(
+            "", "EDGE", x, y, z, True, 0, None, 0
         )
         return self.selection_count()
 
@@ -307,7 +304,12 @@ class SolidWorksDriver:
         return True
 
     def exit_sketch(self) -> None:
-        """退出当前草图。"""
+        """退出当前草图（调用 InsertSketch2 切换状态）。
+
+        ⚠️ V45 验证规则: 特征方法必须在草图打开状态下调用！
+        不要在调用 feature_revolve / feature_cut_extrude 等特征方法前
+        调用此方法，否则特征会静默失败（返回 None）。
+        """
         if self.sw_sketch_mgr:
             self.sw_sketch_mgr.InsertSketch2(True)
 
@@ -318,12 +320,14 @@ class SolidWorksDriver:
     ) -> None:
         """在活动草图中绘制直线（mm 坐标）。
 
+        SW2025 已重命名 CreateLine2 → CreateLine。
+
         Args:
             x1, y1, z1: 起点坐标 (mm)。
             x2, y2, z2: 终点坐标 (mm)。
         """
         if self.sw_sketch_mgr:
-            self.sw_sketch_mgr.CreateLine2(x1, y1, z1, x2, y2, z2)
+            self.sw_sketch_mgr.CreateLine(x1, y1, z1, x2, y2, z2)
 
     def draw_centerline(
         self,
@@ -332,10 +336,11 @@ class SolidWorksDriver:
     ) -> None:
         """在活动草图中绘制中心线（mm 坐标）。
 
+        SW2025 已重命名 CreateCenterLine2 → CreateCenterLine。
         中心线通常用作旋转特征的旋转轴。
         """
         if self.sw_sketch_mgr:
-            self.sw_sketch_mgr.CreateCenterLine2(x1, y1, z1, x2, y2, z2)
+            self.sw_sketch_mgr.CreateCenterLine(x1, y1, z1, x2, y2, z2)
 
     # ------------------------------------------------------------------
     # 特征操作
@@ -400,10 +405,10 @@ class SolidWorksDriver:
         size_mm: float,
         feat_name: str = "Chamfer",
     ) -> bool:
-        """在指定边创建等距倒角（InsertFeatureChamfer, 8 参数）。
+        """在指定边创建 45° 倒角（V45 验证: Type=1 角度-距离模式）。
 
         Args:
-            edge_x, edge_y: 边缘射线拾取位置（米）。
+            edge_x, edge_y: 边缘拾取位置（米）。
             size_mm: 倒角尺寸（mm）。
             feat_name: 特征名称。
 
@@ -412,19 +417,19 @@ class SolidWorksDriver:
         """
         size_m = self.mm_to_m(size_mm)
         self.clear_selection()
-        count = self.select_edge_by_ray(edge_x, edge_y)
+        count = self.select_edge_by_point(edge_x, edge_y)
         if count == 0:
             logger.warning(f"{feat_name}: 未找到边缘 (X={edge_x}, Y={edge_y})")
             return False
 
         try:
             feat = self.sw_feat_mgr.InsertFeatureChamfer(
-                0,                      # Options
-                swChamferDistanceDistance,  # ChamferType
-                0.0,                    # Width (未使用)
-                0.0,                    # Angle (未使用)
-                size_m,                 # OtherDist = 等距倒角值 (米)
+                1,                      # Options = 1 (V45 验证)
+                1,                      # ChamferType = 1 (角度-距离)
+                0.785,                  # Width = 45° (弧度)
+                size_m,                 # OtherDist = 倒角距离 (米)
                 0.0, 0.0, 0.0,         # Vertex 距离 (未使用)
+                False,                  # 最后一个参数
             )
             if feat is None:
                 logger.error(f"{feat_name}: InsertFeatureChamfer 返回 None")
@@ -442,10 +447,10 @@ class SolidWorksDriver:
         radius_mm: float,
         feat_name: str = "Fillet",
     ) -> bool:
-        """选中多条边后创建等半径圆角（FeatureFillet3）。
+        """选中多条边后创建等半径圆角（V45 验证: Options=195）。
 
         Args:
-            edge_specs: [(x, y), ...] 每条边的射线拾取位置（米）。
+            edge_specs: [(x, y), ...] 每条边的点选位置（米）。
             radius_mm: 圆角半径（mm）。
             feat_name: 特征名称。
 
@@ -455,7 +460,7 @@ class SolidWorksDriver:
         radius_m = self.mm_to_m(radius_mm)
         self.clear_selection()
         for ex, ey in edge_specs:
-            self.select_edge_by_ray(ex, ey)
+            self.select_edge_by_point(ex, ey)
 
         total = self.selection_count()
         expected = len(edge_specs)
@@ -465,13 +470,13 @@ class SolidWorksDriver:
 
         try:
             feat = self.sw_feat_mgr.FeatureFillet3(
-                swFeatureFilletSimple,  # Options
+                SW_FILLET_OPTIONS,      # Options = 195 (V45 验证唯一可用值)
                 radius_m,               # Radius (米)
-                0.0,                    # SetbackDist
+                0,                      # SetbackDist
                 0,                      # SetbackType
-                True,                   # TangentPropagation
+                False,                  # TangentPropagation (V45: False)
                 0,                      # OverflowType
-                True, True,             # FeatureScope, AutoSelect
+                False, False,           # FeatureScope, AutoSelect (V45: False)
             )
             if feat is None:
                 logger.error(f"{feat_name}: FeatureFillet3 返回 None")
@@ -491,8 +496,11 @@ class SolidWorksDriver:
     ) -> bool:
         """从已有基准面创建偏移参考基准面。
 
+        ⚠️ V45 验证: InsertRefPlane 必须使用中文基准面名!
+           "上视基准面" ✅  "Top Plane" ❌
+
         Args:
-            base_plane_name: 源基准面名称，如 "Top Plane"。
+            base_plane_name: 源基准面名称，如 "上视基准面"。
             offset_mm: 偏移距离（mm，正值向+方向偏移）。
             plane_name: 新基准面名称。
 

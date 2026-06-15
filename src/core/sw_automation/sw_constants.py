@@ -21,7 +21,9 @@ swRefPlaneOffset = 8    # 偏移距离约束
 swChamferDistanceDistance = 2  # 等距倒角
 
 # ---- 圆角类型 ----
-swFeatureFilletSimple = 0      # 等半径圆角
+# V45 验证: SW2025 FeatureFillet3 必须 Options=195 (0 和 1 均静默失败)
+swFeatureFilletSimple = 0      # 等半径圆角 (SW2025 不可用!)
+SW_FILLET_OPTIONS = 195        # SW2025 FeatureFillet3 唯一可用值
 
 # ---- 选择类型 ----
 swSelectType_FACES = 1   # 面选择
