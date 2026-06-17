@@ -162,7 +162,7 @@ class ShaftBuilder:
             step_x.append(mid)
 
         # 开始草图（前视基准面）
-        if not self._driver.start_sketch("Front Plane"):
+        if not self._driver.start_sketch("前视基准面"):
             return False
 
         # 绘制半剖面轮廓

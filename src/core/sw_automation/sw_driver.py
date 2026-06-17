@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import math
+import pythoncom
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,17 @@ except ImportError:
     # 回退到标准库 logging
     import logging
     logger = logging.getLogger("sw_automation")
+
+# Python COM 编组修复: None 无法自动编组为 VT_DISPATCH null 指针。
+# 必须在需要 IDispatch* 参数的 COM 调用中使用此常量。
+NULL_DISPATCH = pythoncom.VT_DISPATCH
+_NULL_VAR = None  # VARIANT(pythoncom.VT_DISPATCH, None) 的动态创建见 _null_dispatch()
+
+
+def _null_dispatch():
+    """返回 VT_DISPATCH + null 的 VARIANT，用于替代 Nothing/VBA 中的 null 指针。"""
+    from win32com.client import VARIANT
+    return VARIANT(NULL_DISPATCH, None)
 
 from .sw_constants import (
     swDocPART,
@@ -156,7 +168,9 @@ class SolidWorksDriver:
         """
         logger.info("创建新零件文档 ...")
         try:
-            template = self.sw_app.GetDocumentTemplate(swDocPART, "", 0, 0, 0)
+            # Python COM 下 GetDocumentTemplate 返回的 ~ 别名无法用于 NewDocument，
+            # 需要解析为实际模板文件路径。
+            template = self._resolve_part_template()
             self.sw_part = self.sw_app.NewDocument(template, 0, 0, 0)
             if self.sw_part is None:
                 logger.error("无法创建新零件")
@@ -174,6 +188,38 @@ class SolidWorksDriver:
         except Exception as e:
             logger.error(f"创建零件异常: {e}")
             return False
+
+    def _resolve_part_template(self) -> str:
+        """解析零件模板的完整文件路径（Python COM 下 ~ 别名不可用）。
+
+        按优先级尝试:
+          1. 从 SW 选项获取用户设置的默认模板路径
+          2. 从默认安装位置查找 gb_part.prtdot / part.prtdot
+          3. 回退到 GetDocumentTemplate 别名
+
+        Returns:
+            str: 模板文件完整路径。
+        """
+        # 尝试从安装目录查找
+        import os
+        template_dirs = [
+            r"C:\ProgramData\SOLIDWORKS\SOLIDWORKS 2025\templates",
+            r"C:\ProgramData\SolidWorks\SOLIDWORKS 2025\templates",
+        ]
+        part_names = ["gb_part.prtdot", "part.prtdot", "零件.prtdot"]
+
+        for td in template_dirs:
+            if os.path.isdir(td):
+                for name in part_names:
+                    full = os.path.join(td, name)
+                    if os.path.isfile(full):
+                        logger.debug(f"  模板: {full}")
+                        return full
+
+        # 回退到别名（可能失败）
+        alias = self.sw_app.GetDocumentTemplate(swDocPART, "", 0, 0, 0)
+        logger.warning(f"未找到模板文件，使用别名: {alias}")
+        return alias
 
     def rebuild(self) -> None:
         """强制重建模型（Ctrl+Q）。"""
@@ -200,9 +246,9 @@ class SolidWorksDriver:
         path = str(Path(filepath).absolute())
         logger.info(f"正在保存: {path}")
         try:
-            self.sw_model.Extension.SaveAs(
-                path, swSaveAsCurrentVersion, 0, None, "", swSaveAsOptions_Silent, 0
-            )
+            result = self.sw_model.SaveAs3(path, swSaveAsCurrentVersion, 0)
+            if result != 0:
+                logger.warning(f"SaveAs3 返回 {result}")
             logger.success(f"已保存: {path}")
             return True
         except Exception as e:
@@ -235,7 +281,10 @@ class SolidWorksDriver:
     def selection_count(self) -> int:
         """获取当前选中对象数量。"""
         if self.sw_model:
-            return self.sw_model.Extension.GetSelectionCount
+            try:
+                return self.sw_model.SelectionManager.GetSelectedObjectCount
+            except Exception:
+                return 0
         return 0
 
     def select_plane(self, name: str) -> bool:
@@ -251,7 +300,7 @@ class SolidWorksDriver:
             return False
         self.clear_selection()
         result = self.sw_model.Extension.SelectByID2(
-            name, "PLANE", 0.0, 0.0, 0.0, False, 0, None, 0
+            name, "PLANE", 0.0, 0.0, 0.0, False, 0, _null_dispatch(), 0
         )
         return bool(result)
 
@@ -276,7 +325,7 @@ class SolidWorksDriver:
         if self.sw_model is None:
             return 0
         self.sw_model.Extension.SelectByID2(
-            "", "EDGE", x, y, z, True, 0, None, 0
+            "", "EDGE", x, y, z, True, 0, _null_dispatch(), 0
         )
         return self.selection_count()
 
@@ -284,7 +333,7 @@ class SolidWorksDriver:
     # 草图操作
     # ------------------------------------------------------------------
 
-    def start_sketch(self, plane_name: str = "Front Plane") -> bool:
+    def start_sketch(self, plane_name: str = "前视基准面") -> bool:
         """在指定基准面上打开草图。
 
         Args:
@@ -299,7 +348,7 @@ class SolidWorksDriver:
         if self.sw_sketch_mgr is None:
             logger.error("SketchManager 未初始化")
             return False
-        self.sw_sketch_mgr.InsertSketch2(True)
+        self.sw_sketch_mgr.InsertSketch(True)
         logger.debug(f"草图已打开: {plane_name}")
         return True
 
@@ -311,7 +360,7 @@ class SolidWorksDriver:
         调用此方法，否则特征会静默失败（返回 None）。
         """
         if self.sw_sketch_mgr:
-            self.sw_sketch_mgr.InsertSketch2(True)
+            self.sw_sketch_mgr.InsertSketch(True)
 
     def draw_line(
         self,

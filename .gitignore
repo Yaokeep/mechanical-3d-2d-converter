@@ -37,6 +37,19 @@ desktop.ini
 *.tmp
 *.log
 
+# 生成的 CAD 输出文件（非源代码）
+*.SLDPRT
+*.sldprt
+*.step
+*.stp
+*.igs
+*.iges
+
+# CAD 软件锁文件
+*.dwl
+*.dwl2
+~$*
+
 # Jupyter
 .ipynb_checkpoints/
 
