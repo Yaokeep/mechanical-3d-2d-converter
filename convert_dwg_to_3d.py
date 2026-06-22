@@ -14,18 +14,45 @@ import os
 from pathlib import Path
 
 import ezdxf
-from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeRevol
-from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut
-from OCC.Core.BRepBuilderAPI import (
-    BRepBuilderAPI_MakeEdge,
-    BRepBuilderAPI_MakeWire,
-    BRepBuilderAPI_MakeFace,
-    BRepBuilderAPI_Transform,
-)
-from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax1, gp_Trsf
-from OCC.Core.BRepCheck import BRepCheck_Analyzer
-from OCC.Core.STEPControl import STEPControl_Writer, STEPControl_AsIs
-from OCC.Core.IFSelect import IFSelect_RetDone
+
+# OCC 导入延迟到 _ensure_occ() 中，避免仅需 DXF 解析时依赖 PythonOCC
+_OCC_LOADED = False
+
+
+def _ensure_occ():
+    """延迟加载 PythonOCC 模块（仅在需要 3D 建模时）。"""
+    global _OCC_LOADED
+    if _OCC_LOADED:
+        return
+    from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeRevol, BRepPrimAPI_MakeBox
+    from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCC.Core.BRepBuilderAPI import (
+        BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire,
+        BRepBuilderAPI_MakeFace, BRepBuilderAPI_Transform,
+    )
+    from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax1, gp_Trsf
+    from OCC.Core.BRepCheck import BRepCheck_Analyzer
+    from OCC.Core.STEPControl import STEPControl_Writer, STEPControl_AsIs
+    from OCC.Core.IFSelect import IFSelect_RetDone
+
+    globals().update({
+        "BRepPrimAPI_MakeRevol": BRepPrimAPI_MakeRevol,
+        "BRepPrimAPI_MakeBox": BRepPrimAPI_MakeBox,
+        "BRepAlgoAPI_Cut": BRepAlgoAPI_Cut,
+        "BRepBuilderAPI_MakeEdge": BRepBuilderAPI_MakeEdge,
+        "BRepBuilderAPI_MakeWire": BRepBuilderAPI_MakeWire,
+        "BRepBuilderAPI_MakeFace": BRepBuilderAPI_MakeFace,
+        "BRepBuilderAPI_Transform": BRepBuilderAPI_Transform,
+        "gp_Pnt": gp_Pnt,
+        "gp_Dir": gp_Dir,
+        "gp_Ax1": gp_Ax1,
+        "gp_Trsf": gp_Trsf,
+        "BRepCheck_Analyzer": BRepCheck_Analyzer,
+        "STEPControl_Writer": STEPControl_Writer,
+        "STEPControl_AsIs": STEPControl_AsIs,
+        "IFSelect_RetDone": IFSelect_RetDone,
+    })
+    _OCC_LOADED = True
 
 
 # ---- 1. DXF 解析 ----
@@ -336,6 +363,7 @@ def build_step_shaft(geometry: dict):
 
     将半剖面轮廓线绕中心轴（X轴）旋转 360°，生成一整根光滑轴。
     """
+    _ensure_occ()
     sections = geometry["sections"]
     fillet_r = geometry["fillet_radius"]
     chamfers = geometry["chamfers"]
@@ -510,6 +538,7 @@ def cut_keyway(shape, keyway_params):
     键槽是一个矩形槽，沿轴的顶部纵向切割。
     使用长方体布尔减操作实现。
     """
+    _ensure_occ()
     x_start = keyway_params["x_start"]
     x_end = keyway_params["x_end"]
     kw_width = keyway_params["width"]
@@ -522,8 +551,6 @@ def cut_keyway(shape, keyway_params):
     # 键槽长方体：从轴表面到键槽底部
     # 轴表面在 Y 方向 = shaft_r，键槽底部 = shaft_r - kw_depth
     kw_bottom = shaft_r - kw_depth
-
-    from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeBox
 
     # 创建一个比键槽稍大的长方体，确保完整切割
     kw_box = BRepPrimAPI_MakeBox(
@@ -551,6 +578,7 @@ def cut_keyway(shape, keyway_params):
 
 def export_step(shape, output_path: str) -> bool:
     """将 TopoDS_Shape 导出为 STEP 文件"""
+    _ensure_occ()
     print(f"\n=== 导出 STEP ===")
 
     # 检查模型有效性

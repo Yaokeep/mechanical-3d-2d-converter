@@ -161,15 +161,17 @@ class SolidWorksDriver:
     # ------------------------------------------------------------------
 
     def new_part(self) -> bool:
-        """创建新零件文档（MMGS 单位系统）。
+        """创建新零件文档。
+
+        Python COM 限制: gb_part.prtdot 模板默认为 MKS (米制),
+        SetUserPreferenceIntegerValue 无法改变当前文档单位。
+        策略: 检测模板实际单位系统，通过 _to_doc() 自动缩放坐标。
 
         Returns:
             bool: 创建成功返回 True。
         """
         logger.info("创建新零件文档 ...")
         try:
-            # Python COM 下 GetDocumentTemplate 返回的 ~ 别名无法用于 NewDocument，
-            # 需要解析为实际模板文件路径。
             template = self._resolve_part_template()
             self.sw_part = self.sw_app.NewDocument(template, 0, 0, 0)
             if self.sw_part is None:
@@ -178,12 +180,17 @@ class SolidWorksDriver:
             self.sw_model = self.sw_part
             self.sw_feat_mgr = self.sw_model.FeatureManager
             self.sw_sketch_mgr = self.sw_model.SketchManager
-            # 设置 MMGS 单位系统
-            self.sw_model.SetUserPreferenceIntegerValue(
-                SW_USER_PREF_UNIT_SYSTEM, swMMGS
+            # 检测模板实际单位系统: 0=MMGS(mm), 2=MKS(m)
+            actual_unit = self.sw_model.GetUserPreferenceIntegerValue(
+                SW_USER_PREF_UNIT_SYSTEM
+            )
+            self._doc_unit_is_mm = (actual_unit == swMMGS)
+            logger.info(
+                f"  单位系统: {'MMGS (mm)' if self._doc_unit_is_mm else 'MKS (m)'}"
+                f" (值={actual_unit}), 坐标缩放={1 if self._doc_unit_is_mm else 0.001}"
             )
             self.sw_model.ShowNamedView2("*Isometric", -1)
-            logger.success("新零件已创建 (MMGS 单位)")
+            logger.success("新零件已创建")
             return True
         except Exception as e:
             logger.error(f"创建零件异常: {e}")
@@ -315,9 +322,12 @@ class SolidWorksDriver:
         SW2025 不支持 SelectByRay (Err=438)，改用 SelectByID2。
         Z 偏移避开圆柱面，确保选中的是 EDGE 而非 FACE。
 
+        ⚠️ 重要: SelectByID2 使用文档单位系统（MMGS 下为 mm），
+        与特征操作的 API 不同（特征操作使用米）！
+
         Args:
-            x, y: 棱边 XY 坐标（米）。
-            z: Z 偏移（米），默认 0.003 避免打到面上。
+            x, y: 棱边 XY 坐标（mm — 文档单位）。
+            z: Z 偏移（mm），默认 0.003mm 避免打到面上。
 
         Returns:
             int: 当前选中对象总数。
@@ -325,7 +335,9 @@ class SolidWorksDriver:
         if self.sw_model is None:
             return 0
         self.sw_model.Extension.SelectByID2(
-            "", "EDGE", x, y, z, True, 0, _null_dispatch(), 0
+            "", "Edge",
+            self._to_doc(x), self._to_doc(y), self._to_doc(z),
+            True, 0, _null_dispatch(), 0
         )
         return self.selection_count()
 
@@ -345,10 +357,8 @@ class SolidWorksDriver:
         if not self.select_plane(plane_name):
             logger.warning(f"无法选择基准面: {plane_name}")
             return False
-        if self.sw_sketch_mgr is None:
-            logger.error("SketchManager 未初始化")
-            return False
-        self.sw_sketch_mgr.InsertSketch(True)
+        # SW2025 API: must use IModelDoc2.InsertSketch2 (SketchManager version is deprecated)
+        self.sw_model.InsertSketch2(True)
         logger.debug(f"草图已打开: {plane_name}")
         return True
 
@@ -362,12 +372,18 @@ class SolidWorksDriver:
         if self.sw_sketch_mgr:
             self.sw_sketch_mgr.InsertSketch(True)
 
+    def _to_doc(self, mm_val: float) -> float:
+        """将 mm 值转换为文档单位（MMGS→mm, MKS→m/1000）。"""
+        if getattr(self, '_doc_unit_is_mm', True):
+            return mm_val
+        return mm_val / 1000.0
+
     def draw_line(
         self,
         x1: float, y1: float, z1: float,
         x2: float, y2: float, z2: float,
     ) -> None:
-        """在活动草图中绘制直线（mm 坐标）。
+        """在活动草图中绘制直线（mm 坐标，自动转换为文档单位）。
 
         SW2025 已重命名 CreateLine2 → CreateLine。
 
@@ -376,20 +392,26 @@ class SolidWorksDriver:
             x2, y2, z2: 终点坐标 (mm)。
         """
         if self.sw_sketch_mgr:
-            self.sw_sketch_mgr.CreateLine(x1, y1, z1, x2, y2, z2)
+            self.sw_sketch_mgr.CreateLine(
+                self._to_doc(x1), self._to_doc(y1), self._to_doc(z1),
+                self._to_doc(x2), self._to_doc(y2), self._to_doc(z2),
+            )
 
     def draw_centerline(
         self,
         x1: float, y1: float, z1: float,
         x2: float, y2: float, z2: float,
     ) -> None:
-        """在活动草图中绘制中心线（mm 坐标）。
+        """在活动草图中绘制中心线（mm 坐标，自动转换为文档单位）。
 
         SW2025 已重命名 CreateCenterLine2 → CreateCenterLine。
         中心线通常用作旋转特征的旋转轴。
         """
         if self.sw_sketch_mgr:
-            self.sw_sketch_mgr.CreateCenterLine(x1, y1, z1, x2, y2, z2)
+            self.sw_sketch_mgr.CreateCenterLine(
+                self._to_doc(x1), self._to_doc(y1), self._to_doc(z1),
+                self._to_doc(x2), self._to_doc(y2), self._to_doc(z2),
+            )
 
     # ------------------------------------------------------------------
     # 特征操作
@@ -457,7 +479,7 @@ class SolidWorksDriver:
         """在指定边创建 45° 倒角（V45 验证: Type=1 角度-距离模式）。
 
         Args:
-            edge_x, edge_y: 边缘拾取位置（米）。
+            edge_x, edge_y: 边缘拾取位置（mm — 文档单位）。
             size_mm: 倒角尺寸（mm）。
             feat_name: 特征名称。
 
@@ -468,7 +490,7 @@ class SolidWorksDriver:
         self.clear_selection()
         count = self.select_edge_by_point(edge_x, edge_y)
         if count == 0:
-            logger.warning(f"{feat_name}: 未找到边缘 (X={edge_x}, Y={edge_y})")
+            logger.warning(f"{feat_name}: 未找到边缘 (X={edge_x:.3f}mm, Y={edge_y:.3f}mm)")
             return False
 
         try:
@@ -499,7 +521,7 @@ class SolidWorksDriver:
         """选中多条边后创建等半径圆角（V45 验证: Options=195）。
 
         Args:
-            edge_specs: [(x, y), ...] 每条边的点选位置（米）。
+            edge_specs: [(x, y), ...] 每条边的点选位置（mm — 文档单位）。
             radius_mm: 圆角半径（mm）。
             feat_name: 特征名称。
 
@@ -582,50 +604,68 @@ class SolidWorksDriver:
         self,
         depth_mm: float,
         feat_name: str = "CutExtrude",
+        flip: bool = False,
     ) -> bool:
-        """在当前草图上创建拉伸切除（FeatureCut3, 26 参数）。
+        """在当前草图上创建拉伸切除（FeatureCut4, 27 参数 — SW2025）。
+
+        SW2025 FeatureCut4 比 VBA FeatureCut3 多 1 个参数 (T0 前置)。
 
         **注意**: 调用前需确保已在正确的基准面上打开草图。
+
+        FeatureCut3 参数顺序 (V45 验证, SW2025):
+          Sd, Flip, Dir, T1Both, T1, D1, Dchk1, T2, D2, Dchk2,
+          Ddir1, Dval1, Dval2, Dvalchk1, Dvalchk2,
+          Dvaldir1, Dvaldir2, Dvalval1,
+          B1, B2, Bcont, Boff, Offset,
+          Merge, FeatureScope, AutoSelect
 
         Args:
             depth_mm: 切除深度（mm）。
             feat_name: 特征名称。
+            flip: 翻转切除侧（为 True 时反向切除）。
 
         Returns:
             bool: 成功返回 True。
         """
         depth_m = self.mm_to_m(depth_mm)
         try:
-            feat = self.sw_feat_mgr.FeatureCut3(
+            # SW2025 FeatureCut4: 27 params = T0 + VBA FeatureCut3 26 params
+            feat = self.sw_feat_mgr.FeatureCut4(
+                swStartSketchPlane,  # T0 — 新增参数 (SW2025)
                 True,           # Sd — 单方向
-                False,          # Flip — 不翻转切除侧
+                flip,           # Flip — 翻转切除侧
                 False,          # Dir — 不反向
-                swEndCondBlind, # T1 = 盲孔
+                False,          # T1Both
+                0,              # T1 = swEndCondBlind
+                depth_m,        # D1 — 方向1切除深度 (米)
+                False,          # Dchk1
                 0,              # T2 (未使用)
-                depth_m,        # D1 深度 (米)
                 depth_m,        # D2 (未使用)
-                False,          # Dchk1 — 无拔模
                 False,          # Dchk2
-                False, False,   # Ddir1, Ddir2
-                0.0, 0.0,       # Dang1, Dang2
-                False, False,   # OffsetReverse
-                False, False,   # TranslateSurface
-                False,          # NormalCut
-                True,           # UseFeatScope
-                True,           # UseAutoSelect
-                False, False, False,  # Assembly
-                swStartSketchPlane,   # T0
-                0.0,            # StartOffset
-                False,          # FlipStartOffset
+                False,          # Ddir1
+                0.0, 0.0,       # Dval1, Dval2
+                False,          # Dvalchk1
+                False,          # Dvalchk2
+                False,          # Dvaldir1
+                False,          # Dvaldir2
+                False,          # Dvalval1
+                True,           # B1 — 反向等距
+                True,           # B2 — 方向2开
+                True,           # Bcont
+                False,          # Boff
+                0.0,            # Offset
+                False,          # Merge
+                False,          # FeatureScope
+                False,          # AutoSelect
             )
             if feat is None:
-                logger.error(f"{feat_name}: FeatureCut3 返回 None")
+                logger.error(f"{feat_name}: FeatureCut4 返回 None (flip={flip})")
                 return False
             feat.Name = feat_name
             logger.success(f"  [OK] {feat_name} (深度 {depth_mm}mm)")
             return True
         except Exception as e:
-            logger.error(f"{feat_name}: FeatureCut3 异常 - {e}")
+            logger.error(f"{feat_name}: FeatureCut4 异常 - {e}")
             raise SwFeatureError(f"拉伸切除创建失败: {e}") from e
 
 
