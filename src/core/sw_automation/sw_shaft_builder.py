@@ -81,23 +81,39 @@ class ShaftBuilder:
         sections: list[tuple[float, float, float]] | None = None,
         keyways: list[tuple[float, float, float, float, float]] | None = None,
         chamfer_mm: float = DEFAULT_CHAMFER_MM,
+        left_chamfer_mm: float | None = None,
+        right_chamfer_mm: float | None = None,
         fillet_r_mm: float = DEFAULT_FILLET_R_MM,
         progress_callback: Callable[[str, int], None] | None = None,
     ) -> bool:
         """完整的阶梯轴建模流程。
 
         Python COM 只创建旋转基体（最可靠），倒角、圆角、键槽
-        全部通过 VBA 巨集在 SW 进程内完成（避免外部 COM 限制）。
+        全部通过 VBScript 在 SW 进程内完成。
+
+        Args:
+            sections: 轴段列表 [(x_start, x_end, radius_mm), ...]。
+            keyways: 键槽列表 [(xs, xe, w, d, sr), ...]。
+            chamfer_mm: 左右端统一倒角（left/right_chamfer_mm 未指定时使用）。
+            left_chamfer_mm: 左端倒角尺寸（None=使用 chamfer_mm，0=跳过）。
+            right_chamfer_mm: 右端倒角尺寸（None=使用 chamfer_mm，0=跳过）。
+            fillet_r_mm: 阶跃过渡圆角半径。
         """
         if sections is None:
             sections = DEFAULT_SECTIONS
         if keyways is None:
             keyways = DEFAULT_KEYWAYS
+        if left_chamfer_mm is None:
+            left_chamfer_mm = chamfer_mm
+        if right_chamfer_mm is None:
+            right_chamfer_mm = chamfer_mm
 
         steps = [
             ("旋转基体", 0, 20, lambda: self.create_shaft_body(sections)),
-            ("VBA 巨集（倒角+圆角+键槽）", 20, 100,
-             lambda: self._create_all_features_vba(sections, keyways, chamfer_mm, fillet_r_mm)),
+            ("VBScript（倒角+圆角+键槽）", 20, 100,
+             lambda: self._create_all_features_vba(
+                 sections, keyways,
+                 left_chamfer_mm, right_chamfer_mm, fillet_r_mm)),
         ]
 
         all_ok = True
@@ -195,76 +211,70 @@ class ShaftBuilder:
         self,
         sections: list[tuple[float, float, float]],
         keyways: list[tuple[float, float, float, float, float]],
-        chamfer_mm: float,
+        left_chamfer_mm: float,
+        right_chamfer_mm: float,
         fillet_r_mm: float,
     ) -> bool:
-        """生成综合 VBA 巨集并自动执行。
+        """通过 VBScript 直接 COM 创建倒角+圆角+键槽。
 
-        倒角、圆角、键槽全部在 SW 进程内通过 VBA 完成，
-        避免 Python COM 外部调用的 FeatureCut3=None 等问题。
-        所有坐标统一使用米（MKS 文档单位）。
+        VBScript 与 VBA 共用同一 OLE Automation 引擎，不受 Python COM
+        的草图平面限制（FeatureCut3 在参考面上可用）。
+
+        不再保存 .bas 文件（SW VBA IDE 可能尝试编译导致弹窗）。
         """
         import os
         import subprocess
         import time
         from pathlib import Path
 
-        logger.info("--- VBA 巨集（倒角 + 圆角 + 键槽）---")
+        logger.info("--- VBScript 直接 COM（倒角 + 圆角 + 键槽）---")
 
         project_root = Path(os.path.dirname(os.path.abspath(__file__))).parent.parent.parent
         macro_dir = project_root / "CAD"
-        macro_path = macro_dir / "PostRevolve.bas"
 
-        vba = self._generate_post_revolve_vba(sections, keyways, chamfer_mm, fillet_r_mm)
-        macro_path.write_text(vba, encoding="gbk", errors="replace")
-        logger.info(f"  VBA 巨集已生成: {macro_path} ({len(vba)} 字节)")
-
-        # 通过 VBScript 调用 RunMacro
-        vbs_code = (
-            'On Error Resume Next\r\n'
-            'Dim swApp\r\n'
-            'Set swApp = GetObject(, "SldWorks.Application")\r\n'
-            'If Err.Number <> 0 Then\r\n'
-            '    WScript.Echo "ERR: Cannot connect to SW"\r\n'
-            '    WScript.Quit 1\r\n'
-            'End If\r\n'
-            f'swApp.RunMacro "{macro_path}", "main", 0\r\n'
-            'If Err.Number <> 0 Then\r\n'
-            '    WScript.Echo "ERR: " & Err.Description\r\n'
-            '    WScript.Quit 1\r\n'
-            'End If\r\n'
-            'WScript.Echo "OK"\r\n'
-        )
-
-        vbs_path = macro_path.with_suffix('.vbs')
+        vbs_code = self._generate_post_revolve_vbs(
+            sections, keyways, left_chamfer_mm, right_chamfer_mm, fillet_r_mm)
+        vbs_path = macro_dir / "PostRevolve.vbs"
+        # GBK 编码：cscript.exe 使用系统 ANSI 代码页 (CP936) 读取 .vbs 文件
         vbs_path.write_text(vbs_code, encoding="gbk")
+        logger.info(f"  VBScript: {vbs_path} ({len(vbs_code)} 字节)")
 
         try:
             result = subprocess.run(
                 ["cscript", "//Nologo", str(vbs_path)],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=300,
             )
             stdout = result.stdout.strip()
-            logger.debug(f"  cscript: {stdout}")
+            stderr = result.stderr.strip()
+            logger.debug(f"  cscript stdout: {stdout}")
+            if stderr:
+                logger.debug(f"  cscript stderr: {stderr}")
 
             if result.returncode == 0 and "OK" in stdout:
-                time.sleep(5)  # 等待 SW 内 VBA 完成
+                time.sleep(3)
                 try:
                     self._driver.sw_model.ForceRebuild3(True)
                     self._driver.sw_model.ViewZoomtofit2()
                 except Exception:
                     pass
-                logger.success("  [OK] VBA 巨集执行成功！")
+                logger.success("  [OK] VBScript（倒角+圆角）完成！")
+
+                # 键槽通过 Python COM FeatureCut4 创建
+                # （VBScript COM 不支持 FeatureCut3，返回 Nothing）
+                if keyways:
+                    kw_ok = self._create_keyways_python(keyways)
+                    if not kw_ok:
+                        logger.warning("  键槽创建部分失败，请检查 SW 特征树")
+                        return False
                 return True
             else:
-                logger.warning(f"  VBA 巨集执行失败: {stdout}")
-                logger.warning(f"  请在 SW 中手动运行: 工具→宏→运行→{macro_path}")
+                logger.warning(f"  VBScript 失败: stdout={stdout}, stderr={stderr}")
                 return False
         except subprocess.TimeoutExpired:
-            logger.warning("  VBA 巨集超时（可能是 SW 弹窗，请关闭弹窗后手动运行宏）")
+            logger.warning("  VBScript 超时（可能是 SW 弹窗阻塞）")
             return False
         except Exception as e:
-            logger.warning(f"  VBA 巨集异常: {e}")
+            logger.warning(f"  VBScript 异常: {e}")
             return False
 
     def _generate_post_revolve_vba(
@@ -276,8 +286,12 @@ class ShaftBuilder:
     ) -> str:
         """生成完整 VBA 巨集：倒角 + 圆角 + 键槽。
 
-        关键：所有坐标使用米（MKS 文档单位），mm 值 / 1000。
-        Python COM 中 _to_doc() 在 MKS 下也除 1000，保持一致。
+        关键：
+        - 所有坐标使用米（MKS 文档单位），mm 值 / 1000。
+        - 平面名称使用 SW API 内部英文名（Front Plane / Top Plane），
+          避免 GBK 编码损坏中文名称。
+        - 键槽采用前视基准面 + FeatureExtrusion2 双向 Z 轴拉伸
+          （SW 自动判断为切除），替代 FeatureCut3（参考面上不可用）。
         """
         def m(mm_val: float) -> str:
             return f"{mm_val / 1000.0}"
@@ -292,9 +306,9 @@ class ShaftBuilder:
         lines.append("    Dim swApp As Object, swModel As Object")
         lines.append("    Dim swFeatMgr As Object, swSketchMgr As Object")
         lines.append("    Dim swFeat As Object, swSelMgr As Object")
-        lines.append("    Dim xv As Double, yv As Double, nSel As Long")
-        lines.append("    Dim x1 As Double, x2 As Double, y As Double")
-        lines.append("    Dim hw As Double, zNeg As Double, zPos As Double, dM As Double")
+        lines.append("    Dim nSel As Long, i As Long")
+        lines.append("    Dim x1 As Double, x2 As Double, y1 As Double, y2 As Double")
+        lines.append("    Dim halfW As Double, halfL As Double, dM As Double")
         lines.append("")
         lines.append("    Set swApp = Application.SldWorks")
         lines.append("    Set swModel = swApp.ActiveDoc")
@@ -311,7 +325,7 @@ class ShaftBuilder:
         fillet_m = fillet_r_mm / 1000.0
 
         # ============================================================
-        # 1. 端面倒角
+        # 1. 端面倒角 — 选中端面外圆边，InsertFeatureChamfer
         # ============================================================
         left_x = sections[0][0]
         left_r = sections[0][2]
@@ -319,29 +333,29 @@ class ShaftBuilder:
         right_r = sections[-1][2]
 
         lines.append("    ' ============================================")
-        lines.append("    ' 端面倒角 C" + str(chamfer_mm))
+        lines.append(f"    ' End Chamfers C{chamfer_mm}")
         lines.append("    ' ============================================")
         lines.append("")
 
         for name, ex, er in [("LeftEnd", left_x, left_r), ("RightEnd", right_x, right_r)]:
             lines.append(f"    ' Chamfer-{name}")
             lines.append("    swModel.ClearSelection2 True")
-            # SelectByID2 用米; Z=0.001m 偏移避开圆柱面
+            # 端面圆边经过 (ex, er, 0)，Z=0 精确落在边上
             lines.append(f"    swModel.Extension.SelectByID2 \"\", \"Edge\", "
-                         f"{m(ex)}, {m(er)}, 0.001, True, 0, Nothing, 0")
+                         f"{m(ex)}, {m(er)}, 0.0, True, 0, Nothing, 0")
             lines.append("    nSel = swSelMgr.GetSelectedObjectCount2(-1)")
             lines.append("    If nSel > 0 Then")
             lines.append(f"        Set swFeat = swFeatMgr.InsertFeatureChamfer(")
-            lines.append(f"            1, 1, 0.785, {chamfer_m}#, 0, 0, 0, False)")
+            lines.append(f"            1, 1, {chamfer_m}#, 0.7853981633974483#, 0, 0, 0, False)")
             lines.append(f"        If Not swFeat Is Nothing Then swFeat.Name = \"Chamfer-{name}\"")
             lines.append("    End If")
             lines.append("")
 
         # ============================================================
-        # 2. 阶跃过渡圆角
+        # 2. 阶跃过渡圆角 — 多选阶跃边，FeatureFillet3 (Options=195)
         # ============================================================
         lines.append("    ' ============================================")
-        lines.append("    ' 阶跃过渡圆角 R" + str(fillet_r_mm))
+        lines.append(f"    ' Step Fillets R{fillet_r_mm}")
         lines.append("    ' ============================================")
         lines.append("    swModel.ClearSelection2 True")
 
@@ -349,11 +363,12 @@ class ShaftBuilder:
             mid = (sections[i][1] + sections[i + 1][0]) / 2.0
             r_big = max(sections[i][2], sections[i + 1][2])
             lines.append(f"    ' Step {i+1}: X={m(mid)}, R={m(r_big)}")
+            # 阶跃边也在 Z=0 平面上
             lines.append(f"    swModel.Extension.SelectByID2 \"\", \"Edge\", "
-                         f"{m(mid)}, {m(r_big)}, 0.001, True, 1, Nothing, 0")
+                         f"{m(mid)}, {m(r_big)}, 0.0, True, 1, Nothing, 0")
 
         lines.append("    nSel = swSelMgr.GetSelectedObjectCount2(-1)")
-        lines.append("    If nSel > 0 Then")
+        lines.append(f"    If nSel >= {len(sections) - 1} Then")
         lines.append(f"        Set swFeat = swFeatMgr.FeatureFillet3(")
         lines.append(f"            195, {fillet_m}#, 0, 0, False, 0, False, False)")
         lines.append("        If Not swFeat Is Nothing Then swFeat.Name = \"Fillet-Transitions\"")
@@ -361,57 +376,231 @@ class ShaftBuilder:
         lines.append("")
 
         # ============================================================
-        # 3. 键槽（相切参考面 + 拉伸切除）
+        # 3. 键槽 — 前视基准面 + FeatureExtrusion2 双向 Z 轴拉伸
+        #    （Python COM FeatureCut3 参考面限制的变通方案）
+        #    SW 自动判断为切除（已有实体时默认为 Cut）
         # ============================================================
         if keyways:
             lines.append("    ' ============================================")
-            lines.append("    ' 键槽")
+            lines.append("    ' Keyways (Front Plane + FeatureExtrusion2)")
             lines.append("    ' ============================================")
             lines.append("")
 
         for kw_idx, (xs, xe, w, d, sr) in enumerate(keyways):
             n = kw_idx + 1
-            cx = (xs + xe) / 2.0
             length = xe - xs
-            hw_val = w / 2.0
-            offset_m = sr / 1000.0
-            depth_m = d / 1000.0
+            half_w = w / 2.0
+            # 键槽深度方向: 从 shaft_radius 向下挖 depth
+            y_top = sr                      # 轴表面 Y 坐标 (mm)
+            y_bot = sr - d                  # 键槽底部 Y 坐标 (mm)
 
-            lines.append(f"    ' Keyway {n}: Xc={cx:.2f}mm L={length:.0f}mm W={w:.0f}mm D={d:.0f}mm R={sr:.0f}mm")
+            lines.append(f"    ' Keyway {n}: X=[{xs:.1f},{xe:.1f}] W={w:.0f} D={d:.0f} R={sr:.0f}")
             lines.append("")
-            lines.append(f"    ' Step 1: 相切参考面（上视基准面偏移 R）")
+            lines.append(f"    ' Step 1: Sketch on Front Plane")
             lines.append("    swModel.ClearSelection2 True")
-            lines.append("    swModel.Extension.SelectByID2 \"上视基准面\", \"PLANE\", 0, 0, 0, True, 0, Nothing, 0")
-            lines.append(f"    Set swFeat = swFeatMgr.InsertRefPlane(8, {offset_m}#, 0, 0, 0, 0)")
-            lines.append(f"    If Not swFeat Is Nothing Then swFeat.Name = \"KeywayPlane-{n}\"")
-            lines.append("")
-            lines.append(f"    ' Step 2: 键槽轮廓（XZ 平面，Y=shaft_r）")
-            lines.append("    swModel.ClearSelection2 True")
-            lines.append(f"    swModel.Extension.SelectByID2 \"KeywayPlane-{n}\", \"PLANE\", 0, 0, 0, True, 0, Nothing, 0")
+            # 使用 SW API 内部英文名称，避免 GBK 编码问题
+            lines.append("    swModel.Extension.SelectByID2 \"Front Plane\", \"PLANE\", 0, 0, 0, True, 0, Nothing, 0")
             lines.append("    swModel.InsertSketch2 True")
-            lines.append(f"    x1 = {m(round(cx - length / 2.0, 6))}#")
-            lines.append(f"    x2 = {m(round(cx + length / 2.0, 6))}#")
-            lines.append(f"    y  = {m(sr)}#")
-            lines.append(f"    hw = {m(hw_val)}#")
-            lines.append("    zNeg = -hw : zPos = hw")
-            lines.append("    swSketchMgr.CreateLine x1, y, zNeg, x2, y, zNeg")
-            lines.append("    swSketchMgr.CreateLine x2, y, zNeg, x2, y, zPos")
-            lines.append("    swSketchMgr.CreateLine x2, y, zPos, x1, y, zPos")
-            lines.append("    swSketchMgr.CreateLine x1, y, zPos, x1, y, zNeg")
             lines.append("")
-            lines.append(f"    ' Step 3: 拉伸切除（Flip=True 向 -Y 轴心）")
-            lines.append(f"    dM = {depth_m}#")
-            lines.append("    Set swFeat = swFeatMgr.FeatureCut3( True, True, False, False, 0, dM, False, 0, 0, False, False, 0, 0, False, False, False, False, False, True, True, True, False, 0, True, True, True )")
-            lines.append(f"    If Not swFeat Is Nothing Then swFeat.Name = \"Keyway-{n}\"")
+            lines.append(f"    ' Keyway profile (XY plane, extrude along Z)")
+            lines.append(f"    x1 = {m(xs)}#")
+            lines.append(f"    x2 = {m(xe)}#")
+            lines.append(f"    y1 = {m(y_bot)}#")
+            lines.append(f"    y2 = {m(y_top)}#")
+            lines.append("    swSketchMgr.CreateCornerRectangle x1, y1, 0, x2, y2, 0")
+            lines.append("")
+            lines.append(f"    ' Step 2: FeatureExtrusion2 bidirectional Z")
+            lines.append(f"    halfW = {m(half_w)}#")
+            lines.append("    Set swFeat = swFeatMgr.FeatureExtrusion2(True, False, False, 0, 0, halfW, halfW, False, False, False, False, 0, 0, False, False, False, False, True, True, True, 0, 0, False)")
+            lines.append(f"    If Not swFeat Is Nothing Then")
+            lines.append(f"        swFeat.Name = \"Keyway-{n}\"")
+            lines.append("    End If")
             lines.append("")
 
-        lines.append("    ' --- 完成 ---")
+        lines.append("    ' --- Done ---")
         lines.append("    swModel.ForceRebuild3 False")
         lines.append("    swModel.ViewZoomtofit2")
         lines.append("End Sub")
         lines.append("")
 
         return "\r\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # VBScript 直接 COM 生成（替代 RunMacro，避免 SW2025 挂死）
+    # ------------------------------------------------------------------
+
+    def _generate_post_revolve_vbs(
+        self,
+        sections: list[tuple[float, float, float]],
+        keyways: list[tuple[float, float, float, float, float]],
+        left_chamfer_mm: float,
+        right_chamfer_mm: float,
+        fillet_r_mm: float,
+    ) -> str:
+        """生成 VBScript 直接操作 SW COM。
+
+        特性:
+        - 倒角: 按 DXF 检测的左右端独立尺寸（0=跳过该端）
+        - 圆角: 多选阶跃边 + FeatureFillet3 (Options=195, SW2025 验证值)
+        - 键槽: 上视基准面偏移→相切参考面→草图矩形→FeatureCut3 向下切除
+
+        VBS 语法限制: 无 # 类型后缀、无 _ 续行符、函数调用必须单行。
+        """
+        def m(mm_val: float) -> str:
+            return f"{mm_val / 1000.0}"
+
+        lines = []
+        lines.append("' PostRevolve.vbs - Direct COM post-revolve features")
+        lines.append("Option Explicit")
+        lines.append("")
+        lines.append("Dim swApp, swModel, swFeatMgr, swSketchMgr, swSelMgr, swFeat")
+        lines.append("Dim nSel, i, dM, hw")
+        lines.append("")
+        lines.append("' --- Connect to SW ---")
+        lines.append("Set swApp = GetObject(, \"SldWorks.Application\")")
+        lines.append("If swApp Is Nothing Then")
+        lines.append("    WScript.Echo \"ERR: Cannot connect to SW\"")
+        lines.append("    WScript.Quit 1")
+        lines.append("End If")
+        lines.append("Set swModel = swApp.ActiveDoc")
+        lines.append("If swModel Is Nothing Then")
+        lines.append("    WScript.Echo \"ERR: No active document\"")
+        lines.append("    WScript.Quit 1")
+        lines.append("End If")
+        lines.append("Set swFeatMgr = swModel.FeatureManager")
+        lines.append("Set swSketchMgr = swModel.SketchManager")
+        lines.append("Set swSelMgr = swModel.SelectionManager")
+        lines.append("")
+
+        fillet_m = fillet_r_mm / 1000.0
+
+        # ================================================================
+        # 1. 端面倒角 — 按 DXF 检测的独立左右尺寸
+        # ================================================================
+        left_x = sections[0][0]
+        left_r = sections[0][2]
+        right_x = sections[-1][1]
+        right_r = sections[-1][2]
+
+        chamfer_list = [
+            ("LeftEnd", left_x, left_r, left_chamfer_mm),
+            ("RightEnd", right_x, right_r, right_chamfer_mm),
+        ]
+        active_chamfers = [(n, ex, er, sz) for n, ex, er, sz in chamfer_list if sz > 0]
+
+        if active_chamfers:
+            lines.append("' ============================================")
+            lines.append(f"' 1. End Chamfers")
+            lines.append("' ============================================")
+
+        for name, ex, er, ch_size in active_chamfers:
+            ch_m = ch_size / 1000.0
+            lines.append(f"' Chamfer-{name}: X={ex:.1f}mm R={er:.1f}mm C{ch_size:.1f}")
+            lines.append("swModel.ClearSelection2 True")
+            lines.append(f"swModel.Extension.SelectByID2 \"\", \"Edge\", "
+                         f"{m(ex)}, {m(er)}, 0.0, True, 0, Nothing, 0")
+            lines.append("nSel = swSelMgr.GetSelectedObjectCount2(-1)")
+            lines.append("If nSel > 0 Then")
+            lines.append(f"    Set swFeat = swFeatMgr.InsertFeatureChamfer("
+                         f"1, 1, {ch_m}, 0.7853981633974483, 0, 0, 0, False)")
+            lines.append(f"    If Not swFeat Is Nothing Then swFeat.Name = \"Chamfer-{name}\"")
+            lines.append("End If")
+
+        if active_chamfers:
+            lines.append("")
+
+        # ================================================================
+        # 2. 阶跃过渡圆角
+        # ================================================================
+        lines.append("' ============================================")
+        lines.append(f"' 2. Step Fillets R{fillet_r_mm}")
+        lines.append("' ============================================")
+        lines.append("swModel.ClearSelection2 True")
+        for i in range(len(sections) - 1):
+            mid = (sections[i][1] + sections[i + 1][0]) / 2.0
+            r_big = max(sections[i][2], sections[i + 1][2])
+            lines.append(f"swModel.Extension.SelectByID2 \"\", \"Edge\", "
+                         f"{m(mid)}, {m(r_big)}, 0.0, True, 1, Nothing, 0")
+        lines.append("nSel = swSelMgr.GetSelectedObjectCount2(-1)")
+        lines.append(f"If nSel >= {len(sections) - 1} Then")
+        lines.append(f"    Set swFeat = swFeatMgr.FeatureFillet3("
+                     f"195, {fillet_m}, 0, 0, False, 0, False, False)")
+        lines.append("    If Not swFeat Is Nothing Then swFeat.Name = \"Fillet-Transitions\"")
+        lines.append("End If")
+        lines.append("")
+
+        # ================================================================
+        # 3. 键槽 — 由 Python COM FeatureCut4 处理（VBScript 中跳过）
+        #    VBScript COM 接口不支持 FeatureCut3（返回 Nothing），
+        #    而 Python COM FeatureCut4 在前视基准面上可用 (V45 验证)。
+        # ================================================================
+        if keyways:
+            lines.append("' ============================================")
+            lines.append("' 3. Keyways — skipped (handled by Python COM)")
+            lines.append("' ============================================")
+
+        lines.append("")
+        lines.append("' --- Done ---")
+        lines.append("swModel.ForceRebuild3 False")
+        lines.append("swModel.ViewZoomtofit2")
+        lines.append("WScript.Echo \"OK\"")
+        lines.append("")
+
+        return "\r\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Python COM 键槽创建 (FeatureCut4, SW2025)
+    # ------------------------------------------------------------------
+
+    def _create_keyways_python(
+        self,
+        keyways: list[tuple[float, float, float, float, float]],
+    ) -> bool:
+        """通过 Python COM FeatureCut4 创建键槽切除。
+
+        V45 验证: FeatureCut3/4 在 Python COM 中前视基准面上可用。
+        VBScript COM 接口 FeatureCut3 返回 Nothing（接口限制）。
+
+        每个键槽:
+          1. 前视基准面 + 草图矩形（Z=0, Y 跨轴表面）
+          2. FeatureCut4 双向 Z 轴切除（深度=键槽半宽）
+        """
+        logger.info("--- Python COM 键槽切除 ---")
+        all_ok = True
+        for kw_idx, (xs, xe, w, d, sr) in enumerate(keyways):
+            n = kw_idx + 1
+            hw = w / 2.0  # 键槽半宽 = Z 方向切除深度
+            y_bot = sr - d  # 键槽底部 Y (mm)
+            y_top = sr      # 轴表面 Y (mm)
+
+            logger.info(f"  键槽{n}: X=[{xs:.1f},{xe:.1f}] W={w:.0f} D={d:.0f} R={sr:.0f}")
+
+            # 前视基准面草图（必须中文名称）
+            if not self._driver.start_sketch("前视基准面"):
+                logger.error(f"  键槽{n}: 无法打开前视基准面草图")
+                all_ok = False
+                continue
+
+            # 矩形轮廓（Z=0 必须）
+            z = 0.0
+            self._driver.draw_line(xs, y_bot, z, xe, y_bot, z)
+            self._driver.draw_line(xe, y_bot, z, xe, y_top, z)
+            self._driver.draw_line(xe, y_top, z, xs, y_top, z)
+            self._driver.draw_line(xs, y_top, z, xs, y_bot, z)
+
+            # FeatureCut3 双向 Z 轴切除 (V45 验证 26 参数)
+            ok = self._driver.feature_cut3_bidir(
+                depth1_mm=hw,
+                depth2_mm=hw,
+                feat_name=f"Keyway-{n}",
+            )
+            if ok:
+                logger.success(f"  [OK] Keyway-{n}")
+            else:
+                logger.error(f"  [FAIL] Keyway-{n}: FeatureCut4 返回 None")
+                all_ok = False
+
+        return all_ok
 
     # ------------------------------------------------------------------
     # 以下为旧版方法（不再由 build() 调用，保留作为参考/手动使用）
@@ -545,7 +734,7 @@ class ShaftBuilder:
 
         vbs_code = self._generate_keyway_vbscript(keyways)
         vbs_path = Path(tempfile.gettempdir()) / "sw_keyway_cut.vbs"
-        vbs_path.write_text(vbs_code, encoding="gbk")
+        vbs_path.write_text(vbs_code, encoding="utf-8")
         logger.debug(f"  VBScript: {vbs_path}")
 
         try:
@@ -693,7 +882,7 @@ class ShaftBuilder:
         )
 
         vbs_path = macro_path.with_suffix('.vbs')
-        vbs_path.write_text(vbs_code, encoding="gbk")
+        vbs_path.write_text(vbs_code, encoding="utf-8")
         logger.debug(f"  VBScript: {vbs_path}")
 
         try:

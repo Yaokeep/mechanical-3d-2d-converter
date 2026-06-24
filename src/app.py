@@ -12,7 +12,7 @@ class Application:
     """应用程序主类，负责 QApplication 初始化、主题加载和主窗口启动"""
 
     APP_NAME = "机械三维二维图互转"
-    APP_VERSION = "0.3.0"
+    APP_VERSION = "0.5.0"
     APP_ORG = "CADConverter"
 
     def __init__(self, argv: list[str]):

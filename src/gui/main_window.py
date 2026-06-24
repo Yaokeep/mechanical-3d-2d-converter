@@ -25,7 +25,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("机械三维二维图互转 v0.4.0")
+        self.setWindowTitle("机械三维二维图互转 v0.5.0")
         self.resize(1400, 900)
         self.setMinimumSize(1024, 600)
 
@@ -532,7 +532,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "关于 机械三维二维图互转",
-            "<h3>机械三维二维图互转 v0.4.0</h3>"
+            "<h3>机械三维二维图互转 v0.5.0</h3>"
             "<p>机械工程 3D ↔ 2D 双向互转桌面工具</p>"
             "<p>技术栈：PyQt6 + OpenCASCADE (PythonOCC) + SolidWorks COM</p>"
             "<hr>"

@@ -668,6 +668,65 @@ class SolidWorksDriver:
             logger.error(f"{feat_name}: FeatureCut4 异常 - {e}")
             raise SwFeatureError(f"拉伸切除创建失败: {e}") from e
 
+    def feature_cut3_bidir(
+        self,
+        depth1_mm: float,
+        depth2_mm: float,
+        feat_name: str = "CutExtrude",
+    ) -> bool:
+        """FeatureCut3 双向切除（26 参数，对齐 V45 VBA 验证签名）。
+
+        Python COM 直接调用 FeatureCut3（不用 FeatureCut4），
+        与 V45 验证宏完全一致的参数顺序。
+
+        Args:
+            depth1_mm: 方向1 切除深度 (mm)。
+            depth2_mm: 方向2 切除深度 (mm)。
+            feat_name: 特征名称。
+
+        Returns:
+            bool: 成功返回 True。
+        """
+        d1 = self.mm_to_m(depth1_mm)
+        d2 = self.mm_to_m(depth2_mm)
+        try:
+            feat = self.sw_feat_mgr.FeatureCut3(
+                True,   # Sd
+                False,  # Flip
+                False,  # Dir
+                False,  # T1Both
+                0,      # T1 = Blind
+                d1,     # D1
+                False,  # Dchk1
+                0,      # T2
+                d2,     # D2
+                False,  # Dchk2
+                False,  # Ddir1
+                0.0, 0.0,  # Dval1, Dval2
+                False,  # Dvalchk1
+                False,  # Dvalchk2
+                False,  # Dvaldir1
+                False,  # Dvaldir2
+                False,  # Dvalval1
+                True,   # B1
+                True,   # B2
+                True,   # Bcont
+                False,  # Boff
+                0.0,    # Offset
+                False,  # Merge
+                False,  # FeatureScope
+                False,  # AutoSelect
+            )
+            if feat is None:
+                logger.error(f"{feat_name}: FeatureCut3 返回 None (d1={depth1_mm}, d2={depth2_mm})")
+                return False
+            feat.Name = feat_name
+            logger.success(f"  [OK] {feat_name} (深度 {depth1_mm}+{depth2_mm}mm)")
+            return True
+        except Exception as e:
+            logger.error(f"{feat_name}: FeatureCut3 异常 - {e}")
+            raise SwFeatureError(f"拉伸切除创建失败: {e}") from e
+
 
 # ---------------------------------------------------------------------------
 # 便捷函数
