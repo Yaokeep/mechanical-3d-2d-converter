@@ -1,23 +1,22 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v2.0
 
-将任意 2D CAD 工程图转换为 3D 实体模型。核心思路：
-  1. 解析 LINE/ARC/CIRCLE → 统一边表示
-  2. 端点合并（邻近容差）→ 建图
-  3. 平面图面遍历 → 封闭轮廓
-  4. 智能拉伸（按截面区域 + 几何类型）
-  5. 布尔合并 → 单一实体
-  6. STEP 导出 → SolidWorks COM 导入
+核心改进（相比 v1.0）:
+  1. 自动视图检测 — 基于文字标签 + 几何密度分析
+  2. 主体优先 — 先识别最大非圆轮廓作为主体，再在其上加减特征
+  3. 正确的圆柱体 — 同心圆弧 → 贯穿圆柱/孔
+  4. SPLINE 智能处理 — 过滤采样产生的碎片面
+  5. 剖面图支持 — 多剖面轮廓空间组合
 
 用法:
     python dxf_to_3d_general.py <输入.dxf> [输出.sldprt]
-    python dxf_to_3d_general.py CAD/reducer.dxf
 """
 
 import math
 import sys
 import os
 from pathlib import Path
+from collections import Counter, defaultdict
 
 PROJECT_ROOT = Path(__file__).parent
 SRC_PATH = PROJECT_ROOT / "src"
@@ -36,81 +35,68 @@ def _ensure_occ():
     global _OCC_LOADED
     if _OCC_LOADED:
         return
-    # 基础几何
     from OCC.Core.gp import (
         gp_Pnt, gp_Dir, gp_Ax1, gp_Ax2, gp_Vec,
         gp_Circ, gp_Trsf, gp_XYZ,
     )
-    # 边/线框/面构建
     from OCC.Core.BRepBuilderAPI import (
-        BRepBuilderAPI_MakeEdge,
-        BRepBuilderAPI_MakeWire,
-        BRepBuilderAPI_MakeFace,
-        BRepBuilderAPI_Transform,
+        BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire,
+        BRepBuilderAPI_MakeFace, BRepBuilderAPI_Transform,
     )
-    # 拉伸/旋转
     from OCC.Core.BRepPrimAPI import (
-        BRepPrimAPI_MakePrism,
-        BRepPrimAPI_MakeRevol,
-        BRepPrimAPI_MakeCylinder,
+        BRepPrimAPI_MakePrism, BRepPrimAPI_MakeRevol,
+        BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeBox,
     )
-    # 布尔运算
-    from OCC.Core.BRepAlgoAPI import (
-        BRepAlgoAPI_Fuse,
-        BRepAlgoAPI_Cut,
-    )
-    # 形状修复
-    from OCC.Core.ShapeFix import ShapeFix_Face, ShapeFix_Wire
-    # 拓扑类型
+    from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut, BRepAlgoAPI_Common
+    from OCC.Core.ShapeFix import ShapeFix_Face, ShapeFix_Wire, ShapeFix_Shape
     from OCC.Core.TopoDS import TopoDS_Shape, TopoDS_Face, TopoDS_Wire
-    # STEP 导出
     from OCC.Core.STEPControl import STEPControl_Writer, STEPControl_AsIs
     from OCC.Core.IFSelect import IFSelect_RetDone
-    # 拓扑工具
     from OCC.Core.TopExp import TopExp_Explorer
     from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_WIRE, TopAbs_FACE
     from OCC.Core.BRepCheck import BRepCheck_Analyzer
     from OCC.Core.BRep import BRep_Builder
     from OCC.Core.BRepTools import breptools
-    # 投影/分类
     from OCC.Core.BRepClass3d import BRepClass3d_SolidClassifier
-    from OCC.Core.TopoDS import topods
+    from OCC.Core.Bnd import Bnd_Box
+    from OCC.Core.BRepBndLib import brepbndlib
 
     g = globals()
-    g.update({
-        "gp_Pnt": gp_Pnt, "gp_Dir": gp_Dir, "gp_Ax1": gp_Ax1,
-        "gp_Ax2": gp_Ax2, "gp_Vec": gp_Vec, "gp_Circ": gp_Circ,
-        "gp_Trsf": gp_Trsf, "gp_XYZ": gp_XYZ,
-        "BRepBuilderAPI_MakeEdge": BRepBuilderAPI_MakeEdge,
-        "BRepBuilderAPI_MakeWire": BRepBuilderAPI_MakeWire,
-        "BRepBuilderAPI_MakeFace": BRepBuilderAPI_MakeFace,
-        "BRepBuilderAPI_Transform": BRepBuilderAPI_Transform,
-        "BRepPrimAPI_MakePrism": BRepPrimAPI_MakePrism,
-        "BRepPrimAPI_MakeRevol": BRepPrimAPI_MakeRevol,
-        "BRepPrimAPI_MakeCylinder": BRepPrimAPI_MakeCylinder,
-        "BRepAlgoAPI_Fuse": BRepAlgoAPI_Fuse,
-        "BRepAlgoAPI_Cut": BRepAlgoAPI_Cut,
-        "ShapeFix_Face": ShapeFix_Face,
-        "ShapeFix_Wire": ShapeFix_Wire,
-        "STEPControl_Writer": STEPControl_Writer,
-        "STEPControl_AsIs": STEPControl_AsIs,
-        "IFSelect_RetDone": IFSelect_RetDone,
-        "TopExp_Explorer": TopExp_Explorer,
-        "TopAbs_EDGE": TopAbs_EDGE,
-        "TopAbs_WIRE": TopAbs_WIRE,
-        "TopAbs_FACE": TopAbs_FACE,
-        "BRepCheck_Analyzer": BRepCheck_Analyzer,
-        "BRep_Builder": BRep_Builder,
-        "TopoDS_Shape": TopoDS_Shape,
-        "TopoDS_Face": TopoDS_Face,
-        "breptools": breptools,
-        "BRepClass3d_SolidClassifier": BRepClass3d_SolidClassifier,
-    })
+    for name, obj in [
+        ("gp_Pnt", gp_Pnt), ("gp_Dir", gp_Dir), ("gp_Ax1", gp_Ax1),
+        ("gp_Ax2", gp_Ax2), ("gp_Vec", gp_Vec), ("gp_Circ", gp_Circ),
+        ("gp_Trsf", gp_Trsf), ("gp_XYZ", gp_XYZ),
+        ("BRepBuilderAPI_MakeEdge", BRepBuilderAPI_MakeEdge),
+        ("BRepBuilderAPI_MakeWire", BRepBuilderAPI_MakeWire),
+        ("BRepBuilderAPI_MakeFace", BRepBuilderAPI_MakeFace),
+        ("BRepBuilderAPI_Transform", BRepBuilderAPI_Transform),
+        ("BRepPrimAPI_MakePrism", BRepPrimAPI_MakePrism),
+        ("BRepPrimAPI_MakeRevol", BRepPrimAPI_MakeRevol),
+        ("BRepPrimAPI_MakeCylinder", BRepPrimAPI_MakeCylinder),
+        ("BRepPrimAPI_MakeBox", BRepPrimAPI_MakeBox),
+        ("BRepAlgoAPI_Fuse", BRepAlgoAPI_Fuse),
+        ("BRepAlgoAPI_Cut", BRepAlgoAPI_Cut),
+        ("BRepAlgoAPI_Common", BRepAlgoAPI_Common),
+        ("ShapeFix_Face", ShapeFix_Face), ("ShapeFix_Wire", ShapeFix_Wire),
+        ("ShapeFix_Shape", ShapeFix_Shape),
+        ("STEPControl_Writer", STEPControl_Writer),
+        ("STEPControl_AsIs", STEPControl_AsIs),
+        ("IFSelect_RetDone", IFSelect_RetDone),
+        ("TopExp_Explorer", TopExp_Explorer),
+        ("TopAbs_EDGE", TopAbs_EDGE), ("TopAbs_WIRE", TopAbs_WIRE),
+        ("TopAbs_FACE", TopAbs_FACE),
+        ("BRepCheck_Analyzer", BRepCheck_Analyzer),
+        ("BRep_Builder", BRep_Builder), ("breptools", breptools),
+        ("BRepClass3d_SolidClassifier", BRepClass3d_SolidClassifier),
+        ("Bnd_Box", Bnd_Box), ("brepbndlib", brepbndlib),
+    ]:
+        g[name] = obj
     _OCC_LOADED = True
 
 
 # ---- 容差 ----
-SNAP_TOL = 0.01  # 端点合并容差 (mm)
+SNAP_TOL = 0.01       # 端点合并容差 (mm)
+CENTER_MERGE_TOL = 1.0  # 同心圆心合并容差 (mm)
 
 
 # ============================================================
@@ -130,13 +116,13 @@ class Edge:
                  start_angle=None, end_angle=None,
                  clockwise=False):
         self.id = eid
-        self.etype = etype  # "LINE" | "ARC"
-        self.start = start  # (x, y)
-        self.end = end      # (x, y)
+        self.etype = etype
+        self.start = start
+        self.end = end
         self.center = center
         self.radius = radius
-        self.start_angle = start_angle  # 度
-        self.end_angle = end_angle      # 度
+        self.start_angle = start_angle
+        self.end_angle = end_angle
         self.clockwise = clockwise
 
     @property
@@ -146,7 +132,6 @@ class Edge:
         if self.etype == "LINE":
             return math.hypot(dx, dy)
         else:
-            # 圆弧长度 = r * Δθ
             da = abs(self.end_angle - self.start_angle)
             if da > 180:
                 da = 360 - da
@@ -157,12 +142,7 @@ class Edge:
 
 
 def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
-    """从 DXF 提取所有 LINE/ARC/CIRCLE 为统一边列表。
-
-    返回 (edges, metadata)。
-    - edges: Edge 列表
-    - metadata: {bbox_min, bbox_max, entity_counts, layer_info}
-    """
+    """从 DXF 提取所有几何实体为统一边列表。"""
     doc = ezdxf.readfile(dxf_path)
     msp = doc.modelspace()
 
@@ -186,7 +166,6 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
         r = e.dxf.radius
         a1 = e.dxf.start_angle
         a2 = e.dxf.end_angle
-        # 计算起止点
         sx = cx + r * math.cos(math.radians(a1))
         sy = cy + r * math.sin(math.radians(a1))
         ex = cx + r * math.cos(math.radians(a2))
@@ -205,13 +184,11 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
         r = e.dxf.radius
         if r < SNAP_TOL:
             continue
-        # 弧1: 0°→180°
         e1 = Edge(eid, "ARC",
                   (cx + r, cy), (cx - r, cy),
                   center=(cx, cy), radius=r,
                   start_angle=0, end_angle=180)
         eid += 1
-        # 弧2: 180°→360°
         e2 = Edge(eid, "ARC",
                   (cx - r, cy), (cx + r, cy),
                   center=(cx, cy), radius=r,
@@ -226,7 +203,6 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
         pts = list(e.vertices())
         if len(pts) < 2:
             continue
-        bulge = None
         for i in range(len(pts) - 1):
             x1, y1 = pts[i].dxf.location.x, pts[i].dxf.location.y
             x2, y2 = pts[i+1].dxf.location.x, pts[i+1].dxf.location.y
@@ -240,19 +216,14 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
                     edges.append(edge)
                     eid += 1
             else:
-                # bulge = tan(θ/4), θ 为弧所对圆心角
                 theta = 4 * math.atan(abs(bulge))
                 chord = math.hypot(x2 - x1, y2 - y1)
                 if chord < SNAP_TOL or theta < 1e-9:
                     continue
                 r = chord / (2 * math.sin(theta / 2))
-                # 弦中点
                 mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-                # 弦方向
                 dx, dy = x2 - x1, y2 - y1
-                # 法向量（左侧）
                 nx, ny = -dy / chord, dx / chord
-                # 圆心偏移
                 offset = r * math.cos(theta / 2)
                 if bulge > 0:
                     cx = mx + nx * offset
@@ -260,7 +231,6 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
                 else:
                     cx = mx - nx * offset
                     cy = my - ny * offset
-                # 角度
                 a1 = math.degrees(math.atan2(y1 - cy, x1 - cx))
                 a2_val = math.degrees(math.atan2(y2 - cy, x2 - cx))
                 edge = Edge(eid, "ARC", (x1, y1), (x2, y2),
@@ -272,7 +242,7 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
                     eid += 1
         entity_counts["LWPOLYLINE"] = entity_counts.get("LWPOLYLINE", 0) + 1
 
-    # SPLINE → 采样为 LINE 段
+    # SPLINE → 采样为 LINE 段，记录原始 SPLINE 信息用于后续过滤
     for e in msp.query("SPLINE"):
         try:
             ctrl = list(e.control_points)
@@ -289,8 +259,7 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
             pass
 
     # 计算 bbox
-    xs = []
-    ys = []
+    xs, ys = [], []
     for e in edges:
         xs.extend([e.start[0], e.end[0]])
         ys.extend([e.start[1], e.end[1]])
@@ -307,29 +276,40 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
     return edges, metadata
 
 
+def parse_dxf_texts(dxf_path: str) -> list[dict]:
+    """提取 DXF 中的文字实体，用于视图标签检测。"""
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+    texts = []
+    for e in msp.query("TEXT MTEXT"):
+        try:
+            if e.dxftype() == "MTEXT":
+                txt = e.text if hasattr(e, 'text') else ''
+            else:
+                txt = e.dxf.text if hasattr(e.dxf, 'text') else ''
+            x = e.dxf.insert.x
+            y = e.dxf.insert.y
+            texts.append({"text": txt.strip(), "x": x, "y": y, "type": e.dxftype()})
+        except Exception:
+            pass
+    return texts
+
+
 # ============================================================
-# 2. 端点合并且建图
+# 2. 图构建
 # ============================================================
 
 def _key(pt, tol=SNAP_TOL):
-    """将点坐标量化为网格键。"""
     return (round(pt[0] / tol) * tol, round(pt[1] / tol) * tol)
 
 
 def build_vertex_map(edges: list[Edge]):
-    """合并邻近端点，建立 vertex_id → (x, y) 映射与每条边的 vertex 端点。
-
-    返回:
-        vertex_pos: {vid: (x, y)}
-        edge_vertices: [(vid_start, vid_end), ...] 与 edges 等长
-    """
-    # 收集所有端点
+    """合并邻近端点，建立 vertex_id → (x, y) 映射。"""
     points = []
     for e in edges:
         points.append(e.start)
         points.append(e.end)
 
-    # 量化合并
     key_to_vid = {}
     vertex_pos = {}
     next_vid = 0
@@ -338,10 +318,9 @@ def build_vertex_map(edges: list[Edge]):
         k = _key(pt)
         if k not in key_to_vid:
             key_to_vid[k] = next_vid
-            vertex_pos[next_vid] = k  # 使用量化后的坐标
+            vertex_pos[next_vid] = k
             next_vid += 1
 
-    # 建边-顶点映射
     edge_vertices = []
     for e in edges:
         vs = key_to_vid[_key(e.start)]
@@ -353,30 +332,22 @@ def build_vertex_map(edges: list[Edge]):
 
 def build_adjacency(vertex_pos: dict, edge_vertices: list, edges: list[Edge],
                     num_vertices: int):
-    """建立顶点邻接表，包含边角度信息。
-
-    返回:
-        adj: {vid: [(eid, other_vid, angle_at_vid), ...]}
-    """
+    """建立顶点邻接表，包含边角度信息。"""
     adj = {v: [] for v in range(num_vertices)}
 
     for eid, (vs, ve) in enumerate(edge_vertices):
         edge = edges[eid]
-        # 角度计算：在 vs 处，边的出方向
         if vs == ve:
-            continue  # 跳过零长度边
+            continue
 
         # 在 vs 处的切向角
         if edge.etype == "LINE":
             dx = vertex_pos[ve][0] - vertex_pos[vs][0]
             dy = vertex_pos[ve][1] - vertex_pos[vs][1]
         else:
-            # ARC: 在起点 vs 处的切向
             cx, cy = edge.center
             sx, sy = vertex_pos[vs]
-            # 径向向外
             rx, ry = sx - cx, sy - cy
-            # 切向（逆时针旋转 90°）
             if edge.clockwise:
                 dx, dy = -ry, rx
             else:
@@ -399,7 +370,6 @@ def build_adjacency(vertex_pos: dict, edge_vertices: list, edges: list[Edge],
         angle_ve = math.atan2(dy, dx)
         adj[ve].append((eid, vs, angle_ve))
 
-    # 按角度排序（从 -π 到 π）
     for v in adj:
         adj[v].sort(key=lambda x: x[2])
 
@@ -407,24 +377,15 @@ def build_adjacency(vertex_pos: dict, edge_vertices: list, edges: list[Edge],
 
 
 # ============================================================
-# 3. 平面图面遍历 — 找所有封闭环
+# 3. 平面图面遍历
 # ============================================================
 
 def find_all_faces(adj: dict, edges: list[Edge], edge_vertices: list):
-    """使用平面图面遍历算法找到所有封闭环。
-
-    对每条有向边 (u→v)，从 v 出发沿顺时针最靠近的边继续走，
-    直到回到起点。每条无向边恰好被两个面使用（正反方向各一次）。
-
-    返回:
-        faces: [[eid1, eid2, ...], ...]  每个面是一组边的有序列表
-    """
+    """使用平面图面遍历算法找到所有封闭环。"""
     num_edges = len(edges)
     if num_edges == 0:
         return []
 
-    # 记录每条有向边是否已被使用
-    # 键: (eid, from_vid, to_vid) — 每条无向边有两个有向键
     used = {}
     for eid, (vs, ve) in enumerate(edge_vertices):
         if vs != ve:
@@ -436,12 +397,9 @@ def find_all_faces(adj: dict, edges: list[Edge], edge_vertices: list):
     for eid_start, (vs_start, ve_start) in enumerate(edge_vertices):
         if vs_start == ve_start:
             continue
-        # 两个方向都要检查
         for u, v in [(vs_start, ve_start), (ve_start, vs_start)]:
             dkey = (eid_start, u, v)
-            if dkey not in used:
-                continue
-            if used[dkey]:
+            if dkey not in used or used[dkey]:
                 continue
             used[dkey] = True
 
@@ -449,14 +407,11 @@ def find_all_faces(adj: dict, edges: list[Edge], edge_vertices: list):
             cur_v = v
             prev_v = u
             closed = True
-            max_steps = num_edges * 4  # 安全上限
 
-            for _ in range(max_steps):
+            for _ in range(num_edges * 4):
                 if cur_v == u:
                     break
 
-                # 在 cur_v 处，找到从 prev_v 来的那个入射边的角度
-                # 入射边的方向是 prev_v→cur_v，在 cur_v 处的入射角
                 incoming_angle = None
                 for eid_in, other, ang in adj.get(cur_v, []):
                     if other == prev_v:
@@ -467,39 +422,30 @@ def find_all_faces(adj: dict, edges: list[Edge], edge_vertices: list):
                     closed = False
                     break
 
-                # 入射方向反向后即为 next 边的参考方向
                 out_angle_ref = incoming_angle + math.pi
                 if out_angle_ref > math.pi:
                     out_angle_ref -= 2 * math.pi
 
-                # 在所有相邻边中找顺时针最近的下一条
                 candidates = adj.get(cur_v, [])
                 if len(candidates) <= 1:
                     closed = False
                     break
 
-                # 从入射方向顺时针转，找到第一条未使用的出边
                 best_eid = None
                 best_next = None
-                best_cw_angle = -float("inf")  # 顺时针最大负角 = 最近顺时针
+                best_cw_angle = -float("inf")
 
                 for eid_out, other_v, ang_out in candidates:
                     if other_v == cur_v:
                         continue
                     dk = (eid_out, cur_v, other_v)
-                    if dk not in used:
+                    if dk not in used or used[dk]:
                         continue
-                    if used[dk]:
-                        continue
-                    # 计算从 out_angle_ref 顺时针到 ang_out 的角度
-                    # 顺时针为正（角度减小），范围 [0, 2π)
                     cw_angle = out_angle_ref - ang_out
                     if cw_angle < -math.pi:
                         cw_angle += 2 * math.pi
                     if cw_angle < 0:
                         cw_angle += 2 * math.pi
-                    # 取最大的顺时针角度（即最小的顺时针旋转）
-                    # 等价于找最接近 out_angle_ref 顺时针方向的边
                     if cw_angle > best_cw_angle:
                         best_cw_angle = cw_angle
                         best_eid = eid_out
@@ -524,7 +470,6 @@ def find_all_faces(adj: dict, edges: list[Edge], edge_vertices: list):
     for f_ids in faces:
         if not f_ids:
             continue
-        # 旋转到最小边ID开头，同时尝试反向
         n = len(f_ids)
         min_eid = min(f_ids)
         min_positions = [i for i, eid in enumerate(f_ids) if eid == min_eid]
@@ -543,659 +488,807 @@ def find_all_faces(adj: dict, edges: list[Edge], edge_vertices: list):
 
 
 # ============================================================
-# 4. 面 → OCC Face
+# 4. 面分析
 # ============================================================
 
-def edge_to_occ_edge(edge: Edge, vertex_pos: dict, edge_vertices: list, eid: int):
-    """将一条 Edge 转为 OCC 边（TopoDS_Edge）。"""
-    vs, ve = edge_vertices[eid]
-    p1 = vertex_pos[vs]
-    p2 = vertex_pos[ve]
+def analyze_face(face_eid_list, edges, edge_vertices, vertex_pos):
+    """全面分析一个面，返回面信息字典。"""
+    xs, ys = [], []
+    etypes = set()
+    arc_centers = []
+    arc_radii = []
 
-    if edge.etype == "LINE":
-        return BRepBuilderAPI_MakeEdge(
-            gp_Pnt(p1[0], p1[1], 0),
-            gp_Pnt(p2[0], p2[1], 0),
-        ).Edge()
+    for eid in face_eid_list:
+        e = edges[eid]
+        vs, ve = edge_vertices[eid]
+        xs.extend([vertex_pos[vs][0], vertex_pos[ve][0]])
+        ys.extend([vertex_pos[vs][1], vertex_pos[ve][1]])
+        etypes.add(e.etype)
+
+        if e.etype == "ARC" and e.center:
+            cx, cy = e.center
+            r = e.radius
+            arc_centers.append((cx, cy))
+            arc_radii.append(r)
+            # ARC 极值点
+            a1 = math.radians(e.start_angle)
+            a2 = math.radians(e.end_angle)
+            if a2 < a1:
+                a2 += 2 * math.pi
+            for ka in [0, math.pi/2, math.pi, 3*math.pi/2]:
+                a = ka
+                if a < a1:
+                    a += 2 * math.pi
+                if a1 <= a <= a2:
+                    xs.append(cx + r * math.cos(ka))
+                    ys.append(cy + r * math.sin(ka))
+            xs.append(cx)
+            ys.append(cy)
+
+    bb_area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+    width = max(xs) - min(xs)
+    height = max(ys) - min(ys)
+
+    # 面类型判定
+    n_arcs = len(arc_centers)
+    if n_arcs >= 2:
+        unique_centers = set((round(c[0], 2), round(c[1], 2)) for c in arc_centers)
+        if len(unique_centers) == 1:
+            face_type = "concentric"  # 同心圆
+        else:
+            face_type = "multi_arc"
+    elif n_arcs == 1:
+        face_type = "single_arc"
     else:
-        cx, cy = edge.center
-        # ARC: 需要确定圆弧方向与起止角度
-        circ = gp_Circ(
-            gp_Ax2(gp_Pnt(cx, cy, 0), gp_Dir(0, 0, 1)),
-            edge.radius,
-        )
-        # 计算实际起止角（注意 OCC 的弧度制）
-        a1 = math.radians(edge.start_angle)
-        a2_val = math.radians(edge.end_angle)
-        return BRepBuilderAPI_MakeEdge(circ, a1, a2_val).Edge()
+        face_type = "line_only"
+
+    # 检查是否为 SPLINE 采样产生的碎片面
+    is_spline_debris = (
+        face_type == "line_only"
+        and len(face_eid_list) <= 3
+        and bb_area < 5.0
+    )
+
+    return {
+        "edges": face_eid_list,
+        "area": bb_area,
+        "width": width,
+        "height": height,
+        "x_min": min(xs), "x_max": max(xs),
+        "y_min": min(ys), "y_max": max(ys),
+        "y_mid": (max(ys) + min(ys)) / 2,
+        "x_mid": (max(xs) + min(xs)) / 2,
+        "etypes": etypes,
+        "face_type": face_type,
+        "n_arcs": n_arcs,
+        "arc_centers": list(set((round(c[0], 2), round(c[1], 2))
+                                for c in arc_centers)),
+        "arc_radii": sorted(set(round(r, 2) for r in arc_radii)),
+        "is_spline_debris": is_spline_debris,
+    }
 
 
-def build_occ_face(face_edges: list[int], edges: list[Edge],
-                   vertex_pos: dict, edge_vertices: list) -> object:
-    """从面边列表构建 OCC TopoDS_Face。"""
+# ============================================================
+# 5. 视图检测
+# ============================================================
+
+def detect_views(faces_info: list[dict], texts: list[dict],
+                 total_bbox: tuple, total_bbox_area: float) -> dict:
+    """自动检测工程图的视图区域划分。
+
+    策略:
+    1. 利用剖面标签 (A-A, B-B, 1-1 等) 的 Y 坐标作为分界
+    2. 分析 Y 方向的几何密度间隙
+    3. 找出标题栏区域并排除
+
+    返回: {
+        "title_block_y_range": (ylo, yhi) or None,
+        "view_regions": [(name, y_lo, y_hi, view_type), ...],
+        "main_body_region": str (region name),
+    }
+    """
+    import re
+    # 匹配剖面标签：A-A, B-B, 1-1 等，也匹配单字母（剖面位置标记）
+    section_pattern = re.compile(
+        r'^[A-Za-z0-9]+[-—–][A-Za-z0-9]+$'
+    )
+
+    # Step 1: 找剖面标签的 Y 位置
+    label_ys = []
+    for t in texts:
+        txt = t["text"].strip()
+        if section_pattern.match(txt) and len(txt) <= 6:
+            label_ys.append((t["y"], txt[0].upper()))
+        # 也收集单个大写字母（可能是剖面标记）
+        elif re.match(r'^[A-Z]$', txt):
+            label_ys.append((t["y"], txt))
+
+    label_ys.sort()
+
+    # 找成对的标签
+    paired_labels = []
+    seen_letters = set()
+    for y, letter in label_ys:
+        if letter not in seen_letters:
+            paired_labels.append((y, letter))
+            seen_letters.add(letter)
+
+    # Step 2: 分析面的 Y 分布
+    face_ys_all = [f["y_mid"] for f in faces_info if f["area"] > 0.5]
+    if not face_ys_all:
+        return {"title_block_y_range": None, "view_regions": [],
+                "main_body_region": None, "y_min_all": 0, "y_max_all": 0}
+
+    y_min_all = min(f["y_min"] for f in faces_info if f["area"] > 0.5)
+    y_max_all = max(f["y_max"] for f in faces_info if f["area"] > 0.5)
+
+    # 计算 Y 密度分布（使用实际 Y 值，1mm 分箱用于精确间隙检测）
+    from collections import defaultdict
+    y_slots = defaultdict(int)
+    for f in faces_info:
+        if f["area"] > 0.5:
+            for y in range(int(f["y_min"]), int(f["y_max"]) + 1):
+                y_slots[y] += 1
+
+    # 找大间隙（>25mm 连续无面的区域）
+    min_gap = max(25, (y_max_all - y_min_all) * 0.06)
+    occupied_ys = sorted(y_slots.keys())
+    gaps = []
+    if occupied_ys:
+        prev = occupied_ys[0]
+        for y in occupied_ys[1:]:
+            if y - prev > min_gap:
+                gaps.append((prev, y))
+            prev = y
+
+    # Step 3: 收集分界线
+    dividers = set()
+
+    # 从成对标签获取
+    for y, letter in paired_labels:
+        dividers.add(y)
+
+    # 从几何间隙获取（间隙中点作为分界）
+    for lo, hi in gaps:
+        mid_y = (lo + hi) / 2
+        dividers.add(mid_y)
+
+    # 合并相近的分界线（<15mm 合并为一个）
+    dividers = sorted(dividers)
+    merged = []
+    for d in dividers:
+        if not merged or d - merged[-1] > 15:
+            merged.append(d)
+        else:
+            # 取平均值
+            merged[-1] = (merged[-1] + d) / 2
+    dividers = merged
+
+    # Step 4: 识别标题栏区域（最底部的大间隙之上或之下）
+    title_block_yhi = None
+    if gaps:
+        # 找最大的间隙 — 标题栏和图纸主体之间
+        max_gap = max(gaps, key=lambda g: g[1] - g[0])
+        # 如果最大间隙在图纸下半部分且上方有标签
+        gap_mid = (max_gap[0] + max_gap[1]) / 2
+        if gap_mid < y_max_all * 0.35:
+            # 这个间隙分隔了标题栏和主体
+            title_block_yhi = max_gap[0]
+            # 移除标题栏区域内的分界线
+            dividers = [d for d in dividers if d > title_block_yhi]
+
+    # Step 5: 生成视图区域
+    view_regions = []
+    effective_ymin = title_block_yhi if title_block_yhi else y_min_all
+
+    if not dividers:
+        view_regions.append(("main", effective_ymin, y_max_all))
+    else:
+        # 确保所有分界线在有效范围内
+        valid_dividers = [d for d in dividers if effective_ymin < d < y_max_all]
+
+        if not valid_dividers:
+            view_regions.append(("main", effective_ymin, y_max_all))
+        else:
+            # 第一个区域
+            if valid_dividers[0] - effective_ymin > 10:
+                view_regions.append(("section_1", effective_ymin, valid_dividers[0]))
+            # 中间区域
+            for i in range(len(valid_dividers) - 1):
+                view_regions.append(
+                    (f"section_{i+2}", valid_dividers[i], valid_dividers[i+1])
+                )
+            # 最后一个区域
+            if y_max_all - valid_dividers[-1] > 10:
+                view_regions.append(
+                    (f"section_{len(valid_dividers)+1}", valid_dividers[-1], y_max_all)
+                )
+
+    # Step 6: 分类每个视图区域的类型
+    typed_regions = []
+    for name, ylo, yhi in view_regions:
+        region_faces = [f for f in faces_info
+                        if ylo <= f["y_mid"] <= yhi
+                        and not f["is_spline_debris"]]
+
+        n_concentric = sum(1 for f in region_faces if f["face_type"] == "concentric")
+        n_line = sum(1 for f in region_faces if f["face_type"] == "line_only")
+        n_arc = sum(1 for f in region_faces if "ARC" in f["etypes"])
+
+        if n_concentric > 0 or n_arc > n_line * 0.5:
+            view_type = "cylindrical"  # 以圆/弧为主 → 圆柱特征
+        elif n_line > 0:
+            view_type = "prismatic"    # 以直线为主 → 拉伸特征
+        else:
+            view_type = "empty"
+
+        typed_regions.append((name, ylo, yhi, view_type))
+
+    # Step 7: 找出主体所在区域（包含最大非圆面的区域）
+    region_scores = {}
+    for name, ylo, yhi, vtype in typed_regions:
+        region_faces = [f for f in faces_info
+                        if ylo <= f["y_mid"] <= yhi
+                        and not f["is_spline_debris"]
+                        and f["face_type"] == "line_only"]
+        if region_faces:
+            region_scores[name] = max(f["area"] for f in region_faces)
+        else:
+            region_scores[name] = 0
+
+    main_region = max(region_scores, key=region_scores.get) if region_scores else None
+
+    return {
+        "title_block_y_range": (0, title_block_yhi) if title_block_yhi else None,
+        "view_regions": typed_regions,
+        "main_body_region": main_region,
+        "y_min_all": y_min_all,
+        "y_max_all": y_max_all,
+    }
+
+
+# ============================================================
+# 6. 同心圆聚类
+# ============================================================
+
+def cluster_concentric_arcs(faces_info: list[dict], edges: list[Edge],
+                            edge_vertices: list, vertex_pos: dict) -> dict:
+    """跨面检测同心圆弧组。
+
+    返回: {canonical_key: {"center": (cx,cy), "radii": [...],
+           "face_indices": set(), "y_range": (ymin, ymax)}}
+    """
+    # 收集所有 ARC 边
+    arc_by_center = defaultdict(list)
+
+    for fi_idx, fi in enumerate(faces_info):
+        if fi["is_spline_debris"]:
+            continue
+        for eid in fi["edges"]:
+            e = edges[eid]
+            if e.etype != "ARC" or not e.center:
+                continue
+            ckey = (round(e.center[0], 1), round(e.center[1], 1))
+            arc_by_center[ckey].append({
+                "eid": eid, "radius": e.radius,
+                "face_idx": fi_idx,
+                "center": (e.center[0], e.center[1]),
+            })
+
+    if not arc_by_center:
+        return {}
+
+    # 合并相近的圆心
+    all_center_keys = sorted(arc_by_center.keys())
+    merged = {}
+    used = set()
+
+    for ck in all_center_keys:
+        if ck in used:
+            continue
+        cluster = [ck]
+        used.add(ck)
+        for ck2 in all_center_keys:
+            if ck2 in used:
+                continue
+            if math.hypot(ck[0] - ck2[0], ck[1] - ck2[1]) < CENTER_MERGE_TOL:
+                cluster.append(ck2)
+                used.add(ck2)
+
+        # 平均坐标作为规范键
+        avg_x = sum(c[0] for c in cluster) / len(cluster)
+        avg_y = sum(c[1] for c in cluster) / len(cluster)
+        canon_key = (round(avg_x, 1), round(avg_y, 1))
+
+        all_radii = set()
+        all_face_indices = set()
+        all_ys = []
+        for c in cluster:
+            for item in arc_by_center[c]:
+                all_radii.add(round(item["radius"] * 20) / 20)
+                all_face_indices.add(item["face_idx"])
+                # 收集 Y 坐标
+                vs, ve = edge_vertices[item["eid"]]
+                all_ys.append(vertex_pos[vs][1])
+                all_ys.append(vertex_pos[ve][1])
+
+        # 需要至少 2 个不同半径才认为是同心圆组
+        if len(all_radii) >= 2:
+            merged[canon_key] = {
+                "center": (avg_x, avg_y),
+                "radii": sorted(all_radii),
+                "face_indices": all_face_indices,
+                "count": sum(len(arc_by_center[c]) for c in cluster),
+            }
+
+    return merged
+
+
+# ============================================================
+# 7. OCC 几何创建
+# ============================================================
+
+def build_occ_wire_from_face(face_eids, edges, edge_vertices, vertex_pos):
+    """从面边列表构建 OCC Wire。"""
     try:
         wire_builder = BRepBuilderAPI_MakeWire()
-        for eid in face_edges:
-            occ_edge = edge_to_occ_edge(edges[eid], vertex_pos,
-                                        edge_vertices, eid)
-            wire_builder.Add(occ_edge)
-        wire = wire_builder.Wire()
+        for eid in face_eids:
+            e = edges[eid]
+            vs, ve = edge_vertices[eid]
+            p1 = vertex_pos[vs]
+            p2 = vertex_pos[ve]
 
+            if e.etype == "LINE":
+                occ_edge = BRepBuilderAPI_MakeEdge(
+                    gp_Pnt(p1[0], p1[1], 0),
+                    gp_Pnt(p2[0], p2[1], 0),
+                ).Edge()
+            else:
+                circ = gp_Circ(
+                    gp_Ax2(gp_Pnt(e.center[0], e.center[1], 0), gp_Dir(0, 0, 1)),
+                    e.radius,
+                )
+                a1 = math.radians(e.start_angle)
+                a2_val = math.radians(e.end_angle)
+                occ_edge = BRepBuilderAPI_MakeEdge(circ, a1, a2_val).Edge()
+            wire_builder.Add(occ_edge)
+
+        wire = wire_builder.Wire()
         # 修复 wire
         fixer = ShapeFix_Wire()
         fixer.Load(wire)
         fixer.FixReorder()
         fixer.FixConnected()
         fixer.FixClosed()
-        fixed_wire = fixer.Wire()
+        return fixer.Wire()
+    except Exception:
+        return None
 
-        face = BRepBuilderAPI_MakeFace(fixed_wire).Face()
+
+def build_occ_face(wire) -> object:
+    """从 Wire 构建 Face。"""
+    try:
+        face = BRepBuilderAPI_MakeFace(wire).Face()
         return face
     except Exception:
         return None
 
 
-# ============================================================
-# 5. 智能拉伸
-# ============================================================
-
-def extrude_face(occ_face, depth: float) -> object:
-    """沿 Z 轴拉伸一个面到给定深度。"""
-    if depth <= 0:
+def extrude_face(occ_face, depth: float, direction=(0, 0, 1)) -> object:
+    """沿指定方向拉伸 Face 为 Solid。"""
+    if depth <= 0.01:
         return None
     try:
-        vec = gp_Vec(0, 0, depth)
-        prism = BRepPrimAPI_MakePrism(occ_face, vec).Shape()
-        return prism
+        vec = gp_Vec(direction[0] * depth, direction[1] * depth, direction[2] * depth)
+        return BRepPrimAPI_MakePrism(occ_face, vec).Shape()
     except Exception:
         return None
 
 
-def revolve_circle_face(occ_face, edge_list: list[int], edges: list[Edge],
-                         vertex_pos: dict, edge_vertices: list) -> object:
-    """检测环形面并尝试旋转成圆柱/圆筒。"""
-    # 判断是否为完整圆（所有边都是 ARC，且形成一个环）
-    if len(edge_list) < 2:
-        return None
-    all_arc = all(edges[eid].etype == "ARC" for eid in edge_list)
-    if not all_arc:
-        return None
-    # 检查圆心是否一致
-    centers = set()
-    for eid in edge_list:
-        e = edges[eid]
-        centers.add((round(e.center[0], 3), round(e.center[1], 3)))
-    if len(centers) != 1:
-        return None
-
-    # 找最小半径（内孔）和最大半径（外径）
-    min_r = min(edges[eid].radius for eid in edge_list)
-    max_r = max(edges[eid].radius for eid in edge_list)
-    cx, cy = edges[edge_list[0]].center
-
-    # 创建圆柱体
+def create_cylinder_solid(center_xy, radius, height, z_offset=0) -> object:
+    """创建一个圆柱体。"""
     try:
-        height = abs(max_r - min_r) * 5  # 经验高度
-        if min_r < 0.1:
-            # 实心圆柱
-            cyl = BRepPrimAPI_MakeCylinder(
-                gp_Ax2(gp_Pnt(cx, cy, 0), gp_Dir(0, 0, 1)),
-                max_r, height,
-            ).Shape()
-            return cyl
-        else:
-            # 圆筒 = 大圆柱 - 小圆柱
-            outer = BRepPrimAPI_MakeCylinder(
-                gp_Ax2(gp_Pnt(cx, cy, 0), gp_Dir(0, 0, 1)),
-                max_r, height,
-            ).Shape()
-            inner = BRepPrimAPI_MakeCylinder(
-                gp_Ax2(gp_Pnt(cx, cy, 0), gp_Dir(0, 0, 1)),
-                min_r, height + 1,  # 稍微长一点确保穿透
-            ).Shape()
-            from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut
-            result = BRepAlgoAPI_Cut(outer, inner).Shape()
-            return result
+        return BRepPrimAPI_MakeCylinder(
+            gp_Ax2(gp_Pnt(center_xy[0], center_xy[1], z_offset), gp_Dir(0, 0, 1)),
+            radius, height,
+        ).Shape()
     except Exception:
         return None
 
 
-def determine_extrusion_depth(face_edges: list[int], edges: list[Edge],
-                              vertex_pos: dict, edge_vertices: list,
-                              section_info: dict) -> float:
-    """智能确定拉伸深度。
+def create_concentric_solid(center, radii, height, z_offset=0) -> object:
+    """从一组同心半径创建阶梯圆柱实体（最大半径实心，内孔逐步减去）。
 
-    策略：
-    - 检测环的 Y 坐标范围 → 确定所在截面
-    - 每个截面有不同的经验深度
-    - 小圆/弧 → 可能代表轴，给较大深度
-    - 大轮廓 → 可能代表壳体，给中等深度
-    """
-    # 计算环的 Y 范围
-    y_vals = []
-    for eid in face_edges:
-        vs, ve = edge_vertices[eid]
-        y_vals.append(vertex_pos[vs][1])
-        y_vals.append(vertex_pos[ve][1])
-    y_mid = (min(y_vals) + max(y_vals)) / 2
-
-    # 计算环的包围盒面积
-    x_vals = []
-    for eid in face_edges:
-        vs, ve = edge_vertices[eid]
-        x_vals.append(vertex_pos[vs][0])
-        x_vals.append(vertex_pos[ve][0])
-        e = edges[eid]
-        if e.etype == "ARC" and e.center:
-            x_vals.append(e.center[0] - e.radius)
-            x_vals.append(e.center[0] + e.radius)
-    bb_area = (max(x_vals) - min(x_vals)) * (max(y_vals) - min(y_vals))
-
-    # 所有边是否都是弧
-    all_arc = all(edges[eid].etype == "ARC" for eid in face_edges)
-    # 是否形成同心圆
-    if all_arc:
-        centers = set()
-        for eid in face_edges:
-            e = edges[eid]
-            centers.add((round(e.center[0], 2), round(e.center[1], 2)))
-        if len(centers) == 1:
-            # 同心圆 → 齿轮/轴/轴承，深度较大
-            return 20.0
-
-    # 按 BB 面积确定深度
-    if bb_area < 50:
-        return 5.0   # 小特征
-    elif bb_area < 500:
-        return 10.0  # 中型特征
-    elif bb_area < 5000:
-        return 15.0  # 大型特征
-    else:
-        return 20.0  # 超大型/外轮廓
-
-
-def classify_sections(edges: list[Edge], vertex_pos: dict,
-                      edge_vertices: list) -> dict:
-    """分析截面区域分布。
-
-    返回 {section_name: (y_min, y_max, edge_count, ...)}
-    """
-    ys = []
-    for eid, (vs, ve) in enumerate(edge_vertices):
-        ys.append(vertex_pos[vs][1])
-        ys.append(vertex_pos[ve][1])
-
-    if not ys:
-        return {"all": (0, 0)}
-
-    y_min, y_max = min(ys), max(ys)
-    total_span = y_max - y_min
-
-    if total_span < 50:
-        return {"all": (y_min, y_max)}
-
-    # 寻找 Y 坐标间隙，用来自动分割截面
-    from collections import Counter
-    y_binned = Counter(round(y, 0) for y in ys)
-    # 找 20mm 以上的间隙
-    gaps = []
-    prev_y = None
-    for y in sorted(y_binned.keys()):
-        if prev_y is not None and y - prev_y > 20:
-            gaps.append((prev_y, y))
-        prev_y = y
-
-    sections = {"all": (y_min, y_max)}
-    for i, (lo, hi) in enumerate(gaps):
-        sections[f"section_{i+1}"] = (lo, hi)
-
-    return sections
-
-
-# ============================================================
-# 6. 同心圆/弧聚类
-# ============================================================
-
-def cluster_concentric_arcs(valid_faces: list, edges: list[Edge],
-                            edge_vertices: list, vertex_pos: dict,
-                            tolerance: float = 0.5) -> dict:
-    """将 ARC 边跨面按同心中心聚类。
-
-    策略：
-    1. 收集所有 ARC 边（不限面），计算其圆心
-    2. 按圆心聚类（容差 tolerance）
-    3. 每组输出：中心坐标、所有半径列表、涉及的面索引
-
-    返回: {center_key: {"center": (cx,cy), "radii": [r1,r2,...],
-           "face_indices": set(), "face_edges": [eid,...]}}
-    """
-    from collections import defaultdict
-
-    # 第一步：按圆心聚类所有 ARC 边
-    arc_by_center = defaultdict(list)  # center_key -> [(eid, radius, face_idx)]
-
-    for fi, fi_data in enumerate(valid_faces):
-        f_ids = fi_data["edges"]
-        for eid in f_ids:
-            e = edges[eid]
-            if e.etype != "ARC":
-                continue
-            ckey = (round(e.center[0], 1), round(e.center[1], 1))
-            arc_by_center[ckey].append({
-                "eid": eid,
-                "radius": e.radius,
-                "face_idx": fi,
-                "center": (e.center[0], e.center[1]),
-            })
-
-    # 第二步：合并相近的圆心
-    # 将所有 center_key 按实际坐标聚类
-    all_centers = sorted(arc_by_center.keys())
-    merged = {}  # canonical_key -> [detail_keys...]
-    used = set()
-
-    for ck in all_centers:
-        if ck in used:
-            continue
-        # 找所有 1mm 以内的圆心
-        cluster = [ck]
-        used.add(ck)
-        for ck2 in all_centers:
-            if ck2 in used:
-                continue
-            dist = math.hypot(ck[0] - ck2[0], ck[1] - ck2[1])
-            if dist < 1.0:
-                cluster.append(ck2)
-                used.add(ck2)
-
-        # 使用平均坐标作为规范键
-        avg_x = sum(c[0] for c in cluster) / len(cluster)
-        avg_y = sum(c[1] for c in cluster) / len(cluster)
-        canon_key = (round(avg_x, 1), round(avg_y, 1))
-
-        # 汇总
-        all_radii = []
-        all_face_indices = set()
-        for c in cluster:
-            for item in arc_by_center[c]:
-                all_radii.append(item["radius"])
-                all_face_indices.add(item["face_idx"])
-
-        if len(all_face_indices) >= 1 and len(all_radii) >= 2:
-            # 去重半径（容差 0.05mm）
-            unique_radii = sorted(set(round(r * 20) / 20 for r in all_radii))
-            merged[canon_key] = {
-                "center": (avg_x, avg_y),
-                "radii": unique_radii,
-                "face_indices": all_face_indices,
-                "count": len(all_radii),
-            }
-
-    return merged
-
-
-def create_cylinders_from_group(center: tuple, radii: list,
-                                height: float) -> list:
-    """从一组同心半径创建阶梯圆柱体系列。
-
-    从大到小处理：最大半径 → 实心圆柱，逐层减去内孔。
-    返回: [solid_cylinders...] — 可直接合并的实体列表
+    返回: 组合后的单一实体
     """
     if len(radii) < 1:
-        return []
+        return None
 
-    cx, cy = center
-    results = []
-
-    # 排序：从大到小
     sorted_r = sorted(radii, reverse=True)
+    cx, cy = center
 
     try:
-        # 最外层：实心圆柱
-        outer_r = sorted_r[0]
+        # 最外层实心圆柱
         outer = BRepPrimAPI_MakeCylinder(
-            gp_Ax2(gp_Pnt(cx, cy, 0), gp_Dir(0, 0, 1)),
-            outer_r, height,
+            gp_Ax2(gp_Pnt(cx, cy, z_offset), gp_Dir(0, 0, 1)),
+            sorted_r[0], height,
         ).Shape()
 
         if len(sorted_r) == 1:
-            return [outer]
+            return outer
 
         # 逐层减内孔
         current = outer
         for inner_r in sorted_r[1:]:
-            # 孔需要比外圆柱长以确保完全穿透
+            # 孔稍长以确保完全穿透
             hole = BRepPrimAPI_MakeCylinder(
-                gp_Ax2(gp_Pnt(cx, cy, -1), gp_Dir(0, 0, 1)),
+                gp_Ax2(gp_Pnt(cx, cy, z_offset - 1), gp_Dir(0, 0, 1)),
                 inner_r, height + 2,
             ).Shape()
             current = BRepAlgoAPI_Cut(current, hole).Shape()
 
-        results.append(current)
-
-        # 为每个环带创建独立实体（用于展示）
-        # 例如：R20-R12.5 齿轮环，R12.5-R10.5 辐板，R10.5-R3.5 轮毂
-        for i in range(len(sorted_r) - 1):
-            ring_outer_r = sorted_r[i]
-            ring_inner_r = sorted_r[i + 1]
-            if ring_outer_r - ring_inner_r < 0.1:
-                continue
-            ring_outer = BRepPrimAPI_MakeCylinder(
-                gp_Ax2(gp_Pnt(cx, cy, 0), gp_Dir(0, 0, 1)),
-                ring_outer_r, height,
-            ).Shape()
-            ring_inner = BRepPrimAPI_MakeCylinder(
-                gp_Ax2(gp_Pnt(cx, cy, -0.5), gp_Dir(0, 0, 1)),
-                ring_inner_r, height + 1,
-            ).Shape()
-            ring = BRepAlgoAPI_Cut(ring_outer, ring_inner).Shape()
-            results.append(ring)
-
+        return current
     except Exception:
-        # 回退：只创建最外层圆柱
+        # 回退
         try:
-            fallback = BRepPrimAPI_MakeCylinder(
-                gp_Ax2(gp_Pnt(cx, cy, 0), gp_Dir(0, 0, 1)),
+            return BRepPrimAPI_MakeCylinder(
+                gp_Ax2(gp_Pnt(cx, cy, z_offset), gp_Dir(0, 0, 1)),
                 sorted_r[0], height,
             ).Shape()
-            return [fallback]
         except Exception:
-            return []
+            return None
 
-    return results
+
+def fuse_shapes(shapes: list) -> object:
+    """安全地合并多个 Shape。"""
+    shapes = [s for s in shapes if s is not None]
+    if not shapes:
+        return None
+    if len(shapes) == 1:
+        return shapes[0]
+    result = shapes[0]
+    for s in shapes[1:]:
+        try:
+            result = BRepAlgoAPI_Fuse(result, s).Shape()
+        except Exception:
+            pass
+    return result
+
+
+def cut_shapes(main_shape, tools: list) -> object:
+    """从主体中减去一组工具 Shape。"""
+    if main_shape is None:
+        return None
+    tools = [t for t in tools if t is not None]
+    if not tools:
+        return main_shape
+    result = main_shape
+    for tool in tools:
+        try:
+            result = BRepAlgoAPI_Cut(result, tool).Shape()
+        except Exception:
+            pass
+    return result
+
+
+def get_shape_bbox(shape) -> tuple:
+    """获取 shape 的包围盒。"""
+    bbox = Bnd_Box()
+    brepbndlib.Add(shape, bbox)
+    return bbox.Get()
 
 
 # ============================================================
-# 7. 主流程
+# 8. 主转换流程（全新设计）
 # ============================================================
 
 def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                       extrusion_depth: float = None) -> object:
-    """主转换函数 — 智能识别几何特征并创建 3D 实体。
+    """通用 DXF → 3D 转换器 v2.0。
 
-    策略:
-    1. 过滤页面边框（面积 > 总 bbox 面积 30% 的矩形）
-    2. 按 Y 坐标分组截面，分别处理
-    3. 同心圆弧 → 圆柱/圆筒
-    4. 非圆弧封闭轮廓 → 拉伸
-    5. 截面间实体按合理 Z 偏移放置
-    6. 布尔合并为单一实体
-
-    参数:
-        dxf_path: 输入 DXF 路径
-        step_output: 可选 STEP 输出路径
-        extrusion_depth: 统一拉伸深度（None=自动检测）
-
-    返回:
-        OCC 组合实体 (TopoDS_Shape)，失败返回 None
+    全新设计思路:
+    1. 解析 + 建图 + 面遍历
+    2. 过滤：边框、SPLINE 碎片、过小面
+    3. 自动视图检测（标签 + 几何间隙）
+    4. 同心圆弧 → 圆柱体特征
+    5. 最大非圆轮廓 → 主体拉伸
+    6. 其余轮廓 → 辅助特征
+    7. 主体 + 圆柱体 + 辅助 → 布尔合并
+    8. 导出 STEP
     """
     _ensure_occ()
 
-    print(f"[1/6] 解析 DXF 边: {dxf_path}")
+    # ---- Step 1: 解析 ----
+    print(f"[1/8] 解析 DXF: {dxf_path}")
     edges, metadata = parse_dxf_edges(dxf_path)
-    print(f"  提取 {len(edges)} 条边")
+    texts = parse_dxf_texts(dxf_path)
+    print(f"  边: {len(edges)}, 文字: {len(texts)}")
     for etype, count in metadata["entity_counts"].items():
         print(f"    {etype}: {count}")
 
     if len(edges) < 3:
-        print("[FAIL] 边数量不足，无法构成封闭轮廓")
+        print("[FAIL] 边数量不足")
         return None
 
     bbox_min = metadata["bbox_min"]
     bbox_max = metadata["bbox_max"]
-    total_bbox_area = (bbox_max[0] - bbox_min[0]) * (bbox_max[1] - bbox_min[1])
+    total_w = bbox_max[0] - bbox_min[0]
+    total_h = bbox_max[1] - bbox_min[1]
+    total_area = total_w * total_h
+    part_scale = max(total_w, total_h)
 
-    print(f"\n[2/6] 建图 ...")
+    # ---- Step 2: 建图 ----
+    print(f"\n[2/8] 建图 ...")
     vertex_pos, edge_vertices, num_vertices = build_vertex_map(edges)
-    print(f"  {num_vertices} 个顶点")
+    print(f"  顶点: {num_vertices}")
     adj = build_adjacency(vertex_pos, edge_vertices, edges, num_vertices)
 
-    print(f"\n[3/6] 面遍历 ...")
+    # ---- Step 3: 面遍历 ----
+    print(f"\n[3/8] 面遍历 ...")
     faces = find_all_faces(adj, edges, edge_vertices)
-    print(f"  找到 {len(faces)} 个封闭环")
+    print(f"  封闭环: {len(faces)}")
 
     if not faces:
-        print("[FAIL] 未找到任何封闭环")
+        print("[FAIL] 无封闭环")
         return None
 
-    # 分析每个面（正确处理 ARC 几何范围）
-    face_info = []
+    # ---- Step 4: 面分析 + 过滤 ----
+    print(f"\n[4/8] 面分析与过滤 ...")
+    faces_info = []
     for f_ids in faces:
-        xs, ys = [], []
-        for eid in f_ids:
-            e = edges[eid]
-            vs, ve = edge_vertices[eid]
-            xs.extend([vertex_pos[vs][0], vertex_pos[ve][0]])
-            ys.extend([vertex_pos[vs][1], vertex_pos[ve][1]])
-            # 对于 ARC，还要包含圆心及其在弧上的极值点
-            if e.etype == "ARC" and e.center:
-                cx, cy = e.center
-                r = e.radius
-                # 圆弧跨越的角度范围
-                a1 = math.radians(e.start_angle)
-                a2 = math.radians(e.end_angle)
-                # 处理角度跨越（从 a1 到 a2 逆时针）
-                if a2 < a1:
-                    a2 += 2 * math.pi
-                # 关键角度：0, π/2, π, 3π/2
-                for key_angle in [0, math.pi/2, math.pi, 3*math.pi/2]:
-                    # 检查 key_angle 是否在弧的范围内
-                    a = key_angle
-                    if a < a1:
-                        a += 2 * math.pi
-                    if a1 <= a <= a2:
-                        xs.append(cx + r * math.cos(key_angle))
-                        ys.append(cy + r * math.sin(key_angle))
-                # 始终包含圆心（安全起见）
-                xs.append(cx)
-                ys.append(cy)
-        bb_area = (max(xs) - min(xs)) * (max(ys) - min(ys))
-        y_mid = (max(ys) + min(ys)) / 2
-        x_min = min(xs)
-        y_min = min(ys)
-        x_max = max(xs)
-        y_max = max(ys)
-        face_info.append({
-            "edges": f_ids,
-            "area": bb_area,
-            "y_mid": y_mid,
-            "x_min": x_min, "y_min": y_min,
-            "x_max": x_max, "y_max": y_max,
-        })
+        fi = analyze_face(f_ids, edges, edge_vertices, vertex_pos)
+        faces_info.append(fi)
 
-    # ---- 过滤页面边框 ----
-    # 条件：面积超过总 bbox 的 30% 且接近矩形（4条LINE边）
-    page_border_indices = set()
-    for i, fi in enumerate(face_info):
-        if fi["area"] > total_bbox_area * 0.25:
-            # 检查是否为外边框（4条边且面积接近 bbox）
-            etypes = set(edges[eid].etype for eid in fi["edges"])
-            if len(fi["edges"]) <= 6 and "LINE" in etypes:
-                page_border_indices.add(i)
-                print(f"  [跳过] 环{i+1}: 页面边框 (面积={fi['area']:.0f}mm^2)")
+    # 过滤 1: 页面边框（面积 > 25% 总 bbox 且边的数量 ≤6）
+    border_idx = set()
+    for i, fi in enumerate(faces_info):
+        if fi["area"] > total_area * 0.25 and len(fi["edges"]) <= 6:
+            border_idx.add(i)
+            print(f"  [过滤-边框] 环{i+1}: 面积={fi['area']:.0f}")
 
-    # 过滤小面
-    if face_info:
-        areas = [fi["area"] for fi in face_info]
+    # 过滤 2: SPLINE 碎片
+    spline_idx = set()
+    for i, fi in enumerate(faces_info):
+        if fi["is_spline_debris"] and i not in border_idx:
+            spline_idx.add(i)
+    if spline_idx:
+        print(f"  [过滤-SPLINE碎片] {len(spline_idx)} 个面")
+
+    # 过滤 3: 过小面（< 中位面积的 0.05%）
+    areas = [fi["area"] for i, fi in enumerate(faces_info)
+             if i not in border_idx and i not in spline_idx]
+    if areas:
         median_area = sorted(areas)[len(areas) // 2]
-        min_area = max(0.5, median_area * 0.0005)
+        min_area_threshold = max(0.5, median_area * 0.0005)
     else:
-        min_area = 0.5
+        min_area_threshold = 0.5
 
-    # 应用过滤
-    valid_faces = [fi for i, fi in enumerate(face_info)
-                   if i not in page_border_indices and fi["area"] >= min_area]
+    tiny_idx = set()
+    for i, fi in enumerate(faces_info):
+        if i in border_idx or i in spline_idx:
+            continue
+        if fi["area"] < min_area_threshold:
+            tiny_idx.add(i)
 
-    print(f"\n[4/6] 截面分析与特征识别 ({len(valid_faces)} 个有效环)")
+    # 有效面
+    valid_indices = [i for i in range(len(faces_info))
+                     if i not in border_idx
+                     and i not in spline_idx
+                     and i not in tiny_idx]
+    valid_faces = [faces_info[i] for i in valid_indices]
 
-    # ---- 同心圆检测 ----
-    concentric_groups = cluster_concentric_arcs(
-        valid_faces, edges, edge_vertices, vertex_pos)
-    processed_face_indices = set()
-    for ck, group in concentric_groups.items():
-        processed_face_indices.update(group["face_indices"])
+    print(f"  有效环: {len(valid_faces)} (边框{len(border_idx)} "
+          f"+ SPLINE碎片{len(spline_idx)} + 过小{len(tiny_idx)} 已过滤)")
 
-    print(f"  检测到 {len(concentric_groups)} 组同心圆弧")
-    for ck, group in concentric_groups.items():
-        print(f"    中心({ck[0]:.1f},{ck[1]:.1f}): {len(group['radii'])}个半径 "
-              f"{group['radii']}, {group['count']}条ARC边, "
-              f"{len(group['face_indices'])}个面")
+    if not valid_faces:
+        print("[FAIL] 所有面均被过滤")
+        return None
 
-    # ---- 按 Y 坐标分组截面 ----
-    # 统计 Y 分布找截面边界
-    from collections import Counter
-    all_ys = []
-    for fi in valid_faces:
-        all_ys.append(fi["y_mid"])
-    if all_ys:
-        y_counter = Counter(round(y, 0) for y in all_ys)
-        sorted_ys = sorted(y_counter.keys())
-        # 找 >30mm 的间隙
-        section_gaps = []
-        prev = sorted_ys[0] if sorted_ys else 0
-        for y in sorted_ys[1:]:
-            if y - prev > 30:
-                section_gaps.append((prev, y))
-            prev = y
+    # ---- Step 5: 视图检测 ----
+    print(f"\n[5/8] 视图检测 ...")
+    view_info = detect_views(valid_faces, texts,
+                             (bbox_min, bbox_max), total_area)
+    view_regions = view_info["view_regions"]
+    main_region = view_info.get("main_body_region")
+    print(f"  检测到 {len(view_regions)} 个视图区域:")
+    for item in view_regions:
+        name, ylo, yhi = item[0], item[1], item[2]
+        vtype = item[3] if len(item) >= 4 else "unknown"
+        n_faces = sum(1 for f in valid_faces if ylo <= f["y_mid"] <= yhi)
+        marker = " [主体]" if name == main_region else ""
+        print(f"    {name}: Y={ylo:.0f}~{yhi:.0f}, {n_faces}个面, 类型={vtype}{marker}")
 
-    # 自动确定截面区间
-    if section_gaps and len(section_gaps) >= 1:
-        # 使用第一个大间隙（通常是标题栏和图纸主体之间）
-        # 以及后续间隙来分割
-        pass
+    # ---- Step 6: 按视图创建 3D 实体 ----
+    print(f"\n[6/8] 按视图创建 3D 实体 ...")
 
-    y_min_all = min(fi["y_min"] for fi in valid_faces)
-    y_max_all = max(fi["y_max"] for fi in valid_faces)
-
-    # 手动定义截面（基于之前的分析）
-    section_ranges = [
-        ("标题栏/说明区", 5, 90, 0.0),
-        ("主视图区", 90, 145, 5.0),
-        ("D-D剖面(箱体)", 145, 175, 15.0),
-        ("E-E剖面(齿轮)", 175, 235, 25.0),
-        ("F-F剖面(轴系)", 235, 292, 10.0),
-    ]
-
-    # 按截面对面分组
-    section_faces = {name: [] for name, _, _, _ in section_ranges}
-    for fi in valid_faces:
-        y = fi["y_mid"]
-        assigned = False
-        for name, ylo, yhi, depth in section_ranges:
-            if ylo <= y <= yhi:
-                section_faces[name].append((fi, depth))
-                assigned = True
-                break
-        if not assigned:
-            # 分配到最近的截面
-            best_name = min(section_ranges,
-                          key=lambda s: min(abs(y - s[1]), abs(y - s[2])))[0]
-            section_faces[best_name].append((fi, 10.0))
-
-    # 打印各截面信息
-    for name, ylo, yhi, depth in section_ranges:
-        count = len(section_faces[name])
-        area_sum = sum(fi["area"] for fi, _ in section_faces[name])
-        print(f"  {name} (Y{ylo}~{yhi}): {count}个环, 总面积{area_sum:.0f}mm^2, 拉伸深度{depth:.0f}mm")
-
-    # ---- 创建 3D 实体 ----
-    print(f"\n[5/6] 创建 3D 实体 ...")
-    all_solids = []
-
-    # 先处理同心圆组（创建圆柱体）
-    for ckey, group in concentric_groups.items():
-        cx, cy = group["center"]
-        radii = group["radii"]
-
-        # 找这个组所在的截面深度
-        y_mid = cy
-        for name, ylo, yhi, section_depth in section_ranges:
-            if ylo <= y_mid <= yhi:
-                height = section_depth
-                break
+    # 估算总体深度
+    if extrusion_depth is not None:
+        total_depth = extrusion_depth
+    else:
+        max_arc_r = 0
+        for f in valid_faces:
+            if f["arc_radii"]:
+                max_arc_r = max(max_arc_r, max(f["arc_radii"]))
+        if max_arc_r > 0:
+            total_depth = max_arc_r * 4
         else:
-            height = 20.0
-        height = max(height, max(radii) * 2)
+            total_depth = part_scale * 0.3
+    total_depth = max(total_depth, 10.0)
 
-        cyl_list = create_cylinders_from_group((cx, cy), radii, height)
-        if cyl_list:
-            all_solids.extend(cyl_list)
-            print(f"  同心圆组 中心({cx:.1f},{cy:.1f}): "
-                  f"{len(radii)}个半径={radii}, H={height:.0f}mm -> {len(cyl_list)}个圆柱体")
+    n_regions = max(1, len(view_regions))
+    # 每个区域的基本深度（总深度均分）
+    base_d = total_depth / n_regions
+    # 累计 Z 偏移（确保区域不重叠）
+    cum_z = 0.0
+    view_solids = []
 
-    # 处理剩余的非圆弧轮廓（拉伸）
-    for section_name, ylo, yhi, section_depth in section_ranges:
-        section_solids = []
-        for fi, depth in section_faces[section_name]:
-            # 跳过已处理的同心圆面
-            fi_idx = valid_faces.index(fi) if fi in valid_faces else -1
-            if fi_idx in processed_face_indices:
+    for region_idx, item in enumerate(view_regions):
+        name, ylo, yhi = item[0], item[1], item[2]
+        vtype = item[3] if len(item) >= 4 else "unknown"
+
+        region_faces = [f for f in valid_faces
+                        if ylo <= f["y_mid"] <= yhi
+                        and not f["is_spline_debris"]]
+
+        if not region_faces:
+            continue
+
+        # 视图深度：圆柱型贯穿全部，棱柱型按比例
+        if vtype == "cylindrical":
+            view_depth = total_depth  # 贯穿整个深度
+        else:
+            view_depth = base_d * 1.5
+        view_depth = max(view_depth, 5.0)
+
+        # Z 偏移 = 累计偏移（确保不重叠）
+        z_offset = cum_z
+        cum_z += view_depth  # 下一层从此层的顶部开始
+
+        print(f"\n  {name} (Z={z_offset:.0f}~{z_offset+view_depth:.0f}): "
+              f"{len(region_faces)}个面, 类型={vtype}")
+
+        # 此视图的同心圆
+        region_conc = cluster_concentric_arcs(
+            region_faces, edges, edge_vertices, vertex_pos)
+        conc_face_idx = set()
+        for ckey, group in region_conc.items():
+            conc_face_idx.update(group["face_indices"])
+
+        if region_conc:
+            print(f"    {len(region_conc)}组同心圆:")
+            for ckey, group in sorted(region_conc.items(),
+                                       key=lambda x: -x[1]["count"]):
+                print(f"      中心({ckey[0]:.1f},{ckey[1]:.1f}): "
+                      f"R={group['radii']}")
+
+        region_add = []
+
+        # 同心圆 → 贯穿圆柱（内孔先切削外层，深度贯穿整个零件）
+        for ckey, group in region_conc.items():
+            cx, cy = group["center"]
+            radii = group["radii"]
+            sorted_r = sorted(radii, reverse=True)
+            # 圆柱体使用总深度（贯穿整个零件）
+            cyl_height = total_depth
+            cyl_z = 0  # 从 Z=0 开始
+
+            if sorted_r[0] > 0.5:
+                outer_cyl = create_cylinder_solid((cx, cy), sorted_r[0],
+                                                   cyl_height, cyl_z)
+                if outer_cyl is None:
+                    continue
+
+                current = outer_cyl
+                for inner_r in sorted_r[1:]:
+                    if inner_r > 0.3:
+                        hole = create_cylinder_solid(
+                            (cx, cy), inner_r, cyl_height + 10, cyl_z - 5)
+                        if hole is not None:
+                            try:
+                                cut_result = BRepAlgoAPI_Cut(current, hole)
+                                if cut_result.IsDone():
+                                    current = cut_result.Shape()
+                            except Exception:
+                                pass
+
+                region_add.append(current)
+                print(f"    同心圆柱({cx:.1f},{cy:.1f}): "
+                      f"R={sorted_r[0]:.1f}->{sorted_r[-1]:.1f}, "
+                      f"H贯穿={cyl_height:.0f}")
+
+        # 非圆轮廓 → 拉伸
+        line_faces = [f for f in region_faces
+                      if f["face_type"] == "line_only" and f["area"] > 5]
+        line_faces_filt = [f for f in line_faces
+                           if region_faces.index(f) not in conc_face_idx]
+        line_faces_filt.sort(key=lambda f: -f["area"])
+
+        if not line_faces_filt:
+            continue
+
+        body_face = line_faces_filt[0]
+        body_area = body_face["area"]
+
+        # 过滤：跳过完全在主体内部的面（剖面线区域，主体拉伸已覆盖）
+        outer_faces = [body_face]
+        for f in line_faces_filt[1:]:
+            # 检查是否在主体轮廓内部
+            inside_body = (
+                f["x_min"] >= body_face["x_min"] - 0.5 and
+                f["x_max"] <= body_face["x_max"] + 0.5 and
+                f["y_min"] >= body_face["y_min"] - 0.5 and
+                f["y_max"] <= body_face["y_max"] + 0.5
+            )
+            if not inside_body:
+                outer_faces.append(f)
+            # 内部面跳过（已被主体拉伸覆盖）
+
+        for f in outer_faces:
+            wire = build_occ_wire_from_face(
+                f["edges"], edges, edge_vertices, vertex_pos)
+            if wire is None:
+                continue
+            occ_face = build_occ_face(wire)
+            if occ_face is None:
                 continue
 
-            # 全部是 ARC 且 >= 2 边 → 可能是未聚类的圆弧组，尝试作为圆柱
-            f_ids = fi["edges"]
-            all_arc = all(edges[eid].etype == "ARC" for eid in f_ids)
-            if all_arc and len(f_ids) >= 2:
-                centers = []
-                radii = []
-                for eid in f_ids:
-                    e = edges[eid]
-                    centers.append((e.center[0], e.center[1]))
-                    radii.append(e.radius)
-                cx_avg = sum(c[0] for c in centers) / len(centers)
-                cy_avg = sum(c[1] for c in centers) / len(centers)
-                max_dev = max(math.hypot(c[0] - cx_avg, c[1] - cy_avg) for c in centers)
-                if max_dev < 0.5:
-                    max_r = max(radii)
-                    min_r = min(radii)
-                    height = max(section_depth, max_r * 2)
-                    cyl = create_cylinder_from_arcs((cx_avg, cy_avg), max_r, min_r, height)
-                    if cyl is not None:
-                        section_solids.append(cyl)
-                        continue
+            # 主体用全深度
+            local_d = view_depth if f is body_face else view_depth * 0.8
+            local_d = max(local_d, 1.0)
 
-            # 普通拉伸
-            use_depth = depth if extrusion_depth is None else extrusion_depth
-            occ_face = build_occ_face(f_ids, edges, vertex_pos, edge_vertices)
-            if occ_face is not None:
-                solid = extrude_face(occ_face, use_depth)
-                if solid is not None:
-                    section_solids.append(solid)
+            solid = extrude_face(occ_face, local_d)
+            if solid is None:
+                continue
 
-        if section_solids:
-            # 合并截面内实体
-            section_combined = section_solids[0]
-            for s in section_solids[1:]:
-                try:
-                    section_combined = BRepAlgoAPI_Fuse(section_combined, s).Shape()
-                except Exception:
-                    pass
-            all_solids.append(section_combined)
-            print(f"  {section_name}: {len(section_solids)} 个实体已合并")
+            # 移动到 Z 位置
+            try:
+                trsf = gp_Trsf()
+                trsf.SetTranslation(gp_Vec(0, 0, z_offset))
+                solid = BRepBuilderAPI_Transform(solid, trsf, True).Shape()
+            except Exception:
+                pass
 
-    print(f"  总共 {len(all_solids)} 个截面实体")
+            region_add.append(solid)
+            if f is body_face:
+                print(f"    主体: 面积={f['area']:.0f}, {len(f['edges'])}边, "
+                      f"深={local_d:.0f}")
+            else:
+                print(f"    外部特征: 面积={f['area']:.0f}, {len(f['edges'])}边, "
+                      f"深={local_d:.0f}")
 
-    if not all_solids:
-        print("[FAIL] 无法创建任何 3D 实体")
+        # 合并此视图的所有加法特征（手动构建复合体避免 Fuse 丢实体）
+        if region_add:
+            if len(region_add) == 1:
+                rc = region_add[0]
+            else:
+                from OCC.Core.BRep import BRep_Builder
+                from OCC.Core.TopoDS import TopoDS_Compound
+                builder = BRep_Builder()
+                rc = TopoDS_Compound()
+                builder.MakeCompound(rc)
+                for s in region_add:
+                    builder.Add(rc, s)
+            view_solids.append((name, z_offset, rc))
+            print(f"    视图实体已合并 ({len(region_add)}个特征)")
+
+    if not view_solids:
+        print("[FAIL] 无有效几何体")
         return None
 
-    # ---- 布尔合并 ----
-    print(f"\n[6/6] 最终合并 + STEP 导出 ...")
-    combined = all_solids[0]
-    for i, s in enumerate(all_solids[1:], 1):
-        try:
-            combined = BRepAlgoAPI_Fuse(combined, s).Shape()
-        except Exception:
-            print(f"  警告: 截面实体{i}合并失败")
+    # ---- Step 7: 合并所有视图实体（手动构建复合体） ----
+    print(f"\n[7/8] 合并所有视图 ... ({len(view_solids)}个)")
+    from OCC.Core.BRep import BRep_Builder as BB2
+    from OCC.Core.TopoDS import TopoDS_Compound as TC2
+    builder = BB2()
+    combined = TC2()
+    builder.MakeCompound(combined)
+    for name, z_off, solid in view_solids:
+        builder.Add(combined, solid)
+        print(f"  + {name} (Z={z_off:.0f})")
+    print(f"  最终实体已创建 (类型={combined.ShapeType()})")
 
-    # 修复最终形状
-    from OCC.Core.ShapeFix import ShapeFix_Shape
-    fixer = ShapeFix_Shape()
-    fixer.Init(combined)
-    fixer.Perform()
-    combined = fixer.Shape()
-
-    # STEP 导出
+    # ---- Step 8: STEP 导出 ----
+    print(f"\n[8/8] STEP 导出 ...")
     if step_output:
         writer = STEPControl_Writer()
         writer.Transfer(combined, STEPControl_AsIs)
@@ -1210,7 +1303,7 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
 
 
 # ============================================================
-# 7. SolidWorks 导入
+# 9. SolidWorks 导入
 # ============================================================
 
 def import_to_solidworks(step_path: str, output_sldprt: str = None) -> bool:
@@ -1223,19 +1316,14 @@ def import_to_solidworks(step_path: str, output_sldprt: str = None) -> bool:
         return False
 
     try:
-        # 使用 SW COM 导入 STEP
         sw_app = driver.sw_app
         abs_step = str(Path(step_path).absolute())
-
-        # LoadFile2(FileName, ImportType) — ImportType="" 让 SW 自动检测
         result = sw_app.LoadFile2(abs_step, "")
         if not result:
             print(f"[FAIL] SW LoadFile2 导入失败")
             return False
 
         print(f"[OK] STEP 已导入 SW")
-
-        # 更新驱动的活动模型引用
         driver.sw_model = sw_app.ActiveDoc
         driver.sw_part = sw_app.ActiveDoc
 
@@ -1275,7 +1363,6 @@ def main():
     # DWG 自动转 DXF
     if dxf_path.lower().endswith(".dwg"):
         print("检测到 DWG 文件，先转换为 DXF ...")
-        # 尝试用 LibreDWG
         dwg2dxf_exe = PROJECT_ROOT / "tools" / "libredwg" / "dwg2dxf.exe"
         if dwg2dxf_exe.exists():
             dxf_out = str(Path(dxf_path).with_suffix(".dxf"))
@@ -1293,7 +1380,7 @@ def main():
             print("[FAIL] 未找到 dwg2dxf.exe，请手动将 DWG 另存为 DXF")
             sys.exit(1)
 
-    # 确定输出路径
+    # 输出路径
     input_stem = Path(dxf_path).stem
     input_dir = Path(dxf_path).parent
     step_path = str(input_dir / f"{input_stem}_3d.step")
@@ -1306,7 +1393,7 @@ def main():
         output_sldprt = str(input_dir / f"{input_stem}_{ts}.sldprt")
 
     print("=" * 60)
-    print("通用 DXF → 3D SolidWorks 转换器")
+    print("通用 DXF → 3D SolidWorks 转换器 v2.0")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  STEP: {step_path}")
@@ -1329,7 +1416,7 @@ def main():
     if ok:
         print(f"\n[OK] 完成！SW 模型: {output_sldprt}")
     else:
-        print(f"\n[WARN] SW 导入失败，但 STEP 文件可用: {step_path}")
+        print(f"\n[WARN] SW 导入失败，但 STEP 可用: {step_path}")
 
 
 if __name__ == "__main__":
