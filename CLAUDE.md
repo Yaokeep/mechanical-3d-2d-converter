@@ -74,7 +74,7 @@ python main.py
 main.py (入口，将 src/ 加入 sys.path)
   └─ src/app.py (QApplication 初始化、主题加载)
        └─ src/gui/main_window.py (主窗口，菜单栏/工具栏/状态栏/Dock 面板)
-            ├─ src/gui/view3d/             (3D 视口，PythonOCC OpenGL 渲染)
+            ├─ src/gui/view3d/             (3D 视口，PythonOCC OpenGL 渲染 + view3d_controller 鼠标/键盘交互)
             ├─ src/gui/view2d/             (2D 工程图视口，QGraphicsView)
             ├─ src/gui/dock_widgets/       (项目树、属性面板、输出控制台)
             └─ src/gui/dialogs/            (导入/导出/建模对话框、SW 建模对话框 sw_dialog.py)
@@ -85,7 +85,7 @@ src/core/ (核心业务逻辑，与 GUI 完全解耦)
   ├─ projection/     (3D→2D 投影：三视图、轴测图、剖面图、HLR 隐藏线消除)
   ├─ reconstruction/ (2D→3D 重建：线框构建 WireMaker、面构建 FaceBuilder、
   │                   拉伸 Extrude、旋转 Revolve)
-  ├─ annotation/     (自动尺寸标注)
+  ├─ annotation/     (自动尺寸标注：auto_dimension + dimension_calculator)
   └─ sw_automation/  (SolidWorks 2025 COM 自动化驱动 + 参数化建模，✅ 完整实现)
 
 src/utils/ (工具模块：配置管理、日志、线程工作器、单位换算)
@@ -93,8 +93,10 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 根目录独立脚本（不通过 main.py 调用，直接命令行运行）:
   dxf_to_sldprt.py       — DXF 阶梯轴 → SW .sldprt 原生文件（DXF 解析 + SW COM）
-  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图）
+  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，v2.1）
                            核心: 边图构建→封闭环检测→同心圆聚类→智能拉伸/圆柱体→布尔合并
+                           v2.1 新增: 单视图轮廓拉伸模式（自动检测），支持矩形板/圆形法兰
+                           命令行: --single-view 强制轮廓拉伸 / --multi-view 强制包围盒
   convert_dwg_to_3d.py   — DXF → STEP 3D 转换流水线（含 DXF 阶梯轴几何解析 + PythonOCC 建模）
   sw2025_create_shaft.py — 命令行：直接 COM 驱动 SW 创建阶梯轴（无需 GUI）
   generate_sw_macro.py   — 从 JSON 参数生成 SW VBA 宏 .bas 文件
@@ -128,7 +130,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.5.0（`app.py` = `"0.5.0"`，`main_window.py` = `"v0.5.0"`，git tag 为准）：
+版本 v0.5.3（`app.py` = `"0.5.0"`，`main_window.py` = `"v0.5.0"`，git 最新提交为准。注意：代码中版本号字符串尚未同步更新）：
 
 ### ✅ 已完成实现
 
@@ -141,6 +143,10 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
   - 键槽切除 (Keyway-N) — Python COM FeatureCut3(26参数)
 - **`dxf_to_sldprt.py`**：完整 — 命令行参数支持、DXF 几何参数自动检测、时间戳输出文件（防 SW 占用）
 - **`convert_dwg_to_3d.py`**：完整 — 使用 PythonOCC 进行 DXF→STEP 3D 实体建模（旋转体 + 键槽布尔减运算），OCC 懒加载设计使 DXF 解析可独立使用
+- **`dxf_to_3d_general.py`**（1358→1700+ 行，v3.0）：通用 DXF 工程图 → 3D STEP + SW .sldprt。
+  核心算法链：边图构建 → 封闭环检测 → 视图分离(Y+X间隙) → CSG体积求交 / 单视图轮廓拉伸。
+  v3.0 新增 CSG 体积求交法：多视图外轮廓各自拉伸为棱柱 → 布尔交集 → 3D 实体（真正的空间思维）。
+  单视图回退模式保留（轮廓拉伸+内孔减除）。支持 --single-view / --multi-view 命令行参数。
 - **阶梯轴建模对话框**：`sw_dialog.py`（509 行）— 后台线程建模、进度反馈、参数编辑
 - **数据模型**：`Document`、`ShapeNode`、`ProjectionData` 完整实现
 
@@ -203,7 +209,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle`）、`CLAUDE.md` 和 git tag 的版本号需同步。当前为 `v0.5.0`。
+- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle`，共 2 处）、`CLAUDE.md` 和 git tag 的版本号需同步。当前代码中版本号仍为 `v0.5.0`，最新 git 提交为 `v0.5.3`——提交新版本时务必同步更新这些位置。
 - **README.md 路线图已过时**: README 中的开发路线图停留在项目早期规划阶段（v0.3.0~v1.0.0 均标为未完成），实际进度以本文件和 git log 为准。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.step`, `*.stp`, `*.igs`, `*.iges`）和 CAD 软件锁文件。不要将这些文件加入版本控制。
 
