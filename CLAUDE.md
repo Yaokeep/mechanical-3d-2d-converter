@@ -130,7 +130,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.5.4（`app.py` = `"0.5.4"`，`main_window.py` = `"v0.5.4"`，git 最新提交为准）：
+版本 v0.5.5（`app.py` = `"0.5.4"`，`main_window.py` = `"v0.5.4"`，git 最新提交为准）：
 
 ### ✅ 已完成实现
 
@@ -143,9 +143,10 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
   - 键槽切除 (Keyway-N) — Python COM FeatureCut3(26参数)
 - **`dxf_to_sldprt.py`**：完整 — 命令行参数支持、DXF 几何参数自动检测、时间戳输出文件（防 SW 占用）
 - **`convert_dwg_to_3d.py`**：完整 — 使用 PythonOCC 进行 DXF→STEP 3D 实体建模（旋转体 + 键槽布尔减运算），OCC 懒加载设计使 DXF 解析可独立使用
-- **`dxf_to_3d_general.py`**（1358→1700+ 行，v3.0）：通用 DXF 工程图 → 3D STEP + SW .sldprt。
+- **`dxf_to_3d_general.py`**（1358→2000+ 行，v3.0+）：通用 DXF 工程图 → 3D STEP + SW .sldprt。
   核心算法链：边图构建 → 封闭环检测 → 视图分离(Y+X间隙) → CSG体积求交 / 单视图轮廓拉伸。
   v3.0 新增 CSG 体积求交法：多视图外轮廓各自拉伸为棱柱 → 布尔交集 → 3D 实体（真正的空间思维）。
+  v3.1 (P0) 新增内部特征关联：自动检测各视图内部闭环（孔/槽）→ 构建3D切割工具 → 布尔减运算。
   单视图回退模式保留（轮廓拉伸+内孔减除）。支持 --single-view / --multi-view 命令行参数。
 - **阶梯轴建模对话框**：`sw_dialog.py`（509 行）— 后台线程建模、进度反馈、参数编辑
 - **数据模型**：`Document`、`ShapeNode`、`ProjectionData` 完整实现
