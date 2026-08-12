@@ -1252,18 +1252,20 @@ def _is_face_inside(inner_face, outer_face, margin_ratio=0.02):
 
 
 def _build_inner_cut_tool(face_info, view_type, edges, edge_vertices,
-                          vertex_pos, scale_factor, extrude_half):
+                          vertex_pos, scale_factor, extrude_half,
+                          outer_face_center=None):
     """从内部面构建 3D 切割工具。
 
     将内部闭环拉伸为穿透整个 CSG 主体的棱柱，
     用于 BRepAlgoAPI_Cut 布尔减运算。
 
+    outer_face_center: 同视图外轮廓面在旋转+Z对齐后的 (cx, cy, cz)，
+                       内部面使用相同偏移量居中，保持与外轮廓的相对位置。
     extrude_half: 拉伸半长，确保工具完全穿透主体
     返回: TopoDS_Shape 或 None
     """
     eids = face_info.get("edges")
     if not eids:
-        # 包围盒回退面没有边信息，跳过
         return None
 
     # 1) 构建 Wire → Face（DXF 坐标，应用缩放）
@@ -1283,7 +1285,6 @@ def _build_inner_cut_tool(face_info, view_type, edges, edge_vertices,
         occ_face = BRepBuilderAPI_Transform(occ_face, trsf).Shape()
 
     # 3) Z 对齐：非前视图需将旋转后面片的 Z_min 对齐到 Z=0
-    #    （与外轮廓棱柱的构建逻辑一致，确保内外特征在同一坐标系）
     if view_type != "front":
         try:
             face_bbox = Bnd_Box()
@@ -1296,20 +1297,14 @@ def _build_inner_cut_tool(face_info, view_type, edges, edge_vertices,
         except Exception:
             pass
 
-    # 3.5) 居中到原点（与外轮廓一致，确保切割工具在正确坐标系）
-    try:
-        face_bbox = Bnd_Box()
-        brepbndlib.Add(occ_face, face_bbox)
-        _fx1, _fy1, _fz1, _fx2, _fy2, _fz2 = face_bbox.Get()
-        fcx = (_fx1 + _fx2) / 2
-        fcy = (_fy1 + _fy2) / 2
-        fcz = (_fz1 + _fz2) / 2
-        if abs(fcx) > 0.01 or abs(fcy) > 0.01 or abs(fcz) > 0.01:
+    # 3.5) 使用外轮廓的统一居中偏移（而非独立居中）
+    #       保持内部特征与外轮廓之间的相对位置关系
+    if outer_face_center is not None:
+        ocx, ocy, ocz = outer_face_center
+        if abs(ocx) > 0.01 or abs(ocy) > 0.01 or abs(ocz) > 0.01:
             trsf_ctr = gp_Trsf()
-            trsf_ctr.SetTranslation(gp_Vec(-fcx, -fcy, -fcz))
+            trsf_ctr.SetTranslation(gp_Vec(-ocx, -ocy, -ocz))
             occ_face = BRepBuilderAPI_Transform(occ_face, trsf_ctr).Shape()
-    except Exception:
-        pass
 
     # 4) 平移到 -extrude_half，使切割工具居中覆盖主体
     vecs_neg = [
@@ -1657,6 +1652,13 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
             trsf_align.SetTranslation(gp_Vec(0, 0, -fz1))
             occ_face = BRepBuilderAPI_Transform(occ_face, trsf_align).Shape()
 
+        # 保存外轮廓面中心（旋转+Z对齐后），供内部特征工具统一偏移
+        face_bbox = Bnd_Box()
+        brepbndlib.Add(occ_face, face_bbox)
+        _fx1, _fy1, _fz1, _fx2, _fy2, _fz2 = face_bbox.Get()
+        v["_outer_face_center"] = ((_fx1 + _fx2) / 2, (_fy1 + _fy2) / 2,
+                                    (_fz1 + _fz2) / 2)
+
         # 拉伸为棱柱
         prism = _extrude_face_dual(occ_face, extrude_axis, extrude_dist)
         if prism is None:
@@ -1801,10 +1803,12 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
                 continue
 
             vt = v["view_type"]
+            outer_fc = v.get("_outer_face_center", None)
             for fi in inner_faces:
                 tool = _build_inner_cut_tool(
                     fi, vt, edges, edge_vertices, vertex_pos,
-                    scale_factor, half_extrude)
+                    scale_factor, half_extrude,
+                    outer_face_center=outer_fc)
                 if tool is None:
                     continue
 
