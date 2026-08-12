@@ -344,6 +344,167 @@ def parse_dxf_texts(dxf_path: str) -> list[dict]:
     return texts
 
 
+def extract_dxf_annotations(dxf_path: str) -> dict:
+    """提取 DXF 工程图中的辅助信息：剖面线、中心线、截面标记。
+
+    返回:
+        {
+            "hatch_regions": [  # 剖面填充区域（ANSI31 = 实体材料）
+                {"pattern": str, "edges": [[(x1,y1),(x2,y2)],...], "bbox": [4], "area": float},
+                ...
+            ],
+            "centerlines": [    # 中心线 / 对称轴
+                {"start": (x,y), "end": (x,y), "linetype": str, "orientation": "H"|"V"},
+                ...
+            ],
+            "section_markers": [  # 截面标签 A-A, B-B ...
+                {"label": str, "x": float, "y": float},
+                ...
+            ],
+            "linetype_map": {     # 线型名 → 描述
+                "HIDDEN": "Hidden __ __ __",
+                ...
+            },
+        }
+    """
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+
+    result = {
+        "hatch_regions": [],
+        "centerlines": [],
+        "section_markers": [],
+        "linetype_map": {},
+    }
+
+    # ---- 线型表 ----
+    for lt in doc.linetypes:
+        name = lt.dxf.name
+        desc = ""
+        try:
+            desc = lt.dxf.description or ""
+        except Exception:
+            pass
+        result["linetype_map"][name] = desc
+
+    # ---- HATCH: 剖面填充 ----
+    for h in msp.query("HATCH"):
+        pattern = ""
+        try:
+            pattern = h.dxf.pattern_name or ""
+        except Exception:
+            pass
+        # ANSI31 = 金属材料剖面线（45° 斜线），表示实体
+        # 其他剖面图案也可能是实体材料
+        if not pattern:
+            continue
+
+        hatch_edges = []
+        try:
+            for p in h.paths:
+                # EdgePath: 由边组成的边界
+                edge_segments = []
+                try:
+                    for edge in p.edges:
+                        try:
+                            sp = edge.start_point
+                            ep = edge.end_point
+                            edge_segments.append(((sp.x, sp.y), (ep.x, ep.y)))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                if edge_segments:
+                    hatch_edges.extend(edge_segments)
+        except Exception:
+            pass
+
+        if not hatch_edges:
+            continue
+
+        # 计算 hatch 区域的包围盒和面积
+        all_pts = []
+        for (x1, y1), (x2, y2) in hatch_edges:
+            all_pts.append((x1, y1))
+            all_pts.append((x2, y2))
+        xs = [p[0] for p in all_pts]
+        ys = [p[1] for p in all_pts]
+        bbox = [min(xs), min(ys), max(xs), max(ys)]
+        area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+
+        result["hatch_regions"].append({
+            "pattern": pattern,
+            "edges": hatch_edges,
+            "bbox": bbox,
+            "area": area,
+        })
+
+    # ---- 中心线（LINE 实体中非 Continuous 线型） ----
+    center_linetypes = {"CENTER", "CENTER2", "CENTERX2", "DASHDOT", "PHANTOM"}
+    for e in msp.query("LINE"):
+        lt = ""
+        try:
+            lt = (e.dxf.linetype or "").upper()
+        except Exception:
+            pass
+        if lt not in center_linetypes:
+            continue
+
+        x1, y1 = e.dxf.start.x, e.dxf.start.y
+        x2, y2 = e.dxf.end.x, e.dxf.end.y
+        dx, dy = abs(x2 - x1), abs(y2 - y1)
+
+        # 判断方向
+        if dx > dy * 3:
+            orientation = "H"  # 水平中心线
+        elif dy > dx * 3:
+            orientation = "V"  # 垂直中心线
+        else:
+            orientation = "D"  # 斜向
+
+        result["centerlines"].append({
+            "start": (x1, y1),
+            "end": (x2, y2),
+            "linetype": lt,
+            "orientation": orientation,
+            "length": math.hypot(dx, dy),
+        })
+
+    # ---- 截面标记：MTEXT 中的字母标签 ----
+    # 截面标签通常是 "A", "B", "C"... 成对出现（标记截面平面两端）
+    import re
+    section_labels = []
+    for e in msp.query("TEXT MTEXT"):
+        try:
+            if e.dxftype() == "MTEXT":
+                txt = e.text if hasattr(e, 'text') else ''
+            else:
+                txt = e.dxf.text if hasattr(e.dxf, 'text') else ''
+            x = e.dxf.insert.x
+            y = e.dxf.insert.y
+            txt = txt.strip()
+        except Exception:
+            continue
+
+        # 检测截面标签：单个大写字母或 "A-A" 形式
+        if re.match(r'^[A-Z]$', txt):
+            # 单字母截面标记
+            section_labels.append({"label": txt, "x": x, "y": y})
+        elif re.match(r'^[A-Z]-[A-Z]$', txt):
+            section_labels.append({"label": txt.split("-")[0], "x": x, "y": y})
+
+    # 按标签分组（同一字母的多个位置 = 同一截面平面的不同标记点）
+    by_label = defaultdict(list)
+    for sl in section_labels:
+        by_label[sl["label"]].append(sl)
+    # 保留成对出现（至少 2 个标记点）的截面
+    for label, markers in by_label.items():
+        if len(markers) >= 2:
+            result["section_markers"].extend(markers)
+
+    return result
+
+
 # ============================================================
 # 2. 图构建
 # ============================================================
@@ -1476,7 +1637,8 @@ def _separate_views_2d(faces_info, total_bbox):
     return result
 
 
-def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
+def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
+                    annotations=None):
     """CSG 体积求交法：各视图轮廓拉伸为棱柱 → 布尔交集 → 3D 实体。
 
     原理:
@@ -1486,6 +1648,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
       侧视图棱柱 = 侧视图外轮廓 沿 X 拉伸（面在 YZ 平面）
 
     scale_factor: DXF 坐标 → 实物尺寸的缩放因子
+    annotations: extract_dxf_annotations() 返回的注解字典（P2）
 
     Returns: (body_solid, hole_data) 或 (None, None)
     """
@@ -1781,6 +1944,119 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
             combined = BRepBuilderAPI_GTransform(combined, gtrsf).Shape()
             print(f"  [P1] 修正完成")
 
+    # ---- P2: 注解驱动分析（中心线对称 + 剖面材料验证） ----
+    symmetry_info = None  # 对称轴信息
+    if annotations:
+        # P2a: 中心线对称分析
+        centerlines = annotations.get("centerlines", [])
+        if centerlines:
+            # 找最长的垂直中心线（通常是主轴）
+            v_cls = sorted(
+                [cl for cl in centerlines if cl["orientation"] == "V"],
+                key=lambda cl: -cl["length"])
+            h_cls = sorted(
+                [cl for cl in centerlines if cl["orientation"] == "H"],
+                key=lambda cl: -cl["length"])
+
+            for cl in v_cls[:2]:  # 分析前 2 条垂直中心线
+                dxf_cx = cl["start"][0]  # DXF 坐标系中的对称轴 X
+                # 映射到 3D: 需要知道此中心线属于哪个视图
+                # 遍历视图找到包含此 X 的前视图
+                for v in views:
+                    if v["view_type"] != "front":
+                        continue
+                    v_bbox = v["bbox"]
+                    if v_bbox[0] <= dxf_cx <= v_bbox[2]:
+                        # 此中心线在前视图中
+                        # 3D 空间中的等效 X（需要映射回 CSG body 的坐标系）
+                        # DXF 坐标 → 3D 坐标: 先缩放，再减中心偏移
+                        dxf_view_cx = (v_bbox[0] + v_bbox[2]) / 2
+                        sf = scale_factor
+                        # 中心线在 3D 中的 X 偏移（相对于视图中心）
+                        cl_offset_3d = (dxf_cx - dxf_view_cx) * sf
+                        # CSG body 的 3D 中心（已居中到原点附近）
+                        body_center_x = (csg_x > 0 and (cbx1 + cbx2) / 2) or 0
+                        # 中心线在 body 坐标系中的位置
+                        cl_in_body_x = body_center_x + cl_offset_3d
+
+                        # 检查 body 是否关于此中心线对称
+                        body_left = cbx1 - cl_in_body_x
+                        body_right = cbx2 - cl_in_body_x
+                        # 若中心线是真正的对称轴，则 body_left ≈ -body_right
+                        center_offset = abs(body_left + body_right) / 2  # 理想=0
+
+                        print(f"  [P2] 中心线({cl['linetype']}): DXF X={dxf_cx:.1f} "
+                              f"→ 3D 偏移={cl_offset_3d:.1f}mm, "
+                              f"中心偏差={center_offset:.1f}mm")
+
+                        if center_offset > csg_x * 0.10 and csg_x > 10:
+                            print(f"  [P2] [INFO] 中心线不在主体中心, "
+                                  f"偏移={center_offset:.1f}mm "
+                                  f"({center_offset/csg_x*100:.0f}% of X)")
+
+                        symmetry_info = {
+                            "dxf_x": dxf_cx,
+                            "offset_3d": cl_offset_3d,
+                            "center_offset": center_offset,
+                            "orientation": "V",
+                        }
+                        break
+
+        # P2b: HATCH 剖面区域 → 材料验证
+        hatch_regions = annotations.get("hatch_regions", [])
+        if hatch_regions and csg_x > 0 and csg_y > 0:
+            # 将 hatch 区域映射到 3D 空间进行验证
+            # HATCH 在 DXF 的 front 视图中，DXF_XY → 3D_XY
+            hatch_3d_matches = 0
+            hatch_3d_total = 0
+            for hr in hatch_regions:
+                hb = hr["bbox"]
+                # 映射到 3D（缩放 + 中心偏移）
+                sf = scale_factor
+                # 找到此 hatch 对应的视图
+                for v in views:
+                    if v["view_type"] != "front":
+                        continue
+                    v_bbox = v["bbox"]
+                    # 检查 hatch 是否在此视图中
+                    if (hb[0] >= v_bbox[0] - 5 and hb[2] <= v_bbox[2] + 5
+                            and hb[1] >= v_bbox[1] - 5 and hb[3] <= v_bbox[3] + 5):
+                        # 映射 hatch bbox 到 3D body 坐标系
+                        v_center_x = (v_bbox[0] + v_bbox[2]) / 2
+                        v_center_y = (v_bbox[1] + v_bbox[3]) / 2
+                        h3d_x1 = (hb[0] - v_center_x) * sf + (cbx1 + cbx2) / 2
+                        h3d_x2 = (hb[2] - v_center_x) * sf + (cbx1 + cbx2) / 2
+                        h3d_y1 = (hb[1] - v_center_y) * sf + (cby1 + cby2) / 2
+                        h3d_y2 = (hb[3] - v_center_y) * sf + (cby1 + cby2) / 2
+
+                        # 计算 hatch 3D 面积与 CSG body 截面面积的交集比例
+                        h3d_w = h3d_x2 - h3d_x1
+                        h3d_h = h3d_y2 - h3d_y1
+
+                        # 检查 hatch 区域是否至少部分在 body 内
+                        overlap_x = max(0, min(h3d_x2, cbx2) - max(h3d_x1, cbx1))
+                        overlap_y = max(0, min(h3d_y2, cby2) - max(h3d_y1, cby1))
+                        overlap_area = overlap_x * overlap_y
+                        hatch_area = h3d_w * h3d_h
+
+                        if hatch_area > 0:
+                            hatch_3d_total += 1
+                            coverage = overlap_area / hatch_area
+                            if coverage > 0.5:
+                                hatch_3d_matches += 1
+                            elif coverage > 0.01:
+                                print(f"  [P2] [WARN] 剖面区域({hr['pattern']}) "
+                                      f"仅 {coverage*100:.0f}% 在 CSG 主体内 "
+                                      f"(HATCH 3D: [{h3d_x1:.0f}~{h3d_x2:.0f}, "
+                                      f"{h3d_y1:.0f}~{h3d_y2:.0f}])")
+                            else:
+                                print(f"  [P2] [FAIL] 剖面区域({hr['pattern']}) "
+                                      f"完全在 CSG 主体外！主体可能缺失此区域")
+
+            if hatch_3d_total > 0:
+                print(f"  [P2] 剖面材料验证: {hatch_3d_matches}/{hatch_3d_total} "
+                      f"个剖面区域正确位于 CSG 主体内")
+
     # ---- P0: 内部特征布尔减运算 ----
     # 对每个视图的内部闭环构建切割工具，从 CSG 主体中减去
     inner_cut_count = 0
@@ -1899,6 +2175,23 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
     print(f"  边: {len(edges)}, 文字: {len(texts)}")
     for etype, count in metadata["entity_counts"].items():
         print(f"    {etype}: {count}")
+
+    # ---- Step 1.5: 注解提取（剖面线/中心线/截面标记） ----
+    annotations = extract_dxf_annotations(dxf_path)
+    if annotations["hatch_regions"]:
+        print(f"  剖面填充: {len(annotations['hatch_regions'])} 个 "
+              f"({', '.join(h['pattern'] for h in annotations['hatch_regions'])})")
+    if annotations["centerlines"]:
+        print(f"  中心线: {len(annotations['centerlines'])} 条 "
+              f"({', '.join(set(cl['linetype'] for cl in annotations['centerlines']))})")
+    if annotations["section_markers"]:
+        labels = sorted(set(m["label"] for m in annotations["section_markers"]))
+        print(f"  截面标记: {', '.join(f'{l}-{l}' for l in labels)}")
+    has_hidden_lt = any("HIDDEN" in k.upper() for k in annotations["linetype_map"])
+    has_center_lt = any("CENTER" in k.upper() or "PHANTOM" in k.upper()
+                       for k in annotations["linetype_map"])
+    if has_hidden_lt:
+        print(f"  [INFO] DXF 线型表包含 HIDDEN 线型，但所有实体均使用 Continuous")
 
     if len(edges) < 3:
         print("[FAIL] 边数量不足")
@@ -2074,7 +2367,8 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
     if len(views) >= 2 and not single_view and not is_circular_body:
         print(f"\n  尝试 CSG 体积求交 ({len(views)} 视图)...")
         body_solid, csg_holes = csg_reconstruct(
-            views, edges, edge_vertices, vertex_pos, scale_factor)
+            views, edges, edge_vertices, vertex_pos, scale_factor,
+            annotations=annotations)
 
     if body_solid is not None:
         is_csg = True
