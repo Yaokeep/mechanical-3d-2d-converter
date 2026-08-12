@@ -1296,6 +1296,21 @@ def _build_inner_cut_tool(face_info, view_type, edges, edge_vertices,
         except Exception:
             pass
 
+    # 3.5) 居中到原点（与外轮廓一致，确保切割工具在正确坐标系）
+    try:
+        face_bbox = Bnd_Box()
+        brepbndlib.Add(occ_face, face_bbox)
+        _fx1, _fy1, _fz1, _fx2, _fy2, _fz2 = face_bbox.Get()
+        fcx = (_fx1 + _fx2) / 2
+        fcy = (_fy1 + _fy2) / 2
+        fcz = (_fz1 + _fz2) / 2
+        if abs(fcx) > 0.01 or abs(fcy) > 0.01 or abs(fcz) > 0.01:
+            trsf_ctr = gp_Trsf()
+            trsf_ctr.SetTranslation(gp_Vec(-fcx, -fcy, -fcz))
+            occ_face = BRepBuilderAPI_Transform(occ_face, trsf_ctr).Shape()
+    except Exception:
+        pass
+
     # 4) 平移到 -extrude_half，使切割工具居中覆盖主体
     vecs_neg = [
         gp_Vec(-extrude_half, 0, 0),
@@ -1488,14 +1503,18 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
     if len(views) < 2:
         return None, None  # 单视图不用 CSG
 
-    # 计算全局拉伸距离（已考虑比例）
+    # 计算智能拉伸距离（已考虑比例）
+    # 不再使用固定 5x 乘数（会导致极端长宽比破坏布尔运算精度）
     all_x = []
     all_y = []
     for v in views:
         all_x.extend([v["bbox"][0] * scale_factor, v["bbox"][2] * scale_factor])
         all_y.extend([v["bbox"][1] * scale_factor, v["bbox"][3] * scale_factor])
-    max_dim = max(max(all_x) - min(all_x), max(all_y) - min(all_y))
-    extrude_dist = max_dim * 5  # "无限"拉伸
+    total_x = max(all_x) - min(all_x)
+    total_y = max(all_y) - min(all_y)
+    max_dim = max(total_x, total_y)
+    # 使用 2x 乘数：足够覆盖整个零件，同时避免极端长宽比
+    extrude_dist = max_dim * 2
 
     # ---- Fix 4: 前视图有效 Y 范围（用于 Z 深度估算，在裁剪后动态更新） ----
     front_y_range = None  # 裁剪后的前视图 Y 范围
@@ -1643,6 +1662,22 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
         if prism is None:
             print(f"  [WARN] 视图 '{v['name']}' 拉伸失败")
             continue
+
+        # 棱柱居中到原点：避免大坐标导致的布尔运算精度问题
+        # （在拉伸后整体平移，保持各维度的相对位置正确）
+        try:
+            prism_bbox = Bnd_Box()
+            brepbndlib.Add(prism, prism_bbox)
+            px1, py1, pz1, px2, py2, pz2 = prism_bbox.Get()
+            pcx = (px1 + px2) / 2
+            pcy = (py1 + py2) / 2
+            pcz = (pz1 + pz2) / 2
+            if abs(pcx) > 0.01 or abs(pcy) > 0.01 or abs(pcz) > 0.01:
+                trsf_ctr = gp_Trsf()
+                trsf_ctr.SetTranslation(gp_Vec(-pcx, -pcy, -pcz))
+                prism = BRepBuilderAPI_Transform(prism, trsf_ctr).Shape()
+        except Exception:
+            pass
 
         prisms.append(prism)
         print(f"  视图 '{v['name']}'({v['view_type']}): "
