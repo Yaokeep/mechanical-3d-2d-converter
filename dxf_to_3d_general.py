@@ -1253,7 +1253,7 @@ def _is_face_inside(inner_face, outer_face, margin_ratio=0.02):
 
 def _build_inner_cut_tool(face_info, view_type, edges, edge_vertices,
                           vertex_pos, scale_factor, extrude_half,
-                          outer_face_center=None):
+                          outer_face_center=None, z_align_offset=None):
     """从内部面构建 3D 切割工具。
 
     将内部闭环拉伸为穿透整个 CSG 主体的棱柱，
@@ -1284,18 +1284,12 @@ def _build_inner_cut_tool(face_info, view_type, edges, edge_vertices,
         trsf.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(*rot_axis)), rot_angle)
         occ_face = BRepBuilderAPI_Transform(occ_face, trsf).Shape()
 
-    # 3) Z 对齐：非前视图需将旋转后面片的 Z_min 对齐到 Z=0
-    if view_type != "front":
-        try:
-            face_bbox = Bnd_Box()
-            brepbndlib.Add(occ_face, face_bbox)
-            _fx1, _fy1, fz_min, _fx2, _fy2, _fz2 = face_bbox.Get()
-            if abs(fz_min) > 0.01:
-                trsf_align = gp_Trsf()
-                trsf_align.SetTranslation(gp_Vec(0, 0, -fz_min))
-                occ_face = BRepBuilderAPI_Transform(occ_face, trsf_align).Shape()
-        except Exception:
-            pass
+    # 3) Z 对齐：使用外轮廓的统一偏移量（不同半径的面必须用同一偏移）
+    if view_type != "front" and z_align_offset is not None:
+        if abs(z_align_offset) > 0.01:
+            trsf_align = gp_Trsf()
+            trsf_align.SetTranslation(gp_Vec(0, 0, -z_align_offset))
+            occ_face = BRepBuilderAPI_Transform(occ_face, trsf_align).Shape()
 
     # 3.5) 使用外轮廓的统一居中偏移（而非独立居中）
     #       保持内部特征与外轮廓之间的相对位置关系
@@ -1645,12 +1639,13 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
 
         # 对齐：非前视图需将 Z_min 平移到 0（与正视图 Z=0 对齐）
         if v["view_type"] != "front":
-            face_bbox = Bnd_Box()
-            brepbndlib.Add(occ_face, face_bbox)
-            fx1, fy1, fz1, fx2, fy2, fz2 = face_bbox.Get()
-            trsf_align = gp_Trsf()
-            trsf_align.SetTranslation(gp_Vec(0, 0, -fz1))
-            occ_face = BRepBuilderAPI_Transform(occ_face, trsf_align).Shape()
+                fb = Bnd_Box()
+                brepbndlib.Add(occ_face, fb)
+                _, _, z_min_before, _, _, _ = fb.Get()
+                v["_z_align_offset"] = z_min_before  # 保存对齐前的 Z_min，内部面共用
+                trsf_align = gp_Trsf()
+                trsf_align.SetTranslation(gp_Vec(0, 0, -z_min_before))
+                occ_face = BRepBuilderAPI_Transform(occ_face, trsf_align).Shape()
 
         # 保存外轮廓面中心（旋转+Z对齐后），供内部特征工具统一偏移
         face_bbox = Bnd_Box()
@@ -1804,11 +1799,13 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
 
             vt = v["view_type"]
             outer_fc = v.get("_outer_face_center", None)
+            z_off = v.get("_z_align_offset", None)
             for fi in inner_faces:
                 tool = _build_inner_cut_tool(
                     fi, vt, edges, edge_vertices, vertex_pos,
                     scale_factor, half_extrude,
-                    outer_face_center=outer_fc)
+                    outer_face_center=outer_fc,
+                    z_align_offset=z_off)
                 if tool is None:
                     continue
 
