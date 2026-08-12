@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "mechanical-engineer": {
+      "source": "selfdriven-octo/skillzeb",
+      "sourceType": "github",
+      "skillPath": "skills/intelligence/organic-human/human/mechanical-engineer/SKILL.md",
+      "computedHash": "5870a2c34c314a6b4ddd1977e599593b926999c5d4eb259403127a2b9c2275ff"
+    }
+  }
+}

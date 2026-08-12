@@ -61,6 +61,16 @@ htmlcov/
 # ruff
 .ruff_cache/
 
+# Claude Code 本地状态
+.claude/
+
+# CAD 临时输出目录
+CAD/temp_output/
+
+# 测试运行日志
+CAD/*_output.txt
+CAD/*_p1.txt
+
 # 敏感配置
 *.env
 *.secret
