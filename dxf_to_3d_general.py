@@ -1518,14 +1518,13 @@ def _separate_views_2d(faces_info, total_bbox):
             all_views.append(cluster)
             continue
 
-        # X 间隙阈值基于当前簇的 X 宽度（不是全局宽度）
-        # 同一视图内的特征间隙不应触发拆分
+        # X 间隙阈值基于 Y 簇总宽度 + 最小保护值
+        # 同一视图内特征间隙通常 < 30mm 或 < 簇宽的 20%
+        # 独立视图间距较大（如 主+左视图并排）
         cluster_x_min = min(f["x_min"] for f in cluster)
         cluster_x_max = max(f["x_max"] for f in cluster)
         cluster_x_width = cluster_x_max - cluster_x_min
-        x_gap_threshold = max(30.0, cluster_x_width * 0.30)
-
-        # 按 X 坐标分组
+        x_gap_threshold = max(30.0, cluster_x_width * 0.20)
         sorted_by_x = sorted(cluster, key=lambda f: f["x_mid"])
         x_clusters = [[sorted_by_x[0]]]
         for f in sorted_by_x[1:]:
@@ -1557,6 +1556,17 @@ def _separate_views_2d(faces_info, total_bbox):
             # Y 重叠度
             overlap = min(yi_max, yj_max) - max(yi_min, yj_min)
             if overlap > 0 and (overlap > yi_h * 0.5 or overlap > yj_h * 0.5):
+                # X 间隙保护：Y 高度对齐但 X 明显分离 → 可能是并列独立视图
+                # （如 主视图+左视图 并排），不应合并
+                mi_x_max = max(f["x_max"] for f in merged)
+                mj_x_min = min(f["x_min"] for f in all_views[j])
+                mj_x_max = max(f["x_max"] for f in all_views[j])
+                x_gap = mj_x_min - mi_x_max
+                mi_w = mi_x_max - min(f["x_min"] for f in merged)
+                mj_w = mj_x_max - mj_x_min
+                min_w = min(mi_w, mj_w) if mi_w > 0 and mj_w > 0 else 0
+                if overlap > min(yi_h, yj_h) * 0.85 and x_gap > min_w * 0.25:
+                    continue  # 跳过合并，保留为独立视图
                 merged.extend(all_views[j])
                 used.add(j)
         merged_views.append(merged)
@@ -1618,6 +1628,25 @@ def _separate_views_2d(faces_info, total_bbox):
                 if all_view_centers[xi][0] > avg_other_x + total_x_range * 0.12:
                     vtypes[xi] = "side"
                     break
+
+        # X 对齐修正：与 top 视图 X 范围对齐的 → front，不对齐的 → side
+        # 位置排名法可能把"与俯视图对齐的主视图"误判为 side（因为它靠右）
+        if n >= 2:
+            top_idx = next((i for i in range(n) if vtypes[i] == "top"), None)
+            if top_idx is not None:
+                top_x_min = min(f["x_min"] for f in all_views[top_idx])
+                top_x_max = max(f["x_max"] for f in all_views[top_idx])
+                for i in range(n):
+                    if vtypes[i] == "top":
+                        continue
+                    view_x_min = min(f["x_min"] for f in all_views[i])
+                    view_x_max = max(f["x_max"] for f in all_views[i])
+                    view_x_w = view_x_max - view_x_min
+                    x_overlap = min(view_x_max, top_x_max) - max(view_x_min, top_x_min)
+                    if view_x_w > 0 and x_overlap > view_x_w * 0.5:
+                        vtypes[i] = "front"  # 与 top 对齐 → 主视图
+                    else:
+                        vtypes[i] = "side"   # 不对齐 → 侧视图
 
     for idx, vfaces in enumerate(all_views):
         x_min = min(f["x_min"] for f in vfaces)
@@ -1730,12 +1759,22 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                     other_views_ymin.append(ov["bbox"][1])
 
             if other_views_ymin:
-                # 找到紧邻的上方视图（Y 更大的视图）
-                above_ymin = min(other_views_ymin)  # 最近的视图的 Y_min
+                # 只考虑真正在上方的视图（Y_min > 本视图非跨越面的 Y_max）
+                v_normal_temp = [f for f in v["faces"] if not f.get("is_spanning")]
+                if v_normal_temp:
+                    v_nf_ymax_for_filter = max(f["y_max"] for f in v_normal_temp)
+                else:
+                    v_nf_ymax_for_filter = outer_face["y_min"]
+                above_candidates = [y for y in other_views_ymin
+                                    if y > v_nf_ymax_for_filter + 5]
+                if not above_candidates:
+                    above_ymin = None  # 无真正上方视图
+                else:
+                    above_ymin = min(above_candidates)
                 outer_y_span = outer_face["y_max"] - outer_face["y_min"]
 
                 # 如果跨越面的 Y 范围显著超过了到上方视图的间隙
-                if above_ymin < outer_face["y_max"] and outer_y_span > 50:
+                if above_ymin is not None and above_ymin < outer_face["y_max"] and outer_y_span > 50:
                     # 在跨越面和上方视图之间找一个合理的分割点
                     # 使用本视图中非跨越面的最大 Y 和上方视图最小 Y 的中点
                     v_normal = [f for f in v["faces"] if not f.get("is_spanning")]
