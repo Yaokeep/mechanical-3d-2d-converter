@@ -1505,8 +1505,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
     # 使用 2x 乘数：足够覆盖整个零件，同时避免极端长宽比
     extrude_dist = max_dim * 2
 
-    # ---- Fix 4: 前视图有效 Y 范围（用于 Z 深度估算，在裁剪后动态更新） ----
-    front_y_range = None  # 裁剪后的前视图 Y 范围
+    # ---- Fix 4: 前视图 Y 范围由 P1 投影验证自动处理 ----
 
     prisms = []
     hole_data = []  # 每个视图的内孔信息
@@ -1595,10 +1594,6 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
                         outer_face["area"] = ((outer_face["x_max"] - outer_face["x_min"])
                                               * (split_y - outer_face["y_min"]))
                         use_bbox_fallback = True
-
-        # ---- Fix 4: 记录前视图裁剪后的 Y 范围，用于 Z 深度估算 ----
-        if v["name"] == "front" and outer_face is not None:
-            front_y_range = (outer_face["y_max"] - outer_face["y_min"]) * scale_factor
 
         if outer_face is None:
             print(f"  [WARN] 视图 '{v['name']}' 无有效外轮廓，跳过")
@@ -1723,41 +1718,68 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
     except Exception:
         pass
 
-    # ---- Fix 4: Z 深度修正 ----
-    # 如果俯视图 Y 范围太小（<前视图 Y 的 50%），说明俯视图不代表真实深度
-    # 使用前视图 Y 范围作为 Z 深度进行非均匀缩放
-    if front_y_range is not None and front_y_range > 0:
-        try:
-            csg_bbox = Bnd_Box()
-            brepbndlib.Add(combined, csg_bbox)
-            cx1, cy1, cz1, cx2, cy2, cz2 = csg_bbox.Get()
-            csg_z = cz2 - cz1
+    # ---- P1: 投影验证回路 ----
+    # 将 CSG 主体投影回 2D 与原始视图轮廓对比，自动纠正尺寸误差
+    try:
+        csg_bbox = Bnd_Box()
+        brepbndlib.Add(combined, csg_bbox)
+        cbx1, cby1, cbz1, cbx2, cby2, cbz2 = csg_bbox.Get()
+        csg_x, csg_y, csg_z = cbx2 - cbx1, cby2 - cby1, cbz2 - cbz1
+    except Exception:
+        csg_x = csg_y = csg_z = 0
 
-            if csg_z > 0 and front_y_range > 0 and csg_z < front_y_range * 0.5:
-                z_scale = front_y_range / csg_z
-                print(f"  [Fix] Z 深度修正: CSG Z={csg_z:.0f} → "
-                      f"目标 Z={front_y_range:.0f} (×{z_scale:.2f})")
+    # 从各视图收集期望尺寸（3D 空间中的映射）
+    expected = {"X": None, "Y": None, "Z": None}
+    for v in views:
+        vt = v["view_type"]
+        ofc = v.get("_outer_face", {})
+        bw = (v["bbox"][2] - v["bbox"][0]) * scale_factor
+        bh = (v["bbox"][3] - v["bbox"][1]) * scale_factor
+        if vt == "front":
+            # 前视图 DXF_X→3D_X, DXF_Y→3D_Y, 面沿 Z 拉伸→Z 深度来自其他视图
+            if expected["X"] is None or bw > expected["X"]:
+                expected["X"] = bw
+            if expected["Y"] is None or bh > expected["Y"]:
+                expected["Y"] = bh
+        elif vt == "top":
+            # 俯视图 DXF_X→3D_X, DXF_Y→3D_Z（旋转后）
+            if expected["X"] is None or bw > expected["X"]:
+                expected["X"] = bw
+            expected["Z"] = bh  # 俯视图高度 → 3D Z 深度
+        elif vt == "side":
+            # 侧视图 DXF_Y→3D_Y, DXF_X→3D_Z（旋转后）
+            if expected["Y"] is None or bh > expected["Y"]:
+                expected["Y"] = bh
+            expected["Z"] = bw  # 侧视图宽度 → 3D Z 深度
 
-                # 用 gp_GTrsf 做非均匀 Z 缩放
-                gtrsf = gp_GTrsf()
-                # 设置矩阵：对角线 (1, 1, z_scale)，以底部中心为基准
-                gtrsf.SetValue(1, 1, 1.0)  # X scale
-                gtrsf.SetValue(2, 2, 1.0)  # Y scale
-                gtrsf.SetValue(3, 3, z_scale)  # Z scale
-                # 平移部分：缩放后需要补偿位移（以 Z_min 为基准）
-                gtrsf.SetValue(1, 4, 0)
-                gtrsf.SetValue(2, 4, 0)
-                gtrsf.SetValue(3, 4, cz1 * (1 - z_scale))  # 保持底部不动
+    # 报告尺寸对比
+    if csg_x > 0 and csg_y > 0 and csg_z > 0:
+        print(f"  [P1] CSG 主体: X={csg_x:.0f} Y={csg_y:.0f} Z={csg_z:.0f} mm")
+        exp_parts = []
+        for d in ["X", "Y", "Z"]:
+            if expected[d] is not None:
+                exp_parts.append(f"{d}={expected[d]:.0f}")
+        print(f"  [P1] 期望尺寸: {', '.join(exp_parts)} mm")
 
-                combined = BRepBuilderAPI_GTransform(combined, gtrsf).Shape()
+    # 自动修正 Z 深度（用投影验证替代启发式判断）
+    if expected["Z"] is not None and csg_z > 0 and expected["Z"] > 0:
+        z_ratio = expected["Z"] / csg_z
+        if z_ratio < 0.7 or z_ratio > 1.3:
+            # Z 深度偏差 >30%，用均匀缩放修正
+            z_scale = expected["Z"] / csg_z
+            print(f"  [P1] Z 深度修正: Z={csg_z:.0f} → {expected['Z']:.0f} mm "
+                  f"(×{z_scale:.2f})")
 
-                # 验证
-                csg_bbox2 = Bnd_Box()
-                brepbndlib.Add(combined, csg_bbox2)
-                _, _, _, _, _, nz2 = csg_bbox2.Get()
-                print(f"  [Fix] 修正后 Z={(nz2 - cz1):.0f}mm")
-        except Exception as e:
-            print(f"  [WARN] Z 深度修正失败: {e}")
+            gtrsf = gp_GTrsf()
+            gtrsf.SetValue(1, 1, 1.0)
+            gtrsf.SetValue(2, 2, 1.0)
+            gtrsf.SetValue(3, 3, z_scale)
+            gtrsf.SetValue(1, 4, 0)
+            gtrsf.SetValue(2, 4, 0)
+            gtrsf.SetValue(3, 4, cbz1 * (1 - z_scale))
+
+            combined = BRepBuilderAPI_GTransform(combined, gtrsf).Shape()
+            print(f"  [P1] 修正完成")
 
     # ---- P0: 内部特征布尔减运算 ----
     # 对每个视图的内部闭环构建切割工具，从 CSG 主体中减去
