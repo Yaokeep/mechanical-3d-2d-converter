@@ -1236,6 +1236,81 @@ def _align_view_features(view_bbox, ref_bbox, align_dim):
     return (0, 0, 0)
 
 
+def _is_face_inside(inner_face, outer_face, margin_ratio=0.02):
+    """判断 inner_face 是否位于 outer_face 内部（不与外轮廓边界接触）。
+
+    用于区分真正的内部特征（孔、槽）与贴边特征。
+    margin_ratio: 相对于外轮廓尺寸的边距比例
+    """
+    ow = outer_face["x_max"] - outer_face["x_min"]
+    oh = outer_face["y_max"] - outer_face["y_min"]
+    margin = max(ow, oh) * margin_ratio
+    return (inner_face["x_min"] > outer_face["x_min"] + margin and
+            inner_face["x_max"] < outer_face["x_max"] - margin and
+            inner_face["y_min"] > outer_face["y_min"] + margin and
+            inner_face["y_max"] < outer_face["y_max"] - margin)
+
+
+def _build_inner_cut_tool(face_info, view_type, edges, edge_vertices,
+                          vertex_pos, scale_factor, extrude_half):
+    """从内部面构建 3D 切割工具。
+
+    将内部闭环拉伸为穿透整个 CSG 主体的棱柱，
+    用于 BRepAlgoAPI_Cut 布尔减运算。
+
+    extrude_half: 拉伸半长，确保工具完全穿透主体
+    返回: TopoDS_Shape 或 None
+    """
+    eids = face_info.get("edges")
+    if not eids:
+        # 包围盒回退面没有边信息，跳过
+        return None
+
+    # 1) 构建 Wire → Face（DXF 坐标，应用缩放）
+    wire = build_occ_wire_from_face(eids, edges, edge_vertices, vertex_pos,
+                                    scale_factor)
+    if wire is None:
+        return None
+    occ_face = build_occ_face(wire)
+    if occ_face is None:
+        return None
+
+    # 2) 视图旋转变换（与外轮廓相同）
+    rot_axis, rot_angle, extrude_axis = _get_view_transform(view_type)
+    if rot_axis is not None:
+        trsf = gp_Trsf()
+        trsf.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(*rot_axis)), rot_angle)
+        occ_face = BRepBuilderAPI_Transform(occ_face, trsf).Shape()
+
+    # 3) Z 对齐：非前视图需将旋转后面片的 Z_min 对齐到 Z=0
+    #    （与外轮廓棱柱的构建逻辑一致，确保内外特征在同一坐标系）
+    if view_type != "front":
+        try:
+            face_bbox = Bnd_Box()
+            brepbndlib.Add(occ_face, face_bbox)
+            _fx1, _fy1, fz_min, _fx2, _fy2, _fz2 = face_bbox.Get()
+            if abs(fz_min) > 0.01:
+                trsf_align = gp_Trsf()
+                trsf_align.SetTranslation(gp_Vec(0, 0, -fz_min))
+                occ_face = BRepBuilderAPI_Transform(occ_face, trsf_align).Shape()
+        except Exception:
+            pass
+
+    # 4) 平移到 -extrude_half，使切割工具居中覆盖主体
+    vecs_neg = [
+        gp_Vec(-extrude_half, 0, 0),
+        gp_Vec(0, -extrude_half, 0),
+        gp_Vec(0, 0, -extrude_half),
+    ]
+    trsf_neg = gp_Trsf()
+    trsf_neg.SetTranslation(vecs_neg[extrude_axis])
+    occ_face = BRepBuilderAPI_Transform(occ_face, trsf_neg).Shape()
+
+    # 5) 正向拉伸 2×extrude_half → 穿透整个主体的棱柱
+    tool = _extrude_face_dual(occ_face, extrude_axis, extrude_half * 2)
+    return tool
+
+
 def _separate_views_2d(faces_info, total_bbox):
     """从 2D 图纸中分离视图（基于 Y 间隙 + X 间隙）。
 
@@ -1575,15 +1650,18 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
               f"棱柱轴={['X','Y','Z'][extrude_axis]}, "
               f"长={extrude_dist:.0f}mm")
 
-        # 提取内孔信息（本视图中除主体外的圆/弧面）
-        inner_holes = [f for f in v["faces"]
+        # 存储外轮廓引用，供后续内部特征处理使用
+        v["_outer_face"] = outer_face
+
+        # 提取该视图的所有内部面（除主体外的闭环，不限于圆/弧）
+        inner_faces = [f for f in v["faces"]
                        if f is not outer_face
-                       and f["face_type"] in ("single_arc", "concentric")
-                       and not f.get("is_spline_debris")]
-        if inner_holes:
+                       and not f.get("is_spline_debris")
+                       and _is_face_inside(f, outer_face)]
+        if inner_faces:
             hole_data.append({
                 "view_type": v["view_type"],
-                "holes": inner_holes,
+                "inner_faces": inner_faces,
             })
 
     if len(prisms) < 2:
@@ -1648,6 +1726,84 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0):
                 print(f"  [Fix] 修正后 Z={(nz2 - cz1):.0f}mm")
         except Exception as e:
             print(f"  [WARN] Z 深度修正失败: {e}")
+
+    # ---- P0: 内部特征布尔减运算 ----
+    # 对每个视图的内部闭环构建切割工具，从 CSG 主体中减去
+    inner_cut_count = 0
+    combined_before_cuts = combined  # 保存切割前的主体用于回退
+    if len(views) >= 2:
+        # 计算切割工具的拉伸半长（确保完全穿透主体）
+        try:
+            body_bbox = Bnd_Box()
+            brepbndlib.Add(combined, body_bbox)
+            bx1, by1, bz1, bx2, by2, bz2 = body_bbox.Get()
+            body_max_dim = max(bx2 - bx1, by2 - by1, bz2 - bz1)
+            half_extrude = body_max_dim * 1.5
+        except Exception:
+            half_extrude = 500.0  # 兜底值
+
+        for v in views:
+            outer_face = v.get("_outer_face")
+            if outer_face is None:
+                continue
+
+            # 查找该视图的内部面
+            inner_faces = []
+            for f in v["faces"]:
+                if f is outer_face:
+                    continue
+                if f.get("is_spline_debris"):
+                    continue
+                if f["area"] < 1.0:
+                    continue
+                if outer_face["area"] > 0 and f["area"] > outer_face["area"] * 0.25:
+                    continue
+                if not _is_face_inside(f, outer_face):
+                    continue
+                inner_faces.append(f)
+
+            if not inner_faces:
+                continue
+
+            vt = v["view_type"]
+            for fi in inner_faces:
+                tool = _build_inner_cut_tool(
+                    fi, vt, edges, edge_vertices, vertex_pos,
+                    scale_factor, half_extrude)
+                if tool is None:
+                    continue
+
+                try:
+                    cut_op = BRepAlgoAPI_Cut(combined, tool)
+                    if cut_op.IsDone():
+                        combined = cut_op.Shape()
+                        inner_cut_count += 1
+                except Exception:
+                    pass
+
+        # 验证切割后主体是否仍然有效
+        if inner_cut_count > 0:
+            try:
+                body_valid = Bnd_Box()
+                brepbndlib.Add(combined, body_valid)
+                _vx1, _vy1, _vz1, _vx2, _vy2, _vz2 = body_valid.Get()
+                body_vol = (_vx2 - _vx1) * (_vy2 - _vy1) * (_vz2 - _vz1)
+            except Exception:
+                body_vol = 0
+
+            if body_vol <= 0.01:
+                print(f"  [P0] 内部切割导致主体退化，跳过 {inner_cut_count} 个工具（回退）")
+                combined = combined_before_cuts
+                inner_cut_count = 0
+            else:
+                print(f"  [P0] 内部特征处理: {inner_cut_count} 个切割工具已应用")
+                try:
+                    fixer2 = ShapeFix_Shape()
+                    fixer2.Init(combined)
+                    fixer2.Perform()
+                    combined = fixer2.Shape()
+                except Exception:
+                    pass
 
     return combined, hole_data
 
@@ -1908,9 +2064,19 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
             sf = scale_factor
 
             # 从 CSG 主体计算合适的深度和中心位置
-            body_bbox = Bnd_Box()
-            brepbndlib.Add(body_solid, body_bbox)
-            bx1, by1, bz1, bx2, by2, bz2 = body_bbox.Get()
+            try:
+                body_bbox = Bnd_Box()
+                brepbndlib.Add(body_solid, body_bbox)
+                bx1, by1, bz1, bx2, by2, bz2 = body_bbox.Get()
+            except Exception:
+                # 内部切割后包围盒可能无效，用视图范围回退
+                print("  [WARN] CSG 主体包围盒计算失败，使用视图范围估算")
+                bx1 = min(v["bbox"][0] for v in views) * sf
+                by1 = min(v["bbox"][1] for v in views) * sf
+                bz1 = 0
+                bx2 = max(v["bbox"][2] for v in views) * sf
+                by2 = max(v["bbox"][3] for v in views) * sf
+                bz2 = (by2 - by1) * 0.5  # 用 Y 范围估算 Z
             body_z = bz2 - bz1
             body_cx = (bx1 + bx2) / 2
             body_cy = (by1 + by2) / 2

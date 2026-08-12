@@ -25,7 +25,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("机械三维二维图互转 v0.5.0")
+        self.setWindowTitle("机械三维二维图互转 v0.5.4")
         self.resize(1400, 900)
         self.setMinimumSize(1024, 600)
 
