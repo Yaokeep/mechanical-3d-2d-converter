@@ -34,6 +34,11 @@ python dxf_to_sldprt.py input.dxf output.sldprt
 # DXF/DWG 阶梯轴 → 3D STEP 模型（使用 PythonOCC）
 python convert_dwg_to_3d.py CAD/20160112-181116-09933.dxf output.step
 
+# 简单模型回归套件 — 6 个已验证用例（体积精确匹配 + 逐轴 bbox + 实体数）
+# 报告输出 CAD/temp_output/regression_report.txt；--sw 附加 SW 时间戳模型生成
+/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe run_simple_regression.py
+/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe run_simple_regression.py --sw
+
 # 命令行直接 COM 驱动 SW 创建阶梯轴（无需 GUI）
 python sw2025_create_shaft.py                    # 默认参数建模
 python sw2025_create_shaft.py --check            # 仅验证 SW COM 连接
@@ -139,9 +144,11 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 6. **MainWindow 信号连接模式**: 所有菜单/工具栏动作的信号槽连接集中在 `_connect_signals()` 方法中，槽函数命名遵循 `_on_<action>` 约定。
 
+7. **验证准则**: 转换/修复的验收以实际生成的模型为准——每次修改转换代码后运行完整 CLI（生成 STEP + SW 时间戳 .sldprt），不以代码或日志数值吻合作为成功标准。判断几何正确性可加载 STEP 用 `GProp_GProps` 体积 / `BRepAdaptor_Surface` 面类型做定量核对（体积与理论值精确吻合才是真通过）。
+
 ## 项目当前状态
 
-版本 v0.5.8（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串均滞后待同步：`app.py` = `"0.5.4"`、`main_window.py` 窗口标题 = `"v0.5.4"`、关于对话框 = `"v0.5.0"`：
+版本 v0.5.9（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串与 git 同步：`app.py` = `"0.5.9"`、`main_window.py` 窗口标题 = `"v0.5.9"`、关于对话框 = `"v0.5.9"`：
 
 ### ✅ 已完成实现
 
@@ -160,6 +167,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
   - v0.5.5 (P1): 投影验证回路 — CSG 主体尺寸与视图期望值自动对比，偏差 >30% 自动缩放修正
   - v0.5.7 (P2): 注解驱动分析 — 中心线对称检测 + HATCH 剖面材料验证（`extract_dxf_annotations()` + `csg_reconstruct()` 内 P2 区块）
   - v0.5.8: 三视图分离 X 间隙拆分保持（`_separate_views_2d()`）+ 第三视图 CSG 求交
+  - v0.5.9: CSG 视图映射修正为标准正交约定（`_get_view_transform()`：front→XZ/沿Y、top→XY/沿Z、side→YZ/沿X，用满秩 `gp_Trsf.SetValues` 矩阵）——修复系统性 Y/Z 轴向交换（法兰竖盘、块躺倒）；P1 期望尺寸/P2b HATCH 轴向同步更新
   - 单视图回退模式保留（轮廓拉伸+内孔减除）。命令行: --single-view / --multi-view；以上新功能全部自动执行、无新增 CLI 开关
   - 注：文件内版本字符串仍为 v2.1（docstring/横幅），git 提交口径曾用 v3.x，实际功能以 git log 为准
 - **阶梯轴建模对话框**：`sw_dialog.py`（509 行）— 后台线程建模、进度反馈、参数编辑
@@ -224,7 +232,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.5.8`、代码内为 `0.5.4`/`0.5.0`——提交新版本时务必同步更新这些位置。
+- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.5.9`（代码内 `0.5.9`）——提交新版本时务必同步更新这些位置。
 - **README.md 路线图已过时**: README 中的开发路线图停留在项目早期规划阶段（v0.3.0~v1.0.0 均标为未完成），实际进度以本文件和 git log 为准。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.step`, `*.stp`, `*.igs`, `*.iges`）和 CAD 软件锁文件。不要将这些文件加入版本控制。
 

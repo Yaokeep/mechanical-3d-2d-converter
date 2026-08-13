@@ -1345,24 +1345,44 @@ def get_shape_bbox(shape) -> tuple:
 # 8a. CSG 体积求交法 — 真正的 3D 空间思维
 # ============================================================
 
-# 多视图 → 3D 坐标映射
-#   前视图 (Front, XY):  DXF_X→X, DXF_Y→Y, 拉伸方向 Z
-#   俯视图 (Top, XZ):    DXF_X→X, DXF_Y→Z, 拉伸方向 Y
-#   侧视图 (Side, YZ):   DXF_X→Z, DXF_Y→Y, 拉伸方向 X
+# 多视图 → 3D 坐标映射（标准正交投影约定，Z 轴向上）
+#   前视图 (Front): DXF_X→X, DXF_Y→Z（高度）, 面在 XZ 平面, 拉伸方向 Y（深度）
+#   俯视图 (Top):   DXF_X→X, DXF_Y→Y（深度）, 面在 XY 平面, 拉伸方向 Z（高度）
+#   侧视图 (Side):  DXF_X→Y（深度）, DXF_Y→Z（高度）, 面在 YZ 平面, 拉伸方向 X
 
 def _get_view_transform(view_type):
-    """返回 (rotation_axis, rotation_angle_rad, extrude_axis) 用于视图面变换。
+    """返回 (matrix_values, extrude_axis) 用于视图面变换。
 
-    rotation_axis: 将 DXF XY 面旋转到目标平面的轴
+    matrix_values: gp_Trsf.SetValues 的 12 个系数（将 DXF XY 面变换到目标
+                   平面），None 表示恒等变换（面保持 XY 平面）
     extrude_axis: 拉伸方向 (0=X, 1=Y, 2=Z)
     """
     if view_type == "front":
-        return None, 0, 2       # 无需旋转，沿 Z 拉伸
+        # 绕 X 轴 +90°：z=0 平面上 (x,y,0)→(x,0,y)（DXF_X→X, DXF_Y→Z），
+        # 面在 XZ 平面，沿 Y 拉伸。gp_Trsf 要求满秩（旋转阵 det=1）。
+        # 注意 SetValues 约定: x' = a11·x + a12·y + a13·z + a14（平移在每行第4位）
+        return (1, 0, 0, 0, 0, 0, -1, 0, 0, 1, 0, 0), 1
     elif view_type == "top":
-        return (1, 0, 0), -math.pi / 2, 1  # 绕 X 轴 -90° → XZ 面，沿 Y 拉伸
+        # 恒等：面保持 XY 平面，沿 Z 拉伸
+        return None, 2
     elif view_type == "side":
-        return (0, 1, 0), -math.pi / 2, 0  # 绕 Y 轴 -90° → ZY 面，沿 X 拉伸
-    return None, 0, 2
+        # 循环置换 (X→Z→Y→X)：z=0 平面上 (x,y,0)→(0,x,y)
+        # （DXF_X→Y, DXF_Y→Z），面在 YZ 平面，沿 X 拉伸
+        return (0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0), 0
+    return None, 2
+
+
+def _apply_view_transform(occ_face, view_type):
+    """对视图面应用 _get_view_transform 的平面变换（不含拉伸）。
+
+    返回变换后的面。
+    """
+    matrix, _ = _get_view_transform(view_type)
+    if matrix is not None:
+        trsf = gp_Trsf()
+        trsf.SetValues(*matrix)
+        occ_face = BRepBuilderAPI_Transform(occ_face, trsf).Shape()
+    return occ_face
 
 
 def _extrude_face_dual(occ_face, direction_axis, distance):
@@ -1438,12 +1458,9 @@ def _build_inner_cut_tool(face_info, view_type, edges, edge_vertices,
     if occ_face is None:
         return None
 
-    # 2) 视图旋转变换（与外轮廓相同）
-    rot_axis, rot_angle, extrude_axis = _get_view_transform(view_type)
-    if rot_axis is not None:
-        trsf = gp_Trsf()
-        trsf.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(*rot_axis)), rot_angle)
-        occ_face = BRepBuilderAPI_Transform(occ_face, trsf).Shape()
+    # 2) 视图平面变换（与外轮廓相同）
+    _, extrude_axis = _get_view_transform(view_type)
+    occ_face = _apply_view_transform(occ_face, view_type)
 
     # 3) Z 对齐：使用外轮廓的统一偏移量（不同半径的面必须用同一偏移）
     if view_type != "front" and z_align_offset is not None:
@@ -1672,8 +1689,8 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
 
     原理:
       3D实体 = 前视图棱柱 ∩ 俯视图棱柱 ∩ 侧视图棱柱
-      前视图棱柱 = 前视图外轮廓 沿 Z 拉伸
-      俯视图棱柱 = 俯视图外轮廓 沿 Y 拉伸（面在 XZ 平面）
+      前视图棱柱 = 前视图外轮廓 沿 Y 拉伸（面在 XZ 平面，竖轴=Z 高度）
+      俯视图棱柱 = 俯视图外轮廓 沿 Z 拉伸（面在 XY 平面）
       侧视图棱柱 = 侧视图外轮廓 沿 X 拉伸（面在 YZ 平面）
 
     scale_factor: DXF 坐标 → 实物尺寸的缩放因子
@@ -1825,16 +1842,12 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             print(f"  [WARN] 视图 '{v['name']}' Face 构建失败")
             continue
 
-        # 视图 → 3D 坐标变换
-        rot_axis, rot_angle, extrude_axis = _get_view_transform(v["view_type"])
+        # 视图 → 3D 坐标变换（标准正交投影：前视图竖轴 = 3D Z 高度）
+        _, extrude_axis = _get_view_transform(v["view_type"])
+        occ_face = _apply_view_transform(occ_face, v["view_type"])
 
-        if rot_axis is not None:
-            trsf = gp_Trsf()
-            trsf.SetRotation(
-                gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(*rot_axis)), rot_angle)
-            occ_face = BRepBuilderAPI_Transform(occ_face, trsf).Shape()
-
-        # 对齐：非前视图需将 Z_min 平移到 0（与正视图 Z=0 对齐）
+        # 对齐：非前视图面平移使 Z_min=0（统一内部特征偏移基准；
+        # 前视图面位于 XZ 平面，Z 范围由 DXF_Y 决定，不做此平移）
         if v["view_type"] != "front":
                 fb = Bnd_Box()
                 brepbndlib.Add(occ_face, fb)
@@ -1931,28 +1944,37 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         csg_x = csg_y = csg_z = 0
 
     # 从各视图收集期望尺寸（3D 空间中的映射）
+    # 用各视图外轮廓自身的 DXF 范围，而非视图区域包围盒——
+    # 视图分离不完整时区域包围盒会混入相邻视图（如 side 并入 front 区域），
+    # 导致期望值虚高误报（block_3view: 期望 X=145 vs 实际 100）
     expected = {"X": None, "Y": None, "Z": None}
     for v in views:
         vt = v["view_type"]
-        ofc = v.get("_outer_face", {})
-        bw = (v["bbox"][2] - v["bbox"][0]) * scale_factor
-        bh = (v["bbox"][3] - v["bbox"][1]) * scale_factor
+        ofc = v.get("_outer_face") or {}
+        if ofc.get("x_min") is not None:
+            bw = (ofc["x_max"] - ofc["x_min"]) * scale_factor
+            bh = (ofc["y_max"] - ofc["y_min"]) * scale_factor
+        else:
+            bw = (v["bbox"][2] - v["bbox"][0]) * scale_factor
+            bh = (v["bbox"][3] - v["bbox"][1]) * scale_factor
         if vt == "front":
-            # 前视图 DXF_X→3D_X, DXF_Y→3D_Y, 面沿 Z 拉伸→Z 深度来自其他视图
+            # 前视图 DXF_X→3D_X, DXF_Y→3D_Z（高度），面沿 Y 拉伸→Y 深度来自其他视图
             if expected["X"] is None or bw > expected["X"]:
                 expected["X"] = bw
-            if expected["Y"] is None or bh > expected["Y"]:
-                expected["Y"] = bh
+            if expected["Z"] is None or bh > expected["Z"]:
+                expected["Z"] = bh
         elif vt == "top":
-            # 俯视图 DXF_X→3D_X, DXF_Y→3D_Z（旋转后）
+            # 俯视图 DXF_X→3D_X, DXF_Y→3D_Y（深度）
             if expected["X"] is None or bw > expected["X"]:
                 expected["X"] = bw
-            expected["Z"] = bh  # 俯视图高度 → 3D Z 深度
-        elif vt == "side":
-            # 侧视图 DXF_Y→3D_Y, DXF_X→3D_Z（旋转后）
             if expected["Y"] is None or bh > expected["Y"]:
                 expected["Y"] = bh
-            expected["Z"] = bw  # 侧视图宽度 → 3D Z 深度
+        elif vt == "side":
+            # 侧视图 DXF_X→3D_Y（深度）, DXF_Y→3D_Z（高度）
+            if expected["Y"] is None or bw > expected["Y"]:
+                expected["Y"] = bw
+            if expected["Z"] is None or bh > expected["Z"]:
+                expected["Z"] = bh
 
     # 报告尺寸对比
     if csg_x > 0 and csg_y > 0 and csg_z > 0:
@@ -2005,11 +2027,18 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                     if v["view_type"] != "front":
                         continue
                     v_bbox = v["bbox"]
-                    if v_bbox[0] <= dxf_cx <= v_bbox[2]:
+                    # 中心线归属判定 + 视图中心均用外轮廓自身范围
+                    # （区域包围盒混入邻视图时会把邻视图中心线误判为本视图）
+                    ofc = v.get("_outer_face") or {}
+                    if ofc.get("x_min") is not None:
+                        vc_x_min, vc_x_max = ofc["x_min"], ofc["x_max"]
+                    else:
+                        vc_x_min, vc_x_max = v_bbox[0], v_bbox[2]
+                    if vc_x_min <= dxf_cx <= vc_x_max:
                         # 此中心线在前视图中
                         # 3D 空间中的等效 X（需要映射回 CSG body 的坐标系）
                         # DXF 坐标 → 3D 坐标: 先缩放，再减中心偏移
-                        dxf_view_cx = (v_bbox[0] + v_bbox[2]) / 2
+                        dxf_view_cx = (vc_x_min + vc_x_max) / 2
                         sf = scale_factor
                         # 中心线在 3D 中的 X 偏移（相对于视图中心）
                         cl_offset_3d = (dxf_cx - dxf_view_cx) * sf
@@ -2043,9 +2072,9 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
 
         # P2b: HATCH 剖面区域 → 材料验证
         hatch_regions = annotations.get("hatch_regions", [])
-        if hatch_regions and csg_x > 0 and csg_y > 0:
+        if hatch_regions and csg_x > 0 and csg_z > 0:
             # 将 hatch 区域映射到 3D 空间进行验证
-            # HATCH 在 DXF 的 front 视图中，DXF_XY → 3D_XY
+            # HATCH 在 DXF 的 front 视图中，DXF_XY → 3D_XZ（竖轴=高度）
             hatch_3d_matches = 0
             hatch_3d_total = 0
             for hr in hatch_regions:
@@ -2061,21 +2090,28 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                     if (hb[0] >= v_bbox[0] - 5 and hb[2] <= v_bbox[2] + 5
                             and hb[1] >= v_bbox[1] - 5 and hb[3] <= v_bbox[3] + 5):
                         # 映射 hatch bbox 到 3D body 坐标系
-                        v_center_x = (v_bbox[0] + v_bbox[2]) / 2
-                        v_center_y = (v_bbox[1] + v_bbox[3]) / 2
+                        # 视图中心用外轮廓自身中心（区域包围盒可能混入邻视图）
+                        ofc = v.get("_outer_face") or {}
+                        if ofc.get("x_min") is not None:
+                            v_center_x = (ofc["x_min"] + ofc["x_max"]) / 2
+                            v_center_y = (ofc["y_min"] + ofc["y_max"]) / 2
+                        else:
+                            v_center_x = (v_bbox[0] + v_bbox[2]) / 2
+                            v_center_y = (v_bbox[1] + v_bbox[3]) / 2
                         h3d_x1 = (hb[0] - v_center_x) * sf + (cbx1 + cbx2) / 2
                         h3d_x2 = (hb[2] - v_center_x) * sf + (cbx1 + cbx2) / 2
-                        h3d_y1 = (hb[1] - v_center_y) * sf + (cby1 + cby2) / 2
-                        h3d_y2 = (hb[3] - v_center_y) * sf + (cby1 + cby2) / 2
+                        # 前视图 DXF_Y → 3D Z（高度），与 CSG 映射约定一致
+                        h3d_z1 = (hb[1] - v_center_y) * sf + (cbz1 + cbz2) / 2
+                        h3d_z2 = (hb[3] - v_center_y) * sf + (cbz1 + cbz2) / 2
 
                         # 计算 hatch 3D 面积与 CSG body 截面面积的交集比例
                         h3d_w = h3d_x2 - h3d_x1
-                        h3d_h = h3d_y2 - h3d_y1
+                        h3d_h = h3d_z2 - h3d_z1
 
                         # 检查 hatch 区域是否至少部分在 body 内
                         overlap_x = max(0, min(h3d_x2, cbx2) - max(h3d_x1, cbx1))
-                        overlap_y = max(0, min(h3d_y2, cby2) - max(h3d_y1, cby1))
-                        overlap_area = overlap_x * overlap_y
+                        overlap_z = max(0, min(h3d_z2, cbz2) - max(h3d_z1, cbz1))
+                        overlap_area = overlap_x * overlap_z
                         hatch_area = h3d_w * h3d_h
 
                         if hatch_area > 0:
@@ -2087,7 +2123,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                 print(f"  [P2] [WARN] 剖面区域({hr['pattern']}) "
                                       f"仅 {coverage*100:.0f}% 在 CSG 主体内 "
                                       f"(HATCH 3D: [{h3d_x1:.0f}~{h3d_x2:.0f}, "
-                                      f"{h3d_y1:.0f}~{h3d_y2:.0f}])")
+                                      f"{h3d_z1:.0f}~{h3d_z2:.0f}])")
                             else:
                                 print(f"  [P2] [FAIL] 剖面区域({hr['pattern']}) "
                                       f"完全在 CSG 主体外！主体可能缺失此区域")
