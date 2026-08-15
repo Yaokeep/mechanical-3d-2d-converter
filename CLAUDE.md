@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 常用命令
 
 ```bash
-# 启动 GUI 应用
+# 启动 GUI 应用（完整 3D 功能需在 cad-occt 环境；无 OCC 时优雅降级为占位视图）
 python main.py
 
 # 代码质量
@@ -32,7 +32,8 @@ python dxf_to_sldprt.py input.dxf output.sldprt
 /c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe dxf_to_3d_general.py input.dxf output.sldprt
 
 # DXF/DWG 阶梯轴 → 3D STEP 模型（使用 PythonOCC）
-python convert_dwg_to_3d.py CAD/20160112-181116-09933.dxf output.step
+# 需在 cad-occt 环境运行：DXF 解析可脱离 OCC（懒加载），但 STEP 导出必须 OCC
+/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe convert_dwg_to_3d.py CAD/20160112-181116-09933.dxf output.step
 
 # 简单模型回归套件 — 6 个已验证用例（体积精确匹配 + 逐轴 bbox + 实体数）
 # 报告输出 CAD/temp_output/regression_report.txt；--sw 附加 SW 时间戳模型生成
@@ -106,7 +107,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 根目录独立脚本（不通过 main.py 调用，直接命令行运行）:
   dxf_to_sldprt.py       — DXF 阶梯轴 → SW .sldprt 原生文件（DXF 解析 + SW COM）
-  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，2992 行）
+  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，3099 行）
                            核心链: 边图构建→封闭环检测→视图分离(Y+X 间隙)→CSG 体积求交 / 单视图轮廓拉伸
                            CSG: 各视图外轮廓拉伸为棱柱→布尔交集→内部特征布尔减(P0)→投影验证(P1)
                            →注解驱动分析(P2，中心线对称 + HATCH 剖面验证)，全部自动执行
@@ -124,7 +125,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 |------|------|
 | `.claude/` | `settings.local.json` — 预授权的 Bash 权限列表；`skills/` — 项目级启用的技能符号链接 |
 | `.agents/skills/` | 4 个技能：`mechanical-engineer`、`solidworks-cad`（泵叶轮参数化）、`python-code-review`（含 5 个参考文件）、`python-packaging`；仅前两个经符号链接在项目级启用。根目录 `skills-lock.json` 锁定 `mechanical-engineer` 来源 |
-| `CAD/` | 51 个 VBA 宏（含 VerifySW2025_v33~v45 验证系列）、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`）、`temp_output/` 电机测试、`test_simple/` 简单用例、`verify_log/` 宏迭代历史 |
+| `CAD/` | 52 个 VBA 宏（含 VerifySW2025_v33~v45 验证系列）、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`）、`temp_output/` 电机测试、`test_simple/` 简单用例、`verify_log/` 宏迭代历史 |
 | `PDF/` | 空目录（预留放参考 PDF 文档） |
 | `三维/` | 参考 SLDPRT 模型（`麒浚传动_PF60K-14-50-70-M4-L2-12.SLDPRT`，gitignored） |
 | `soldwork/` | SW VBA 宏工作区（`.swp` 工程文件 + `.bas` 测试宏） |
@@ -148,7 +149,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.5.9（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串与 git 同步：`app.py` = `"0.5.9"`、`main_window.py` 窗口标题 = `"v0.5.9"`、关于对话框 = `"v0.5.9"`：
+版本 v0.6.0（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串与 git 同步：`app.py` = `"0.6.0"`、`main_window.py` 窗口标题 = `"v0.6.0"`、关于对话框 = `"v0.6.0"`：
 
 ### ✅ 已完成实现
 
@@ -161,13 +162,19 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
   - 键槽切除 (Keyway-N) — Python COM FeatureCut3(26参数)
 - **`dxf_to_sldprt.py`**：完整 — 命令行参数支持、DXF 几何参数自动检测、时间戳输出文件（防 SW 占用）
 - **`convert_dwg_to_3d.py`**：完整 — 使用 PythonOCC 进行 DXF→STEP 3D 实体建模（旋转体 + 键槽布尔减运算），OCC 懒加载设计使 DXF 解析可独立使用
-- **`dxf_to_3d_general.py`**（2992 行）：通用 DXF 工程图 → 3D STEP + SW .sldprt。核心算法链：边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 / 单视图轮廓拉伸。
+- **`dxf_to_3d_general.py`**（3099 行）：通用 DXF 工程图 → 3D STEP + SW .sldprt。核心算法链：边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 / 单视图轮廓拉伸。
   - v0.5.4: CSG 体积求交法 — 多视图外轮廓各自拉伸为棱柱 → 布尔交集 → 3D 实体
   - v0.5.5 (P0): 内部特征关联 — 各视图内部闭环（孔/槽）→ 3D 切割工具 → 布尔减运算
   - v0.5.5 (P1): 投影验证回路 — CSG 主体尺寸与视图期望值自动对比，偏差 >30% 自动缩放修正
   - v0.5.7 (P2): 注解驱动分析 — 中心线对称检测 + HATCH 剖面材料验证（`extract_dxf_annotations()` + `csg_reconstruct()` 内 P2 区块）
   - v0.5.8: 三视图分离 X 间隙拆分保持（`_separate_views_2d()`）+ 第三视图 CSG 求交
   - v0.5.9: CSG 视图映射修正为标准正交约定（`_get_view_transform()`：front→XZ/沿Y、top→XY/沿Z、side→YZ/沿X，用满秩 `gp_Trsf.SetValues` 矩阵）——修复系统性 Y/Z 轴向交换（法兰竖盘、块躺倒）；P1 期望尺寸/P2b HATCH 轴向同步更新
+  - v0.6.0 (P3): 复杂图纸健壮性 — 以 reducer（263 边真实图纸）为靶子，修复 5 处：
+    - 特征坐标映射：CSG 分支凸台/孔从 DXF 绝对坐标改为减去所属视图 DXF 中心（`_dxf_center_x/_y`），修复远离视图中心的凸台落到主体外形成分离实体（reducer 2 实体 → 1 实体）
+    - bbox 回退矩形 X 范围与共享轴视图对齐（front/top 互相补齐外轮廓缺失，reducer X=74→95 与期望精确吻合）
+    - top 视图特征 Y 映射保留 DXF Y 差异（上下孔不能压到 body_cy，法兰角孔位置）
+    - 孤立大圆（半径≥主体最小边 40%）识别为主体外轮廓跳过切除——修复法兰外径被误当孔切穿主体（此前坐标错位掩盖了该误分类）
+    - P2a 中心线归属增加 Y 范围检查（top 视图凸台轴心线不再误报为 front 中心线偏移）
   - 单视图回退模式保留（轮廓拉伸+内孔减除）。命令行: --single-view / --multi-view；以上新功能全部自动执行、无新增 CLI 开关
   - 注：文件内版本字符串仍为 v2.1（docstring/横幅），git 提交口径曾用 v3.x，实际功能以 git log 为准
 - **阶梯轴建模对话框**：`sw_dialog.py`（509 行）— 后台线程建模、进度反馈、参数编辑
@@ -232,7 +239,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.5.9`（代码内 `0.5.9`）——提交新版本时务必同步更新这些位置。
+- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.0`（代码内 `0.6.0`）——提交新版本时务必同步更新这些位置。
 - **README.md 路线图已过时**: README 中的开发路线图停留在项目早期规划阶段（v0.3.0~v1.0.0 均标为未完成），实际进度以本文件和 git log 为准。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.step`, `*.stp`, `*.igs`, `*.iges`）和 CAD 软件锁文件。不要将这些文件加入版本控制。
 

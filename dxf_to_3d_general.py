@@ -1750,6 +1750,28 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         if outer_face is None and len(v["faces"]) >= 1:
             # 用视图包围盒构建矩形外轮廓
             x_min, y_min, x_max, y_max = v["bbox"]
+            # ---- P3: X 范围与共享轴视图对齐 ----
+            # front/top 共享 DXF X 轴（正交投影约定），两者 X 范围应一致。
+            # 若本视图外轮廓缺失导致 bbox 回退矩形明显窄于另一视图，
+            # 用更宽视图的范围替代（Y 范围保持本视图，深度不受影响）。
+            if v["view_type"] in ("front", "top"):
+                peer_xs = []
+                for pv in views:
+                    if pv is v or pv["view_type"] not in ("front", "top"):
+                        continue
+                    pof = pv.get("_outer_face")
+                    if pof is not None and pof.get("x_min") is not None:
+                        peer_xs.append((pof["x_min"], pof["x_max"]))
+                    else:
+                        peer_xs.append((pv["bbox"][0], pv["bbox"][2]))
+                if peer_xs:
+                    peer_w = max(px[1] for px in peer_xs) - min(px[0] for px in peer_xs)
+                    if peer_w > (x_max - x_min) * 1.10:
+                        x_min = min(min(px[0] for px in peer_xs), x_min)
+                        x_max = max(max(px[1] for px in peer_xs), x_max)
+                        print(f"  [P3] 视图 '{v['name']}' 外轮廓 X 范围对齐: "
+                              f"[{v['bbox'][0]:.0f}~{v['bbox'][2]:.0f}] → "
+                              f"[{x_min:.0f}~{x_max:.0f}]")
             # 创建 4 边矩形替代面（边 ID 无效但会构建新 Wire）
             outer_face = {
                 "edges": None,  # 标记为包围盒回退
@@ -1817,6 +1839,13 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         if outer_face is None:
             print(f"  [WARN] 视图 '{v['name']}' 无有效外轮廓，跳过")
             continue
+
+        # ---- P3: 视图 DXF 中心（供 CSG 特征坐标映射） ----
+        # 用视图分离区域 bbox 的中心（而非外轮廓中心）作为映射基准：
+        # 特征坐标相对视图区域的偏移在 bbox 回退扩展前后保持一致，
+        # 且 CSG 棱柱居中平移后主体中心在原点附近，特征需减去此基准。
+        v["_dxf_center_x"] = (v["bbox"][0] + v["bbox"][2]) / 2 * scale_factor
+        v["_dxf_center_y"] = (v["bbox"][1] + v["bbox"][3]) / 2 * scale_factor
 
         # 构建 Wire → Face
         if use_bbox_fallback:
@@ -2035,6 +2064,18 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                     else:
                         vc_x_min, vc_x_max = v_bbox[0], v_bbox[2]
                     if vc_x_min <= dxf_cx <= vc_x_max:
+                        # P3: 中心线端点还须落在视图 Y 范围内——
+                        # top 视图的凸台轴心线（PHANTOM）X 落在 front
+                        # 范围内但 Y 在 top 区域，不能当作 front 中心线
+                        # 做对称性判定（会误报"不在主体中心"）。
+                        if ofc.get("y_min") is not None:
+                            vc_y_min, vc_y_max = ofc["y_min"], ofc["y_max"]
+                        else:
+                            vc_y_min, vc_y_max = v_bbox[1], v_bbox[3]
+                        cl_y1, cl_y2 = cl["start"][1], cl["end"][1]
+                        if not (vc_y_min - 1 <= min(cl_y1, cl_y2)
+                                and max(cl_y1, cl_y2) <= vc_y_max + 1):
+                            continue
                         # 此中心线在前视图中
                         # 3D 空间中的等效 X（需要映射回 CSG body 的坐标系）
                         # DXF 坐标 → 3D 坐标: 先缩放，再减中心偏移
@@ -2510,6 +2551,24 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
 
             # 判断同心圆组属于哪个视图（前视图 vs 俯视图）
             # 俯视图的同心圆 Y 坐标 > 200 → 其 DXF Y 映射到 3D Z
+            # ---- P3: 视图 DXF X 中心映射基准 ----
+            # CSG 主体已居中到原点附近，特征坐标必须减去所属视图的
+            # DXF X 中心（csg_reconstruct 保存的 _dxf_center_x），
+            # 否则远离视图中心的特征（如 reducer 右侧凸台）会落在主体外，
+            # 布尔加后成为分离实体。
+            top_center_x = None
+            top_center_y = None
+            front_center_x = None
+            for v in views:
+                vcx = v.get("_dxf_center_x")
+                if vcx is None:
+                    continue
+                if v["view_type"] == "top" and top_center_x is None:
+                    top_center_x = vcx
+                    top_center_y = v.get("_dxf_center_y")
+                elif v["view_type"] == "front" and front_center_x is None:
+                    front_center_x = vcx
+
             boss_count = 0
             hole_count = 0
             for ckey, group in concentric_groups.items():
@@ -2523,13 +2582,15 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                 is_top_view_feature = (cy > 200)
 
                 if is_top_view_feature:
-                    # 俯视图特征：DXF Y → 3D Z，放在主体顶面
-                    feat_3d_x = cx * sf
-                    feat_3d_y = body_cy  # Y 居中于主体
+                    # 俯视图特征：DXF Y → 3D Y（减去视图中心基准），放在主体顶面
+                    feat_3d_x = cx * sf - (top_center_x if top_center_x is not None else 0)
+                    # P3: 上下分布的孔（如法兰上下角孔）DXF Y 差异必须保留，
+                    # 不能统一压到 body_cy（凸台场景 cy≈视图中心，两者等价）
+                    feat_3d_y = cy * sf - (top_center_y if top_center_y is not None else body_cy)
                     feat_z_base = bz2    # 从主体顶面开始
                 else:
-                    # 前视图特征：DXF 坐标直接映射到 3D XY
-                    feat_3d_x = cx * sf
+                    # 前视图特征：DXF 坐标映射到 3D XY（减去视图中心基准）
+                    feat_3d_x = cx * sf - (front_center_x if front_center_x is not None else 0)
                     feat_3d_y = cy * sf
                     feat_z_base = bz2
 
@@ -2558,6 +2619,12 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                 elif gtype == "isolated":
                     # 独立圆：仅孔（安装孔等贯穿孔）
                     hole_r = radii[0] * sf
+                    # P3: 半径接近主体外轮廓（≥主体最小边 40%）时跳过——
+                    # 该圆是主体轮廓（如法兰盘外径被误分类为孤立圆），
+                    # 切除会毁掉主体（此前坐标错位掩盖了该误分类）
+                    body_w = bx2 - bx1
+                    if body_w > 0 and hole_r > body_w * 0.4:
+                        continue
                     hole = create_cylinder_solid((feat_3d_x, feat_3d_y), hole_r,
                                                  body_z + 20, bz1 - 5)
                     if hole is not None:
@@ -2774,6 +2841,10 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
             if gtype == "isolated":
                 # 独立圆 → 仅孔
                 if sorted_r[0] > 0.3:
+                    # P3: 半径接近主体外轮廓的大圆是主体轮廓（如法兰外径），
+                    # 跳过——切除会毁掉主体
+                    if body_w > 0 and sorted_r[0] > body_w * 0.4:
+                        continue
                     hole = create_cylinder_solid((cx, cy), sorted_r[0],
                                                  cyl_h + 10, -5)
                     if hole is not None:
