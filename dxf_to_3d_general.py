@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.5
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.9
 
 核心算法链（详见 CLAUDE.md「dxf_to_3d_general.py」条目）:
   边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 /
@@ -4285,13 +4285,19 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                             break
                                         if _ring_c is None:
                                             continue
+                                        # v0.6.9: 环刀底余量 1.0 → 0.1——
+                                        # 台阶环刀段底即台阶腔底，段底下方
+                                        # 是台阶盘材料（r40 盘 r[25,40] 环带），
+                                        # 1mm 越界余量把腔底下方盘环带
+                                        # 误切 0.5mm 高（PF60K 顶段缺 1,518，
+                                        # 基准一侧环形台阶被削掉）
                                         _ring_h = _zmax - z_bot + 2.0
                                         _ring_outer = create_cylinder_solid(
                                             _ring_c, _zhalf,
-                                            _ring_h, z_bot - 1.0)
+                                            _ring_h, z_bot - 0.1)
                                         _ring_inner = create_cylinder_solid(
                                             _ring_c, fi_w / 2,
-                                            _ring_h, z_bot - 1.0)
+                                            _ring_h, z_bot - 0.1)
                                         if (_ring_outer is not None
                                                 and _ring_inner is not None):
                                             _ring_cut = BRepAlgoAPI_Cut(
@@ -4522,15 +4528,28 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                         # 如 φ14 台阶顶 -22 > φ42 刀顶 -25）；
                                         # 与刀段共顶的更小圆段是嵌套孔
                                         # （如 φ32 孔段顶=φ42 刀顶），不填芯
+                                        # v0.6.9: 芯段底还须与刀段底相接
+                                        # （±0.5，台阶柱从孔底升起）。芯段底
+                                        # 明显高于刀段底的是刀内嵌套孔
+                                        # （PF60K φ14 孔底 -42.5 比 φ42 刀
+                                        # 底 -43.5 高 1.0）——融合实心芯柱会
+                                        # 把孔刀已切的孔填实（假材料）
                                         if (min(_s_top, _tz2) - max(_s_bot, _tz1) >= 0.5
-                                                and _s_top > _tz2 + 0.5):
+                                                and _s_top > _tz2 + 0.5
+                                                and _s_bot <= _tz1 + 0.5):
                                             # v0.6.3: 芯底不加余量——芯底
                                             # 低于主体底会把主体 bbox 拉低
                                             # （恶性循环：推导段底随主体底
                                             # 下移，芯再下移）；顶余量 +0.5
                                             # 伸入上层材料无害（Fuse 重叠融合）
+                                            # v0.6.9: 芯柱位置用匹配圆真实
+                                            # 圆心 (_tx,_ty)——半圆刀 bbox
+                                            # 中心相对圆心偏移 r/2（φ42 半圆
+                                            # 刀偏移 10.5），旧代码在 bbox
+                                            # 中心融合芯柱会把 φ14 台阶柱
+                                            # 挤进孔内壁堵孔（假 r7 材料柱）
                                             _core = create_cylinder_solid(
-                                                (_t_cx, _t_cy), _tr,
+                                                (_tx, _ty), _tr,
                                                 _s_top - _s_bot + 0.5,
                                                 _s_bot)
                                             _fo3 = BRepAlgoAPI_Fuse(combined, _core)
@@ -4879,13 +4898,14 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 # 角块 = 盒内圆柱外材料）。角块盒取内切方盒
                 # (bx±br, by±br) 时盘材料全在圆柱内不受损；刀底
                 # 平贴盘面（_bz 不嵌入）——嵌入会堵 φ14 孔口并留
-                # 孔口月牙碎片（实测 +66 体积）；刀顶 +0.75 略高
-                # 过段顶消除 0.1mm 皮
+                # 孔口月牙碎片（实测 +66 体积）；刀顶 +0.1 略高
+                # 过段顶消除浮点皮（v0.6.9: 旧 +0.75 越界把凸台
+                # 顶上方主体 r7 材料误切 0.65mm，-16.45 层缺失）
                 _bot_boss_cands.sort(key=lambda _c: -_c[1])
                 _br, _bz, _bt, _bx, _by = _bot_boss_cands[0]
                 _boss = create_cylinder_solid(
                     (_bx, _by), _br,
-                    _bt - _bz + 0.75, _bz)
+                    _bt - _bz + 0.1, _bz)
                 if _boss is not None:
                     _fo = BRepAlgoAPI_Fuse(combined, _boss)
                     if _fo.IsDone():
@@ -4893,7 +4913,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                         _sq_box = BRepPrimAPI_MakeBox(
                             gp_Pnt(_bx - _br, _by - _br, _bz),
                             gp_Pnt(_bx + _br, _by + _br,
-                                   _bt + 0.75)).Shape()
+                                   _bt + 0.1)).Shape()
                         _seg_op = BRepAlgoAPI_Common(
                             combined, _sq_box)
                         if _seg_op.IsDone():
@@ -4907,6 +4927,34 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                     print(f"  [P3.5] 底面凸台圆柱截形 "
                                           f"r={_br / scale_factor:.1f} "
                                           f"Z[{_bz:.1f}~{_bt:.1f}]")
+                # v0.6.9: 凸台延续下方同轴孔——贯穿凸台的孔
+                # （φ14 芯孔 r7 段顶 -21.95 与凸台段底 -21.92
+                # 相接）被 P0 帽判据跳过切割，凸台 Fuse 成实心
+                # 圆柱堵死孔口（基准凸台是 r[7,8] 环形柱）。
+                # 通用规则：同轴孔段顶与凸台段底相接（±1.5）
+                # → 孔延续切穿凸台段。
+                for _hx, _hy, _hr, _hdx, _hdy in top_hole_circles:
+                    if _hr >= _br - 0.5:
+                        continue
+                    if (abs(_hx - _bx) > 1.0
+                            or abs(_hy - _by) > 1.0):
+                        continue
+                    _hsegs = _profile_depths(_hdx, _hr / scale_factor)
+                    if not _hsegs:
+                        continue
+                    if not any(abs(s[0] - _bz) <= 1.5
+                               for s in _hsegs):
+                        continue
+                    _htool = create_cylinder_solid(
+                        (_bx, _by), _hr,
+                        _bt - _bz + 0.1, _bz)
+                    _ho = BRepAlgoAPI_Cut(combined, _htool)
+                    if _ho.IsDone():
+                        combined = _ho.Shape()
+                        inner_cut_count += 1
+                        print(f"  [P3.5] 凸台同轴孔延续 "
+                              f"r={_hr / scale_factor:.1f} "
+                              f"Z[{_bz:.1f}~{_bt:.1f}]")
         except Exception as _e:
             print(f"  [WARN] 凸台圆柱截形异常: {_e}")
 
