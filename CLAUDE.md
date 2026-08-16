@@ -134,7 +134,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
                            （const/cone/vary）→ SW COM 特征建模（凸台序列自底向上+孔切除+材料岛）。
                            关键修复: 方∩圆法兰轮廓（_normalize_loops 弧端点重合判据，防整圆误合成）、
                            φ12 孔与键槽混合环签名断段、凹口段整圆简化+键槽切穿补切。
-                           验收: PF60K 特征模型体积 259,484 vs CSG 259,123（+0.14%）/ 基准 261,935（-0.94%）
+                           验收: PF60K 特征模型体积 259,284 vs CSG 259,123（+0.06%）/ 基准 261,935（-1.01%）
   sw2025_create_shaft.py — 命令行：直接 COM 驱动 SW 创建阶梯轴（无需 GUI）
   generate_sw_macro.py   — 从 JSON 参数生成 SW VBA 宏 .bas 文件
   gen_vba_test.py        — 生成 VBA FeatureCut3 测试宏 → CAD/SimpleTest.bas
@@ -171,7 +171,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.6（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串与 git 同步：`app.py` = `"0.6.6"`、`main_window.py` 窗口标题 = `"v0.6.6"`、关于对话框 = `"v0.6.6"`：
+版本 v0.6.7（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串与 git 同步：`app.py` = `"0.6.7"`、`main_window.py` 窗口标题 = `"v0.6.7"`、关于对话框 = `"v0.6.7"`：
 
 ### ✅ 已完成实现
 
@@ -213,8 +213,9 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
   - v0.6.5 (P3.5): 顶段凸台圆柱截形 — φ17 凸台方形化根因修复。根因：凸台在 front/side 棱柱中只有 17 宽矩形投影（凸台段竖线高 0.9mm < `_vertical_hole_profiles` 段高阈值 1.0 被过滤，`_profile_depths` 无凸台段），CSG 交集产生 17×17 方柱，P0 帽判据只跳过切割（Cut 会削掉凸起）却无截形机制。修复：P3.2 后新增凸台截形块——直接扫 front/side 竖线对（阈值 0.5），段顶贴视图顶且段浅的圆为凸台（深孔 R6 顶贴顶但段深 >4 排除、贯穿孔贴底排除、r8/r8.5 邻圆同扫中截形半径取竖线对实测宽）；只切凸台段方形角部（凸台段盒 ∩ r8.5 圆柱外材料），全程 Common 会把整个主体截成圆柱。定量：凸台段多余 721→0.4，凸台 z[69.5,70.4] 缺失仅 1.8（= 键槽 0.5 深差 4×0.5×0.9）
   - 信息论局限（图纸无信息，无法修复，代码注释已说明）：F 段顶 3mm 环（φ42 孔壁竖线被 HLR 消除）；R8 vs R8.5 凹槽半径差（重建按图纸标注 φ17）；φ3.3 沉头锥（沉头外圈 R2.75 与 φ5.5 顶面孔投影完全重合，top 视图无法区分）；φ3.3/φ5.5 孔位 0.1mm 画图精度差（DXF 17.2 → ±24.8 vs 基准 ±24.7）
   - 注：v0.6.5 起文件内版本字符串（docstring/横幅）已统一为 v0.6.5，与实际功能一致
-- **`dxf_to_sw_features.py`**（933 行）：DXF 工程图 → SW 原生特征模型（可编辑特征树：Boss-Extrude/Cut-Extrude/Revolve）。核心链：复用 `dxf_to_3d_general.convert_dxf_to_3d` CSG 重建 → z 切片环提取（圆/线/弧分类）→ 环轨迹跟踪分段 → 段分类（const 拉伸 / cone 旋转 / vary 细分）→ SW COM 特征建模（凸台序列自底向上 + 孔切除 + 材料岛 + 锥面旋转凸台）。验收（PF60K 法兰盘，18 特征）：体积 259,484 vs CSG 259,123（+0.14%）/ SW 基准 261,935（-0.94%）
+- **`dxf_to_sw_features.py`**（933 行）：DXF 工程图 → SW 原生特征模型（可编辑特征树：Boss-Extrude/Cut-Extrude/Revolve）。核心链：复用 `dxf_to_3d_general.convert_dxf_to_3d` CSG 重建 → z 切片环提取（圆/线/弧分类）→ 环轨迹跟踪分段 → 段分类（const 拉伸 / cone 旋转 / vary 细分）→ SW COM 特征建模（凸台序列自底向上 + 孔切除 + 材料岛 + 锥面旋转凸台）。验收（PF60K 法兰盘，18 特征）：体积 259,284 vs CSG 259,123（+0.06%）/ SW 基准 261,935（-1.01%）
   - v0.6.6: 方∩圆法兰轮廓修复 — `_normalize_loops` 整圆合成增加弧端点几何重合判据（原先仅角度区间连续性，方∩圆 4 弧被直线隔开、角度伪连续 → 误合成整圆 → SW 拉伸纯圆多出 4 弓形角，体积偏差 +44,803 主因）；φ12 孔与键槽相交混合环签名断段（原中心+半径匹配把混合环并入键槽矩形轨迹，φ12 孔漏切 -3,269）；凹口外环段（键槽切穿凸台）整圆简化 + 对应 cut 段深度延长补切（混合环线-弧 0.2mm 组装间隙致 SW 草图开环拉伸失败）
+  - v0.6.7: 通孔切穿修复 — 孔切除统一 `depth-0.1` 微缩会让通孔（孔底=实体底面）留 0.1mm 皮，把底面开口（r25 中心孔 + 4 定位角孔）整个封住（用户验收：另一面多层圆环台阶与定位孔藏在内部）；改为通孔 `depth+0.05` 微超切穿（贯穿切除 SW 自动截断到实体边界），盲孔保持微缩。底面逐层截面与 CSG 基准完全一致。配套：`sw_driver.rebuild()` 增加 ForceRebuild3(True) 二次重建 — SW2025 惰性重建下仅 False 一次后立即 SaveAs3 导出 STEP 只输出草图几何（6.8KB 草图盘，模型看似被切空），双重建后导出完整实体
   - SetAddToDB 行为限制（实测 SW2025）：孔切除草图用 `_sketch_loop(no_snap=True)`（SetAddToDB 绕过草图推理捕捉，键槽矩形角部距截面圆边 0.04mm 会被吸附畸变致 FeatureCut3 None）；**boss 草图必须 no_snap=False**（SetAddToDB 模式线端点不自动合并，多线环开环拉伸失败，八边环实测）
 - **阶梯轴建模对话框**：`sw_dialog.py`（509 行）— 后台线程建模、进度反馈、参数编辑
 - **数据模型**：`Document`、`ShapeNode`、`ProjectionData` 完整实现
@@ -278,7 +279,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.6`（代码内 `0.6.6`）——提交新版本时务必同步更新这些位置。
+- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.7`（代码内 `0.6.7`）——提交新版本时务必同步更新这些位置。
 - **README.md 路线图**: v0.6.5 梳理时已与实际进度对齐（标记已完成版本并指向 CLAUDE.md），后续新增功能时同步更新。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
 

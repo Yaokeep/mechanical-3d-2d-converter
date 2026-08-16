@@ -229,9 +229,16 @@ class SolidWorksDriver:
         return alias
 
     def rebuild(self) -> None:
-        """强制重建模型（Ctrl+Q）。"""
+        """强制重建模型（Ctrl+Q）。
+
+        False（全重建）+ True（顶面重建）双调用:
+        实测 SW2025 惰性重建下仅 False 一次后立即 SaveAs3 导出 STEP
+        只输出草图几何（Cut1 草图盘，模型"看似被切空"），
+        补 True 后导出完整实体（267KB vs 6.8KB）。
+        """
         if self.sw_model:
             self.sw_model.ForceRebuild3(False)
+            self.sw_model.ForceRebuild3(True)
 
     def zoom_to_fit(self) -> None:
         """缩放到适应窗口。"""

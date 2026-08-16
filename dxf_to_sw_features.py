@@ -877,8 +877,18 @@ def _build_sw_model(driver, shape, outer_segs, hole_segs, shift):
         # ⚠️ 孔深微缩 0.1mm: SW 实测孔底与特征接触面共面(或微越界)时
         # 会把合并实体切成分离块（顶段 4 孔深 9.1 → 实体 1→2），
         # 微缩使孔底高于接触面规避共面切除。
+        # ⚠️ 通孔(孔底 = 实体底面)不微缩、微超 0.05mm 保证切穿:
+        # 微缩会让通孔底部留 0.1mm 皮，把底面开口(r25 中心孔、
+        # 4 定位角孔)整个封住（实测用户验收: 底面多层圆环台阶
+        # 与定位孔全被封在内部）。贯穿切除 SW 自动截断到实体
+        # 边界，微超不会产生悬空几何。
+        zmin_csg = -shift
+        if all(s["z_bot"] <= zmin_csg + 0.05 for s in batch):
+            cut_depth = depth + 0.05
+        else:
+            cut_depth = depth - 0.1
         if not driver.feature_cut_extrude(
-            depth - 0.1, feat_name=f"CutExtrude{feat_idx}", flip=False
+            cut_depth, feat_name=f"CutExtrude{feat_idx}", flip=False
         ):
             return None
         feat_stats["cut"] += 1

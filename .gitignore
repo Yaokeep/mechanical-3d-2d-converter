@@ -75,6 +75,10 @@ CAD/temp_output/*.log
 CAD/temp_output/*.png
 CAD/temp_output/*.bmp
 CAD/temp_output/*.txt
+CAD/temp_output/*.stl
+CAD/temp_output/*.STL
+CAD/temp_output/*.x_t
+CAD/temp_output/*.jpg
 
 # 测试运行日志
 CAD/*_output.txt
