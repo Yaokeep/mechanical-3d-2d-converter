@@ -1,18 +1,15 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v2.1
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.5
 
-核心改进（相比 v2.0）:
-  1. 自动视图检测 — 基于文字标签 + 几何密度分析
-  2. 主体优先 — 先识别最大非圆轮廓作为主体，再在其上加减特征
-  3. 正确的圆柱体 — 同心圆弧 → 贯穿圆柱/孔
-  4. SPLINE 智能处理 — 过滤采样产生的碎片面
-  5. 剖面图支持 — 多剖面轮廓空间组合
-  6. 单视图轮廓拉伸 — 简单零件自动使用轮廓拉伸 + 内孔减除
+核心算法链（详见 CLAUDE.md「dxf_to_3d_general.py」条目）:
+  边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 /
+  单视图轮廓拉伸；内部特征 P0 布尔减 → 投影验证 P1 → 注解驱动
+  分析 P2 → 复杂图纸健壮性 P3（含顶段凸台圆柱截形 P3.5）
 
 用法:
     python dxf_to_3d_general.py <输入.dxf> [输出.sldprt] [--single-view|--multi-view]
     --single-view: 强制单视图轮廓拉伸模式
-    --multi-view:  强制多视图包围盒模式（v2.0 行为）
+    --multi-view:  强制多视图包围盒模式（旧 v2.0 行为）
 """
 
 import math
@@ -4797,7 +4794,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
 def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                       extrusion_depth: float = None,
                       single_view: bool = None) -> object:
-    """通用 DXF → 3D 转换器 v2.1。
+    """通用 DXF → 3D 转换器 v0.6.5。
 
     新增 single_view 参数:
       - None: 自动检测（单视图: 轮廓拉伸; 多视图: 包围盒+特征）
@@ -5819,7 +5816,7 @@ def main():
         output_sldprt = str(input_dir / f"{input_stem}_{ts}.sldprt")
 
     print("=" * 60)
-    print("通用 DXF → 3D SolidWorks 转换器 v2.1")
+    print("通用 DXF → 3D SolidWorks 转换器 v0.6.5")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  STEP: {step_path}")

@@ -356,8 +356,6 @@ def _supplement_outline_lines(shape, dz, up, dx):
             # 遍历会漏 → 外轮廓断链, 如法兰锥面大端圆 r=40 的投影
             # 横线缺失）。edge-on 时由面片参数直接补投影线段。
             if abs(az) < 0.001:
-                print(f"  [DBG] V边界圆补线: 面类型={st} az={az:.3f} "
-                      f"u1={u1:.2f} u2={u2:.2f} v1={v1:.2f} v2={v2:.2f}")
                 axv = gp_Vec(axis.X(), axis.Y(), axis.Z())
                 a0v = gp_Vec(pos.Location().X(), pos.Location().Y(),
                              pos.Location().Z())

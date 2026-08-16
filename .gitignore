@@ -40,10 +40,12 @@ desktop.ini
 # 生成的 CAD 输出文件（非源代码）
 *.SLDPRT
 *.sldprt
+*.SLDDRW
 *.step
 *.stp
 *.igs
 *.iges
+*.svg
 
 # CAD 软件锁文件
 *.dwl
@@ -64,8 +66,15 @@ htmlcov/
 # Claude Code 本地状态
 .claude/
 
-# CAD 临时输出目录
-CAD/temp_output/
+# CAD 临时输出产物（源脚本/测试样本 DXF 仍纳入跟踪，
+# 输出由 *.step/*.SLDPRT/*.log 等全局规则排除）
+CAD/temp_output/*.step
+CAD/temp_output/*.SLDPRT
+CAD/temp_output/*.sldprt
+CAD/temp_output/*.log
+CAD/temp_output/*.png
+CAD/temp_output/*.bmp
+CAD/temp_output/*.txt
 
 # 测试运行日志
 CAD/*_output.txt
