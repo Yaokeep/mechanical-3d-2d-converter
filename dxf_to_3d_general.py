@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.9
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.10
 
 核心算法链（详见 CLAUDE.md「dxf_to_3d_general.py」条目）:
   边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 /
@@ -3987,14 +3987,29 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                     if k_ylo is not None and k_yhi is not None:
                         if ymax < k_ylo + 1.0 or ymin > k_yhi - 1.0:
                             continue
-                    slot_lines.append((is_front, x))
+                    slot_lines.append((is_front, x, ymin, ymax))
+            # v0.6.10: front 视图孔壁竖线 y 范围——槽壁必须与孔壁
+            # 同段（同轴远处孔的键槽槽壁投影 x 与本孔重合但 y 不同
+            # 段，如顶段 φ12 键槽孔槽壁 x=±2 被底部 φ14 孔误拾，
+            # 基准实测 φ14 孔纯圆无键槽）
+            wall_ylo = wall_yhi = None
+            for is_front, x, ymin, ymax in slot_lines:
+                if not is_front:
+                    continue
+                if abs(abs(x - kx_dxf) - k_r) <= 0.8:
+                    wall_ylo = ymin if wall_ylo is None else min(wall_ylo, ymin)
+                    wall_yhi = ymax if wall_yhi is None else max(wall_yhi, ymax)
             # front: 槽壁竖线 = 孔心 ± w/2（槽壁平面投影），w = 2×off
             kw = None
-            for is_front, x in slot_lines:
+            for is_front, x, ymin, ymax in slot_lines:
                 if not is_front:
                     continue
                 off = abs(x - kx_dxf)
                 if 1.2 <= off <= 3.0:
+                    if wall_ylo is not None and (
+                            ymax < wall_ylo + 0.5
+                            or ymin > wall_yhi - 0.5):
+                        continue
                     w = 2 * off
                     if kw is None or abs(w - 4.0) < abs(kw - 4.0):
                         kw = w
@@ -4005,7 +4020,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             # 接近 xj 的竖线定方向（孔壁 d=±6 会被交线 d=±5.66 胜出）
             xj = (k_r * k_r - (kw / 2) ** 2) ** 0.5
             best_d = None
-            for is_front, x in slot_lines:
+            for is_front, x, _ymin, _ymax in slot_lines:
                 if is_front:
                     continue
                 d = x - _kx_side
@@ -4403,6 +4418,13 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                     # [4.5,8.5]）切出后查 front 槽壁竖线
                                     # + side 交线竖线，生成键槽刀（宽 4
                                     # 槽贯通孔全高，槽向由 side 交线侧定）
+                                    # v0.6.10: 槽壁竖线须与孔壁竖线
+                                    # y 重叠（函数内部判据）——同轴远
+                                    # 处孔的键槽槽壁投影（顶段 φ12 键
+                                    # 槽孔槽壁 x=±2）会被底部 φ14 孔误
+                                    # 拾成键槽（基准实测 φ14 孔纯圆无
+                                    # 键槽），槽刀顶 z_top+1 伸入沉头
+                                    # 段还产生 1mm 槽口伪影
                                     if 4.5 <= fi_w / 2 <= 8.5:
                                         try:
                                             _kyw = _detect_keyway(
@@ -4705,11 +4727,12 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                 break
                         if _had:
                             continue
-                        # v0.6.8: 凸起段跳过——段底接 F 段顶且段浅
-                        # (≤6mm) 的段是 F 段顶上方凸台（基准 PF60K
-                        # φ16 凸台 z[-22~-17] 实测为 r8 实心凸起），
-                        # 补刀会把凸起挖成孔腔（伪 r8.5 孔腔）；
-                        # 凸台圆柱截形由 P3.5 块统一处理
+                        # v0.6.8: 浅段跳过——段底接 F 段顶且段浅
+                        # (≤6mm) 的段是 F 段顶上方沉头孔/凸台（基准
+                        # PF60K φ16 z[-22~-17] 实测为 r8 沉头孔，v0.6.10），
+                        # 补刀会把 r8.5 邻圆误匹配进来挖成过大的孔腔
+                        # （伪 r8.5 孔腔）；该段由 P3.5 块统一处理
+                        # （沉头孔切孔，半径取竖线对实测宽）
                         if (_s_bot >= _f_top - 0.5
                                 and _s_top - _s_bot <= 6.0):
                             continue
@@ -4727,17 +4750,17 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             except Exception as _e:
                 print(f"  [WARN] P3.2 孔内材料补全异常: {_e}")
 
-        # ---- v0.6.5: 凸台圆柱截形（顶段 + 底面，v0.6.8 泛化）----
-        # 凸台（顶段 φ17 / 底面 φ16）在 front/side 棱柱中只有矩形
-        # 投影（凸台段竖线高 0.9mm 被 _vertical_hole_profiles 段高
-        # 阈值 1.0 过滤，_profile_depths 无凸台段），CSG 交集在凸
-        # 台段产生方柱；top 视图圆给出圆柱截面。P0 帽判据跳过凸台
-        # 切割（Cut 会削掉凸起），此处直接扫竖线（阈值 0.5）找凸
-        # 台段，用角块盒 ∩ 圆柱外材料把凸台段方角切掉：
+        # ---- v0.6.5: 凸台圆柱截形（顶段，v0.6.8 泛化）----
+        # 顶段凸台（φ17）在 front/side 棱柱中只有矩形投影（凸台段
+        # 竖线高 0.9mm 被 _vertical_hole_profiles 段高阈值 1.0 过滤，
+        # _profile_depths 无凸台段），CSG 交集在凸台段产生方柱；top
+        # 视图圆给出圆柱截面。P0 帽判据跳过凸台切割（Cut 会削掉凸
+        # 起），此处直接扫竖线（阈值 0.5）找凸台段，用角块盒 ∩ 圆
+        # 柱外材料把凸台段方角切掉：
         #   顶段凸台: 段顶贴视图顶且段浅（v0.6.5，PF60K φ17）
-        #   底面凸台: 段底接 F 段顶上方（v0.6.8，PF60K φ16 凸台
-        #             z[-22~-17]，此前 P3.2 补刀把凸台段挖成伪
-        #             r8.5 孔腔）
+        #   底面沉头孔: 段底接 F 段顶上方（v0.6.10，PF60K φ16 沉头
+        #              z[-22~-17]——v0.6.8 曾误判为凸台 Fuse r8 圆
+        #              柱，基准实测为 φ14 芯孔沉头，此处切孔）
         # 孔圆排除：段顶贴主体顶且段高 >4（深孔 R6，Common 会把
         # 凸台段切空）或段底贴主体底（贯穿孔）。
         try:
@@ -4752,7 +4775,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             if _flange_hole_segs:
                 _boss_f_top = max(s[0] for s in _flange_hole_segs)
             _top_boss_cands = []  # 顶段凸台: (r_csg, z_bot, cx, cy)
-            _bot_boss_cands = []  # 底面凸台: (r_csg, z_bot, z_top, cx, cy)
+            _bot_boss_cands = []  # 底面沉头孔: (r_csg, z_bot, z_top, cx, cy)
             for _tx, _ty, _tr, _dx, _dy in top_hole_circles:
                 _r_dxf = _tr / scale_factor
                 if _r_dxf > _czhalf * 0.3:
@@ -4844,10 +4867,11 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                             # （r8/r8.5 邻圆同扫中，DXF
                                             # 竖线 w=17 才对应凸台）
                                             _z_r = _w / 2
-                                    # v0.6.8: 底面凸台段——段底接
-                                    # F 段顶上方（±1mm 内）且段浅
-                                    # (≤6mm)；段底上限 +5 排除更
-                                    # 高处的台阶/锥面噪声段
+                                    # v0.6.8: 底面浅段（v0.6.10 起
+                                    # 按沉头孔处理）——段底接 F 段顶
+                                    # 上方（±1mm 内）且段浅 (≤6mm)；
+                                    # 段底上限 +5 排除更高处的台阶/
+                                    # 锥面噪声段
                                     if (_boss_f_top is not None
                                             and _boss_f_top - 1.0
                                             <= _z_bc <= _boss_f_top + 5.0
@@ -4889,72 +4913,51 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                       f"r={_br / scale_factor:.1f} "
                                       f"Z[{_bz:.1f}~{_czmax:.1f}]")
             if _bot_boss_cands:
-                # v0.6.8: 段底降序取最贴 F 段顶的凸台段——φ14 芯
-                # 孔上段 (z_bot≈-21.95) 与 φ16 凸台段 (-21.92) 同
-                # 入围时，降序取段底更高者（凸台段）。底面凸台段
-                # 是 CSG 交集方柱（φ16 投影 16×16）+ 锥面过渡裁剪
-                # （P3.4）盘截面叠加：Fuse r8 圆柱补出凸台圆柱后，
-                # 需切除方柱内切方角块（方柱 16×16 内切于圆柱，
-                # 角块 = 盒内圆柱外材料）。角块盒取内切方盒
-                # (bx±br, by±br) 时盘材料全在圆柱内不受损；刀底
-                # 平贴盘面（_bz 不嵌入）——嵌入会堵 φ14 孔口并留
-                # 孔口月牙碎片（实测 +66 体积）；刀顶 +0.1 略高
-                # 过段顶消除浮点皮（v0.6.9: 旧 +0.75 越界把凸台
-                # 顶上方主体 r7 材料误切 0.65mm，-16.45 层缺失）
-                _bot_boss_cands.sort(key=lambda _c: -_c[1])
-                _br, _bz, _bt, _bx, _by = _bot_boss_cands[0]
-                _boss = create_cylinder_solid(
-                    (_bx, _by), _br,
-                    _bt - _bz + 0.1, _bz)
-                if _boss is not None:
-                    _fo = BRepAlgoAPI_Fuse(combined, _boss)
-                    if _fo.IsDone():
-                        combined = _fo.Shape()
-                        _sq_box = BRepPrimAPI_MakeBox(
-                            gp_Pnt(_bx - _br, _by - _br, _bz),
-                            gp_Pnt(_bx + _br, _by + _br,
-                                   _bt + 0.1)).Shape()
-                        _seg_op = BRepAlgoAPI_Common(
-                            combined, _sq_box)
-                        if _seg_op.IsDone():
-                            _corner_op = BRepAlgoAPI_Cut(
-                                _seg_op.Shape(), _boss)
-                            if _corner_op.IsDone():
-                                _co2 = BRepAlgoAPI_Cut(
-                                    combined, _corner_op.Shape())
-                                if _co2.IsDone():
-                                    combined = _co2.Shape()
-                                    print(f"  [P3.5] 底面凸台圆柱截形 "
-                                          f"r={_br / scale_factor:.1f} "
-                                          f"Z[{_bz:.1f}~{_bt:.1f}]")
-                # v0.6.9: 凸台延续下方同轴孔——贯穿凸台的孔
-                # （φ14 芯孔 r7 段顶 -21.95 与凸台段底 -21.92
-                # 相接）被 P0 帽判据跳过切割，凸台 Fuse 成实心
-                # 圆柱堵死孔口（基准凸台是 r[7,8] 环形柱）。
-                # 通用规则：同轴孔段顶与凸台段底相接（±1.5）
-                # → 孔延续切穿凸台段。
-                for _hx, _hy, _hr, _hdx, _hdy in top_hole_circles:
-                    if _hr >= _br - 0.5:
+                # v0.6.10: 底面浅段是沉头孔不是凸台——基准薄板体积
+                # 实测（逐 2mm 板 π(30²-8²)·2 精确吻合）PF60K 底面
+                # φ16 z[0~5] 为 φ14 芯孔的沉头（台阶孔 r7→r8），
+                # v0.6.8/v0.6.9 按凸台处理（Fuse r8 圆柱 + 方角块
+                # 切除 + 芯孔切穿凸台）产生的 r[7,8] 环形柱 + 方井
+                # 与基准不符（结构错误且 SW 特征建模混合环草图开环
+                # 失败，CutExtrude7）。通用规则：F 段顶上方浅段 =
+                # 同轴孔沉头——半径取竖线对实测宽（r8.5 邻圆误匹配
+                # 的候选同段被去重取小半径排除），直接切孔；沉头段
+                # 底与下方同轴孔段顶相接（±1.5）时刀底取孔段顶，
+                # 沉头台阶面与孔顶面共面（与基准一致）。
+                _bot_boss_cands.sort(key=lambda _c: (-_c[1], _c[0]))
+                _seen = set()
+                _chosen = []
+                for _c in _bot_boss_cands:
+                    _k = (round(_c[1], 1), round(_c[2], 1))
+                    if _k in _seen:
                         continue
-                    if (abs(_hx - _bx) > 1.0
-                            or abs(_hy - _by) > 1.0):
-                        continue
-                    _hsegs = _profile_depths(_hdx, _hr / scale_factor)
-                    if not _hsegs:
-                        continue
-                    if not any(abs(s[0] - _bz) <= 1.5
-                               for s in _hsegs):
-                        continue
+                    _seen.add(_k)
+                    _chosen.append(_c)
+                for _br, _bz, _bt, _bx, _by in _chosen:
+                    _cut_bot = _bz
+                    for _hx, _hy, _hr, _hdx, _hdy in top_hole_circles:
+                        if _hr >= _br - 0.5:
+                            continue
+                        if (abs(_hx - _bx) > 1.0
+                                or abs(_hy - _by) > 1.0):
+                            continue
+                        _hsegs = _profile_depths(_hdx, _hr / scale_factor)
+                        if not _hsegs:
+                            continue
+                        _tops = [s[0] for s in _hsegs
+                                 if abs(s[0] - _bz) <= 1.5]
+                        if _tops:
+                            _cut_bot = max(_tops)
+                            break
                     _htool = create_cylinder_solid(
-                        (_bx, _by), _hr,
-                        _bt - _bz + 0.1, _bz)
+                        (_bx, _by), _br, _bt - _cut_bot, _cut_bot)
                     _ho = BRepAlgoAPI_Cut(combined, _htool)
                     if _ho.IsDone():
                         combined = _ho.Shape()
                         inner_cut_count += 1
-                        print(f"  [P3.5] 凸台同轴孔延续 "
-                              f"r={_hr / scale_factor:.1f} "
-                              f"Z[{_bz:.1f}~{_bt:.1f}]")
+                        print(f"  [P3.5] 底面沉头孔 "
+                              f"r={_br / scale_factor:.1f} "
+                              f"Z[{_cut_bot:.1f}~{_bt:.1f}]")
         except Exception as _e:
             print(f"  [WARN] 凸台圆柱截形异常: {_e}")
 
