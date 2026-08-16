@@ -51,6 +51,7 @@ def _ensure_occ():
     from OCC.Core.BRepPrimAPI import (
         BRepPrimAPI_MakePrism, BRepPrimAPI_MakeRevol,
         BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCone,
     )
     from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut, BRepAlgoAPI_Common
     from OCC.Core.ShapeFix import ShapeFix_Face, ShapeFix_Wire, ShapeFix_Shape
@@ -84,6 +85,7 @@ def _ensure_occ():
         ("BRepPrimAPI_MakeRevol", BRepPrimAPI_MakeRevol),
         ("BRepPrimAPI_MakeCylinder", BRepPrimAPI_MakeCylinder),
         ("BRepPrimAPI_MakeBox", BRepPrimAPI_MakeBox),
+        ("BRepPrimAPI_MakeCone", BRepPrimAPI_MakeCone),
         ("BRepAlgoAPI_Fuse", BRepAlgoAPI_Fuse),
         ("BRepAlgoAPI_Cut", BRepAlgoAPI_Cut),
         ("BRepAlgoAPI_Common", BRepAlgoAPI_Common),
@@ -1523,6 +1525,10 @@ def build_occ_wire_from_face(face_eids, edges, edge_vertices, vertex_pos,
                 )
                 a1 = math.radians(e.start_angle)
                 a2_val = math.radians(e.end_angle)
+                # v0.6.4: HLR 顺时针小弧 end < start 时直接构造会得到
+                # 补弧（352° 大弧）——交换角度取逆时针同几何段
+                if a2_val < a1:
+                    a1, a2_val = a2_val, a1
                 occ_edge = BRepBuilderAPI_MakeEdge(circ, a1, a2_val).Edge()
             else:
                 occ_edge = BRepBuilderAPI_MakeEdge(
@@ -2787,22 +2793,27 @@ def build_wire_from_directed_ring(ring, vertex_pos, edges, scale_factor=1.0):
                     gp_Ax2(gp_Pnt(e.center[0] * sf, e.center[1] * sf, 0),
                            gp_Dir(0, 0, 1)),
                     e.radius * sf)
+                # v0.6.4: 参数版弧构造——三点过圆重载在 pythonocc
+                # 7.7.2 中不存在（MakeEdge(circ, P1, P2, P3) 抛
+                # TypeError 被 except 吞掉），历史上所有 ARC 边静默
+                # 退化为弦线（PF60K 顶段 R40 角弧变 45° 斜面，
+                # "圆形突起变方形"的根源）。改用参数构造，方向由
+                # DXF 扫角决定（HLR 顺时针小弧 end < start），
+                # 端点与 LINE 顶点的微小偏差由 ShapeFix_Wire 容差
+                # 0.5 修复。
                 a1 = math.atan2(p1[1] - e.center[1], p1[0] - e.center[0])
                 a2 = math.atan2(p2[1] - e.center[1], p2[0] - e.center[0])
-                # 三点过圆构造: 端点精确落在顶点坐标上（参数构造的
-                # 弧端点与 LINE 顶点有 ~0.001mm 浮点偏差, 会让
-                # MakeWire 判为不连续丢弃后续所有边）
-                mid_a = (a1 + a2) / 2
-                p1_pt = gp_Pnt(p1[0] * sf, p1[1] * sf, 0)
-                p2_pt = gp_Pnt(p2[0] * sf, p2[1] * sf, 0)
-                pm_pt = gp_Pnt((e.center[0] + e.radius * math.cos(mid_a)) * sf,
-                               (e.center[1] + e.radius * math.sin(mid_a)) * sf,
-                               0)
-                try:
-                    occ_edge = BRepBuilderAPI_MakeEdge(
-                        circ, p1_pt, pm_pt, p2_pt).Edge()
-                except Exception:
-                    occ_edge = BRepBuilderAPI_MakeEdge(p1_pt, p2_pt).Edge()
+                if e.end_angle >= e.start_angle:
+                    # DXF 逆时针弧 p1→p2
+                    while a2 <= a1:
+                        a2 += 2 * math.pi
+                    occ_edge = BRepBuilderAPI_MakeEdge(circ, a1, a2).Edge()
+                else:
+                    # DXF 顺时针弧（HLR end < start）: 逆时针 p2→p1
+                    # 段与之几何重合（wire 方向由 FixReorder 统一）
+                    while a1 <= a2:
+                        a1 += 2 * math.pi
+                    occ_edge = BRepBuilderAPI_MakeEdge(circ, a2, a1).Edge()
             else:
                 occ_edge = BRepBuilderAPI_MakeEdge(
                     gp_Pnt(p1[0] * sf, p1[1] * sf, 0),
@@ -2956,16 +2967,24 @@ def _flange_top_from_ring_vertices(views, scale_factor, no_merge_rings, edges):
             p2 = vp[t]
             if (abs(p1[0] - p2[0]) > 1.5
                     and abs(p1[1] - p2[1]) > 1.5):
-                cone_cands.append(max(p1[1], p2[1]))
+                cone_cands.append((min(p1[1], p2[1]), max(p1[1], p2[1])))
     if not cands:
-        return None, None
+        return None, None, None
     y_top = max(cands)
     z_top = (y_top - ymid) * scale_factor
     # 锥面顶 = 斜线边上端（在法兰顶下方 >1mm 才有意义）；
+    # 锥面底 = 同斜线边下端（锥面斜母线投影高，PF60K 1.8）。
     # 找不到（无锥面结构或斜线未输出）→ None 回退法兰顶
-    y_cone = max((y for y in cone_cands if y_top - y > 1.0), default=None)
-    z_cone = (y_cone - ymid) * scale_factor if y_cone is not None else None
-    return z_top, z_cone
+    _cone_sel = [c for c in cone_cands if y_top - c[1] > 1.0]
+    if _cone_sel:
+        y_cone = max(c[1] for c in _cone_sel)
+        y_cone_lo = min(c[0] for c in _cone_sel)
+        z_cone = (y_cone - ymid) * scale_factor
+        z_cone_bot = (y_cone_lo - ymid) * scale_factor
+    else:
+        z_cone = None
+        z_cone_bot = None
+    return z_top, z_cone, z_cone_bot
 
 
 def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
@@ -3012,6 +3031,8 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
     prisms = []
     prisms_flange = []  # v0.6.3 P3.1: top 分体的环带棱柱
     hole_data = []  # 每个视图的内孔信息
+    z_cone = None  # v0.6.4: 锥面顶（CSG 系），无信号时 None
+    z_cone_bot = None  # v0.6.4: 锥面底
 
     for v in views:
         ring_data = no_merge_rings.get(v["name"])
@@ -3233,6 +3254,11 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                         # 顶段 z[56.5,66.5] 的 16 边环角过渡（基准
                         # 6,536）三视图无信息（top 投影被外环覆盖），
                         # 接受为信息论局限。
+                        # v0.6.4: 保存 16 边实心面（含 R40 角弧），
+                        # 顶段环柱补丁用——主体圆棱柱交 front/side 棱柱
+                        # 在顶段产生 45° 斜切角，16 边柱 ∩ 顶段 z 盒可
+                        # 补回角弧（基准顶段 = 60×60 + 4 R40 角弧）
+                        v["_full16_face"] = occ_face
                         occ_face = circle_face  # 主体棱柱改用圆面
                         v["_flange_hole_r"] = hole_r / scale_factor
                         print(f"  [P3.1] 视图 '{v['name']}' 分体: "
@@ -3249,6 +3275,9 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         occ_face = _apply_view_transform(occ_face, v["view_type"])
         if split_face is not None:
             split_face = _apply_view_transform(split_face, v["view_type"])
+        full16_face = None
+        if v.get("_full16_face") is not None:
+            full16_face = _apply_view_transform(v["_full16_face"], v["view_type"])
 
         # 对齐：非前视图面平移使 Z_min=0（统一内部特征偏移基准；
         # 前视图面位于 XZ 平面，Z 范围由 DXF_Y 决定，不做此平移）
@@ -3263,6 +3292,9 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 if split_face is not None:
                     split_face = BRepBuilderAPI_Transform(
                         split_face, trsf_align).Shape()
+                if full16_face is not None:
+                    full16_face = BRepBuilderAPI_Transform(
+                        full16_face, trsf_align).Shape()
 
         # 保存外轮廓面中心（旋转+Z对齐后），供内部特征工具统一偏移
         face_bbox = Bnd_Box()
@@ -3279,6 +3311,10 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         flange_prism = None
         if split_face is not None:
             flange_prism = _extrude_face_dual(split_face, extrude_axis,
+                                              extrude_dist)
+        full16_prism = None
+        if full16_face is not None:
+            full16_prism = _extrude_face_dual(full16_face, extrude_axis,
                                               extrude_dist)
 
         # 棱柱居中到原点：避免大坐标导致的布尔运算精度问题
@@ -3298,6 +3334,9 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 if flange_prism is not None:
                     flange_prism = BRepBuilderAPI_Transform(
                         flange_prism, trsf_ctr).Shape()
+                if full16_prism is not None:
+                    full16_prism = BRepBuilderAPI_Transform(
+                        full16_prism, trsf_ctr).Shape()
         except Exception:
             pass
 
@@ -3306,6 +3345,9 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             # 环带棱柱单独收集, 求交时与 front/side 棱柱再求交
             prisms_flange.append(flange_prism)
             v["_body_prism"] = prism
+        if full16_prism is not None:
+            # v0.6.4: 16 边实心棱柱，供顶段环柱补丁（修复 45° 斜切角）
+            v["_full16_prism"] = full16_prism
         print(f"  视图 '{v['name']}'({v['view_type']}): "
               f"轮廓={outer_face['area']:.0f}mm2, "
               f"棱柱轴={['X','Y','Z'][extrude_axis]}, "
@@ -3367,7 +3409,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             front_side = [p for p in prisms if p is not body_prism_ref]
             flange = _common_chain([prisms_flange[0]] + front_side)
             # 法兰顶面 z: 外环顶点标定（锥面顶段上端等非极值顶点层）
-            z_cap, z_cone = _flange_top_from_ring_vertices(
+            z_cap, z_cone, z_cone_bot = _flange_top_from_ring_vertices(
                 views, scale_factor, no_merge_rings, edges)
             # v0.6.3: 主体/环带分界 z 取锥面顶（有信号时）——锥面段
             # r30 圆盘由主体圆棱柱覆盖，环带只补叶片柱段；环带到
@@ -3412,9 +3454,10 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
     # 基准顶段 16 边环的 4 角凸（r[30,40] 角区，与法兰叶片同形状）
     # 三视图投影被 HLR 过滤（top 被外环覆盖、front/side 无母线），
     # 主体圆棱柱缺该材料（PF60K 顶段缺 6,535）。角凸 z 范围 =
-    # [主体段顶, 台阶段底]（φ60 竖线上端 → φ50 台阶竖线下端），
-    # 补丁 = 环带棱柱 ∩ 该 z 盒（含 r[21,30] 环，与主体圆柱重叠
-    # 部分 Fuse 无新增材料，无害）。
+    # [主体段顶, 台阶段底]（φ60 竖线上端 → φ50 台阶竖线下端）。
+    # v0.6.4: 补丁源改用 16 边实心棱柱（环带棱柱只含 r[21,40] 环，
+    # 顶段方柱 45° 斜切角 r[21.2,30] 未被覆盖；16 边棱柱 ∩ z 盒
+    # 补回完整顶段截面，中心区与主体圆柱重叠 Fuse 无新增材料）。
     try:
         _top_r = no_merge_rings.get("top") if no_merge_rings else None
         _top_half = None
@@ -3467,19 +3510,68 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                 _fz_bot = _zbot_c
         if (_fz_top is not None and _fz_bot is not None
                 and 2.0 < _fz_bot - _fz_top <= 20.0):
-            _patch_box = BRepPrimAPI_MakeBox(
-                gp_Pnt(-500, -500, _fz_top),
-                gp_Pnt(500, 500, _fz_bot)).Shape()
-            _patch_op = BRepAlgoAPI_Common(
-                prisms_flange[0], _patch_box)
-            if _patch_op.IsDone():
-                _patch_fuse = BRepAlgoAPI_Fuse(combined, _patch_op.Shape())
-                if _patch_fuse.IsDone():
-                    combined = _patch_fuse.Shape()
-                    print(f"  [P3.1] 顶段角凸补丁 z[{_fz_top:.1f}~"
-                          f"{_fz_bot:.1f}]")
+            # v0.6.4: 补丁源优先 16 边实心棱柱（完整顶段截面），
+            # 无则回退环带棱柱（旧行为）
+            _patch_src = None
+            for _pv in views:
+                if _pv.get("_full16_prism") is not None:
+                    _patch_src = _pv["_full16_prism"]
+                    break
+            if _patch_src is None and prisms_flange:
+                _patch_src = prisms_flange[0]
+            if _patch_src is not None:
+                _patch_box = BRepPrimAPI_MakeBox(
+                    gp_Pnt(-500, -500, _fz_top),
+                    gp_Pnt(500, 500, _fz_bot)).Shape()
+                _patch_op = BRepAlgoAPI_Common(
+                    _patch_src, _patch_box)
+                if _patch_op.IsDone():
+                    _patch_fuse = BRepAlgoAPI_Fuse(combined, _patch_op.Shape())
+                    if _patch_fuse.IsDone():
+                        combined = _patch_fuse.Shape()
+                        print(f"  [P3.1] 顶段角凸补丁 z[{_fz_top:.1f}~"
+                              f"{_fz_bot:.1f}]")
     except Exception as _e:
         print(f"  [WARN] 顶段角凸补丁失败: {_e}")
+
+    # ---- v0.6.4: 锥面过渡裁剪 ----
+    # 基准方段（60×60+R40 角弧）与 r30 主体之间是圆锥面过渡
+    # （R角弧→r主体，高=锥顶−锥底，PF60K 1.8）。方段棱柱 z
+    # [锥底,锥顶] 段圆锥外的角区材料是直角过渡假材料。裁剪工具 =
+    # combined∩z盒 − 圆锥台（主体 r30 处截面与锥顶圆盘一致，
+    # 锥底处截面 ⊂ R角弧底圆 → 与方段无缝相接；φ42 孔 r21 在
+    # 圆锥内不受影响）。
+    if z_cone is not None and z_cone_bot is not None and _top_half:
+        try:
+            _cone_r_bot = None
+            _top_rd = no_merge_rings.get("top") if no_merge_rings else None
+            if _top_rd is not None:
+                _arcs = [edges[eid].radius
+                         for eid, _f, _t in _top_rd["ring"]
+                         if edges[eid].etype == "ARC"]
+                _cone_r_bot = max(_arcs) if _arcs else None
+            if _cone_r_bot is None:
+                _cone_r_bot = _top_half + (z_cone - z_cone_bot)
+            _cone_h = z_cone - z_cone_bot
+            _cone_ax = gp_Ax2(gp_Pnt(0.0, 0.0, z_cone_bot),
+                              gp_Dir(0.0, 0.0, 1.0))
+            _cone_tool = BRepPrimAPI_MakeCone(
+                _cone_ax, _cone_r_bot, _top_half, _cone_h).Shape()
+            _seg_box = BRepPrimAPI_MakeBox(
+                gp_Pnt(-500, -500, z_cone_bot),
+                gp_Pnt(500, 500, z_cone)).Shape()
+            _seg_op = BRepAlgoAPI_Common(combined, _seg_box)
+            if _seg_op.IsDone():
+                _corner_op = BRepAlgoAPI_Cut(_seg_op.Shape(), _cone_tool)
+                if _corner_op.IsDone():
+                    _co2 = BRepAlgoAPI_Cut(combined, _corner_op.Shape())
+                    if _co2.IsDone():
+                        combined = _co2.Shape()
+                        print(f"  [P3.1] 锥面过渡裁剪 R{_cone_r_bot:.1f}→"
+                              f"{_top_half:.1f} z[{z_cone_bot:.1f}~"
+                              f"{z_cone:.1f}]")
+        except Exception as _e:
+            print(f"  [WARN] 锥面过渡裁剪异常: {_e}")
 
     # 修复
     try:
@@ -3823,6 +3915,83 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 pass
             return tool
 
+        def _detect_keyway(kx_dxf, k_r, k_ylo, k_yhi):
+            """φ12 顶孔旁键槽检测 → (槽宽, 槽向±1, 槽底深) 或 None。
+
+            v0.6.4: 键槽三视图信息——front 视图槽壁竖线（孔壁内侧
+            2mm 处，槽宽 = 2×偏移）；side 视图槽壁×孔壁交线竖线
+            （x = 孔心 + √(r²−(w/2)²)，交线 y 深）。槽底深图纸无
+            信息，取标准键槽（DIN 6885: 宽 4 → 孔心距底 7.8）。
+            """
+            # front/side 视图竖线收集（y 与孔段重叠）
+            fv = next((v for v in views if v["view_type"] == "front"), None)
+            sv = next((v for v in views if v["view_type"] == "side"), None)
+            if fv is None or sv is None:
+                return None
+            _kx_side = None  # side 视图孔心 x
+            try:
+                _sv_cx = (sv["bbox"][0] + sv["bbox"][2]) / 2
+                _kx_side = _sv_cx + (kx_dxf
+                                     - (fv["bbox"][0] + fv["bbox"][2]) / 2)
+            except Exception:
+                return None
+            slot_lines = []
+            for v, vcx, is_front in ((fv, (fv["bbox"][0] + fv["bbox"][2]) / 2, True),
+                                     (sv, _sv_cx, False)):
+                vx1, vx2 = v["bbox"][0], v["bbox"][2]
+                vy1, vy2 = v["bbox"][1], v["bbox"][3]
+                for e in edges:
+                    if getattr(e, "etype", "") != "LINE":
+                        continue
+                    x1, y1 = e.start[0], e.start[1]
+                    x2, y2 = e.end[0], e.end[1]
+                    if abs(x1 - x2) > 0.3:
+                        continue
+                    x = (x1 + x2) / 2
+                    if not (vx1 - 1 <= x <= vx2 + 1):
+                        continue
+                    ymin, ymax = min(y1, y2), max(y1, y2)
+                    # 竖线与孔段 y 重叠（非整段覆盖——键槽槽壁可能
+                    # 与孔壁等长，交线竖线全高）；y 范围未提供时跳过
+                    if k_ylo is not None and k_yhi is not None:
+                        if ymax < k_ylo + 1.0 or ymin > k_yhi - 1.0:
+                            continue
+                    slot_lines.append((is_front, x))
+            # front: 槽壁竖线 = 孔心 ± w/2（槽壁平面投影），w = 2×off
+            kw = None
+            for is_front, x in slot_lines:
+                if not is_front:
+                    continue
+                off = abs(x - kx_dxf)
+                if 1.2 <= off <= 3.0:
+                    w = 2 * off
+                    if kw is None or abs(w - 4.0) < abs(kw - 4.0):
+                        kw = w
+            if kw is None or not (2.5 <= kw <= 5.5):
+                return None
+            # side: 交线竖线 = 孔心 ± √(r² − (w/2)²)，定槽向。孔壁
+            # 竖线（±r）与交线仅相距 r−xj（w=4 时 0.34），取 |d| 最
+            # 接近 xj 的竖线定方向（孔壁 d=±6 会被交线 d=±5.66 胜出）
+            xj = (k_r * k_r - (kw / 2) ** 2) ** 0.5
+            best_d = None
+            for is_front, x in slot_lines:
+                if is_front:
+                    continue
+                d = x - _kx_side
+                if abs(d) < abs(xj) - 1.2 or abs(d) > abs(xj) + 0.8:
+                    continue
+                if abs(d) <= k_r * 0.4:
+                    continue
+                if best_d is None or abs(abs(d) - abs(xj)) \
+                        < abs(abs(best_d) - abs(xj)):
+                    best_d = d
+            if best_d is None:
+                return None
+            direction = 1 if best_d > 0 else -1
+            # 槽底深: 标准键槽（宽 4 → 孔心距底 7.8）
+            bottom = k_r + 1.8
+            return kw, direction, bottom
+
         # v0.6.3 P3.2: 环带内孔 F 的深度段派生。φ42 孔壁竖线在
         # front/side 视图被 HLR 遮挡消除（内部孔壁不可见），
         # _profile_depths(r=21) 恒空。改从可见竖线对派生：
@@ -3962,10 +4131,12 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                 try:
                                     _zbb = Bnd_Box()
                                     brepbndlib.Add(combined, _zbb)
+                                    _zmin = _zbb.Get()[2]
                                     _zmax = _zbb.Get()[5]
                                     _zhalf = max(_zbb.Get()[3] - _zbb.Get()[0],
                                                  _zbb.Get()[4] - _zbb.Get()[1]) / 2
                                 except Exception:
+                                    _zmin = None
                                     _zmax = None
                                     _zhalf = 1e9
                                 for z_top, z_bot in depths:
@@ -4076,9 +4247,14 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                     # 相接段 → 本段是噪声竖线对（如主体
                                     # 顶段碎边配对 φ5.5 沉头误配到
                                     # Z[34.6~44.6]），剔除。
+                                    # v0.6.4: 同轴远距豁免——芯孔段与本段
+                                    # 相距 > 主体高 30% 时是独立同轴孔
+                                    # （PF60K 顶段 φ5.5 孔 z[34.6,44.6]
+                                    # 与法兰 φ3.3 孔 z[-48.5,-38.4] 同轴
+                                    # 相距 73），非噪声，保留本段。
                                     _sink_seen = False
                                     _sink_touch = False
-                                    _sink_below = False
+                                    _sink_below_top = None
                                     for _tx, _ty, _tr, _dx, _dy in top_hole_circles:
                                         if abs(_dx - fi_cx) > 1.5:
                                             continue
@@ -4103,7 +4279,9 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                                 break
                                             if (_s_bot < z_bot - 0.5
                                                     and _s_top < z_bot - 0.5):
-                                                _sink_below = True
+                                                if (_sink_below_top is None
+                                                        or _s_top > _sink_below_top):
+                                                    _sink_below_top = _s_top
                                         if _sink_touch:
                                             break
                                     # v0.6.3: 仅当同心芯孔段完全在本段
@@ -4113,6 +4291,12 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                     # 本段上方/内部时本段是真实孔壁
                                     # （法兰 φ14 芯孔 vs 主体顶 R6 孔，
                                     # PF60K 中央孔系 φ42/φ32/φ14），保留。
+                                    _sink_below = _sink_below_top is not None
+                                    if _sink_below and (_zmax is not None
+                                                        and _zmin is not None
+                                                        and z_bot - _sink_below_top
+                                                        > (_zmax - _zmin) * 0.3):
+                                        _sink_below = False
                                     if _sink_seen and not _sink_touch and _sink_below:
                                         continue
                                     # v0.6.3: 覆盖判据——更大同心圆环刀
@@ -4150,6 +4334,55 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                         continue
                                     tools.append(
                                         _limit_tool_depth(tool, z_top, z_bot))
+                                    # v0.6.4: 键槽检测——φ12 级孔（r∈
+                                    # [4.5,8.5]）切出后查 front 槽壁竖线
+                                    # + side 交线竖线，生成键槽刀（宽 4
+                                    # 槽贯通孔全高，槽向由 side 交线侧定）
+                                    if 4.5 <= fi_w / 2 <= 8.5:
+                                        try:
+                                            _kyw = _detect_keyway(
+                                                fi_cx, fi_w / 2, None, None)
+                                            if _kyw is not None:
+                                                _kw, _kdir, _kbot = _kyw
+                                                _kcore = None
+                                                for (_tx, _ty, _tr,
+                                                     _dx, _dy) in top_hole_circles:
+                                                    if (abs(_dx - fi_cx) <= 1.5
+                                                            and abs(_tr / scale_factor
+                                                                    - fi_w / 2) <= 0.6):
+                                                        _kcore = (_tx, _ty)
+                                                        break
+                                                if _kcore is not None:
+                                                    _kcx, _kcy = _kcore
+                                                    # DXF → CSG 单位换算
+                                                    _kwc = _kw * scale_factor
+                                                    _kbotc = _kbot * scale_factor
+                                                    _rhc = fi_w / 2 * scale_factor
+                                                    # 槽刀长方体: 宽 _kwc
+                                                    # （垂直槽向）、槽向从孔壁
+                                                    # 到槽底 _kbotc、z 孔段全高
+                                                    if _kdir == 1:
+                                                        _kbox = BRepPrimAPI_MakeBox(
+                                                            gp_Pnt(_kcx - _kwc / 2,
+                                                                   _kcy + _rhc - 0.5,
+                                                                   z_bot - 1.0),
+                                                            gp_Pnt(_kcx + _kwc / 2,
+                                                                   _kcy + _kbotc + 0.5,
+                                                                   z_top + 1.0)).Shape()
+                                                    else:
+                                                        _kbox = BRepPrimAPI_MakeBox(
+                                                            gp_Pnt(_kcx - _kwc / 2,
+                                                                   _kcy - _kbotc - 0.5,
+                                                                   z_bot - 1.0),
+                                                            gp_Pnt(_kcx + _kwc / 2,
+                                                                   _kcy - _rhc + 0.5,
+                                                                   z_top + 1.0)).Shape()
+                                                    tools.append(_kbox)
+                                                    print(f"  [P0] 键槽刀: 宽{_kwc:.1f} "
+                                                          f"槽向{'Y+' if _kdir > 0 else 'Y-'} "
+                                                          f"深{_kbotc:.1f} z[{z_bot:.1f}~{z_top:.1f}]")
+                                        except Exception:
+                                            pass
                     # v0.6.3: top 无深度匹配不回退贯穿——φ12 凸台等顶部
                     # 凸起深度推导失败时，贯穿刀会把凸起切成通孔
                     if not tools and tool is not None and vt != "top":
@@ -5273,6 +5506,25 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
         combined = fixer.Shape()
     except Exception:
         pass
+
+    # v0.6.4: 网格线清理——布尔差在共面处留下碎片面（PF60K 重建
+    # 1734 面中数百个 area≈0 残渣，STEP 里显示为无意义网格线），
+    # UnifySameDomain 合并同域相邻面为大面
+    try:
+        from OCC.Core.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+        _usd = ShapeUpgrade_UnifySameDomain(combined, True, True, False)
+        _usd.SetAngularTolerance(1e-4)
+        _usd.SetLinearTolerance(1e-3)
+        _usd.Build()
+        combined = _usd.Shape()
+        _nf = 0
+        _fx = TopExp_Explorer(combined, TopAbs_FACE)
+        while _fx.More():
+            _nf += 1
+            _fx.Next()
+        print(f"  网格线合并: 面数 → {_nf}")
+    except Exception as e:
+        print(f"  [WARN] 网格线合并失败: {e}")
 
     # ---- Fix 1: 坐标归一化 —— 将实体平移到几何中心 ----
     try:

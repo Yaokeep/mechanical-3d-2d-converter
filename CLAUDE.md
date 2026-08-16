@@ -59,6 +59,8 @@ python sw_export_step.py 三维/xxx.SLDPRT [out.step]      # SLDPRT → STEP 基
 python model_to_drawing.py input.step [out.dxf]          # STEP → 三视图 DXF（HLR 投影）
 /c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe dxf_to_3d_general.py out.dxf  # DXF → 重建 STEP
 python compare_models.py 基准.step 重建.step             # 体积/bbox/布尔差定量对比
+python compare_models.py --dz 21.95 基准.step 重建.step  # z 平移对齐（重建系→基准系）
+python compare_models.py --dz 21.95 --split -5,0,56.5 基准.step 重建.step  # 逐段拆分多余/缺失
 # 图纸侧（SW 工程图 → DXF 导出，生成带三视图的正式图纸）:
 python CAD/temp_output/generate_engineering_drawing.py   # SW COM 生成工程图并导出 DXF
 ```
@@ -158,7 +160,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.3（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串与 git 同步：`app.py` = `"0.6.3"`、`main_window.py` 窗口标题 = `"v0.6.3"`、关于对话框 = `"v0.6.3"`：
+版本 v0.6.4（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串与 git 同步：`app.py` = `"0.6.4"`、`main_window.py` 窗口标题 = `"v0.6.4"`、关于对话框 = `"v0.6.4"`：
 
 ### ✅ 已完成实现
 
@@ -189,6 +191,15 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
     - P3.1: top 视图分体（主体圆棱柱 + 环带棱柱 `prisms_flange`）；主体/环带裁剪到锥面顶分界（`_flange_top_from_ring_vertices` 斜线边信号标定）；顶段角凸补丁（环带棱柱 ∩ 顶段 z 盒，z 范围由竖线对两遍扫描推导：主体级上半部段 ylo → 主体段顶、台阶级 r∈[0.75,0.98]×主体半宽 → 台阶段底）
     - P3.2: F 段派生（法兰孔全高段）、r_f 补刀、φ32 材料岛融合、台阶环刀（顶部台阶内收 r[台阶,主体] 环刀，中心用 top 圆 CSG 坐标——v8 曾用 DXF 坐标切空）
     - P3.3: 调试打印全部清理（27 处 [DBG] 系列）；回归套件 6/6 保持
+  - v0.6.4 (P3.4): 用户验收 4 处细节修复 + 锥面过渡裁剪，以 PF60K 法兰盘逐面定量对比为靶子（v9 重建 vs 基准：体积差 −1.05%、多余 721、缺失 3,473、交集 98.7%）：
+    - φ12 键槽孔内键槽切除（front 视图槽壁竖线 + 键槽孔竖线对深度段 → 矩形槽刀，`[P0] 键槽刀` 日志）
+    - 顶段 R40 角弧恢复（top 外环斜线边 `_cone_cands` 信号 → 顶段角凸补丁源改用 16 边实心棱柱含 R40 角弧，修复 45° 斜切角、圆形突起变方形）
+    - φ5.5 顶段孔沉头豁免（P0 顶沉孔段 r∈[0.35,0.95]×环带 r_f 不切，基准顶段孔 z[56.5,66.5] 是贯穿孔非沉头）
+    - 网格线清理（布尔差共面碎片面 → `UnifySameDomain` 合并，面数 1734→73）
+    - 锥面过渡裁剪（front/side 斜线边信号标定 z_cone 区间，`BRepPrimAPI_MakeCone` 圆锥台裁剪方段 R40→主体 r30，`[P3.1] 锥面过渡裁剪` 日志）
+    - 三点过圆 MakeEdge 兼容修复（HLR 顺时针小弧 `end < start` 直接构造产生满圆）
+    - compare_models.py 增加 `--dz` z 平移对齐 / `--split` 逐段拆分（逐 solid 求交 + IsDone/体积上限兜底防 box 泄漏）
+  - 信息论局限（图纸无信息，无法修复，代码注释已说明）：F 段顶 3mm 环（φ42 孔壁竖线被 HLR 消除）；R8 vs R8.5 凹槽半径差（重建按图纸标注 φ17）；φ3.3 沉头锥（沉头外圈 R2.75 与 φ5.5 顶面孔投影完全重合，top 视图无法区分）；φ3.3/φ5.5 孔位 0.1mm 画图精度差（DXF 17.2 → ±24.8 vs 基准 ±24.7）
   - 注：文件内版本字符串仍为 v2.1（docstring/横幅），git 提交口径曾用 v3.x，实际功能以 git log 为准
 - **阶梯轴建模对话框**：`sw_dialog.py`（509 行）— 后台线程建模、进度反馈、参数编辑
 - **数据模型**：`Document`、`ShapeNode`、`ProjectionData` 完整实现
@@ -252,7 +263,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.3`（代码内 `0.6.3`）——提交新版本时务必同步更新这些位置。
+- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.4`（代码内 `0.6.4`）——提交新版本时务必同步更新这些位置。
 - **README.md 路线图已过时**: README 中的开发路线图停留在项目早期规划阶段（v0.3.0~v1.0.0 均标为未完成），实际进度以本文件和 git log 为准。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.step`, `*.stp`, `*.igs`, `*.iges`）和 CAD 软件锁文件。不要将这些文件加入版本控制。
 
