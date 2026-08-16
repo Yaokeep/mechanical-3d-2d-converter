@@ -200,6 +200,13 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
     edges = []
     eid = 0
     entity_counts = {}
+    # v0.6.8: 被跳过的竖线（隐藏线图层）单独收录——PF60K v8 图纸
+    # 的 φ42 孔壁竖线画在"隐藏线"图层（俯视被 r25 孔口台阶遮挡），
+    # 全局跳过会把竖直孔壁几何整体丢失，竖线对配对退化为锥面斜线
+    # 碎段噪声对（φ53 宽），F 段派生/孔限深全部错位。收录仅用于
+    # 竖线对扫描（_vertical_hole_profiles），不进入边图面遍历
+    # （避免 v0.6.3 的可见/隐藏平行重复边 8 字环问题）
+    hidden_vlines = []
 
     # LINE（跳过中心线、构造线等辅助线）
     for e in msp.query("LINE"):
@@ -207,6 +214,11 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
         # 过滤中心线和构造线
         if _is_skip_entity(e, lt):
             entity_counts["LINE_SKIPPED"] = entity_counts.get("LINE_SKIPPED", 0) + 1
+            _x1, _y1 = e.dxf.start.x, e.dxf.start.y
+            _x2, _y2 = e.dxf.end.x, e.dxf.end.y
+            if abs(_x1 - _x2) <= 0.3 and max(_y1, _y2) - min(_y1, _y2) >= 0.5:
+                hidden_vlines.append(
+                    ((_x1 + _x2) / 2, min(_y1, _y2), max(_y1, _y2)))
             continue
         x1, y1 = e.dxf.start.x, e.dxf.start.y
         x2, y2 = e.dxf.end.x, e.dxf.end.y
@@ -388,6 +400,7 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
         "bbox_max": (max(xs) if xs else 0, max(ys) if ys else 0),
         "entity_counts": entity_counts,
         "total_edges": eid,
+        "_hidden_vlines": hidden_vlines,
     }
     return edges, metadata
 
@@ -1874,12 +1887,16 @@ def _is_face_inside(inner_face, outer_face, margin_ratio=0.02):
             inner_face["y_max"] < outer_face["y_max"] - margin)
 
 
-def _vertical_hole_profiles(view, edges):
+def _vertical_hole_profiles(view, edges, hidden_vlines=None):
     """front/side 视图竖线对扫描 → 竖直孔投影列表 [(cx, r, ylo, yhi)]。
 
     竖直孔（轴沿 3D Z）在 front/side 视图的投影是两条竖线 X=cx±r。
     从原始边数据扫描竖线对，Y 范围即孔投影深度范围。
     主体外轮廓竖边（宽度 ≈ 视图宽）被 0.85 阈值排除。
+
+    hidden_vlines: 隐藏线图层竖线 [(x, ymin, ymax), ...]（v0.6.8）——
+    图纸中被遮挡的孔壁竖线（如 φ42 孔壁在俯视方向被 r25 孔口台阶
+    遮挡画为隐藏线），并入竖线收集使孔壁配对完整；不进入边图。
     """
     ofc = view.get("_outer_face") or {}
     vx1, vx2 = ofc.get("x_min"), ofc.get("x_max")
@@ -1906,6 +1923,13 @@ def _vertical_hole_profiles(view, edges):
         if ymax - ymin < 0.5:
             continue
         vlines.setdefault(round(x, 1), []).append((ymin, ymax))
+    # v0.6.8: 隐藏线竖线并入（同上 bbox/长度过滤）
+    for hx, hylo, hyhi in (hidden_vlines or []):
+        if not (vx1 - 1 <= hx <= vx2 + 1):
+            continue
+        if not (vy1 - 1 <= hylo <= vy2 + 1 and vy1 - 1 <= hyhi <= vy2 + 1):
+            continue
+        vlines.setdefault(round(hx, 1), []).append((hylo, hyhi))
 
     # 竖线对匹配
     xs = sorted(vlines)
@@ -2984,7 +3008,7 @@ def _flange_top_from_ring_vertices(views, scale_factor, no_merge_rings, edges):
 
 
 def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
-                    annotations=None):
+                    annotations=None, hidden_vlines=None):
     """CSG 体积求交法：各视图轮廓拉伸为棱柱 → 布尔交集 → 3D 实体。
 
     原理:
@@ -3478,7 +3502,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 if _pys <= 0:
                     continue
                 _pymid = ((_pofc["y_min"] or 0) + (_pofc["y_max"] or 0)) / 2
-                _profs.append((_pymid, _vertical_hole_profiles(_pv, edges)))
+                _profs.append((_pymid, _vertical_hole_profiles(_pv, edges, hidden_vlines)))
             for _pymid, _plist in _profs:
                 for _pcx, _pr, _ylo, _yhi in _plist:
                     # 主体级竖线对（r≈主体半宽，φ60 外轮廓竖线
@@ -3807,10 +3831,17 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         # v0.6.1: front/side 视图竖线对（竖直孔投影）缓存，
         # 用于深度推理（取代依赖 faces 环的旧逻辑）
         profiles_by_view = {}
+        # v0.6.8: 仅可见线竖线对缓存——岛/孔分类信号：可见孔壁
+        # 是真孔开口（front/side 轮廓上可见的腔），仅隐藏线孔壁
+        # 是内部特征（被 HLR 消除轮廓的材料岛，如 PF60K φ32 岛
+        # x=26/58 隐藏竖线）。edges 已过滤隐藏线图层，故不传
+        # hidden_vlines 即得可见-only 列表。
+        profiles_vis_by_view = {}
         applied_cuts = set()  # v0.6.3: 已应用刀具去重键
         for v in views:
             if v["view_type"] != "top":
-                profiles_by_view[id(v)] = _vertical_hole_profiles(v, edges)
+                profiles_by_view[id(v)] = _vertical_hole_profiles(v, edges, hidden_vlines)
+                profiles_vis_by_view[id(v)] = _vertical_hole_profiles(v, edges)
 
         # v0.6.3: top 视图圆列表（孔候选，供 front/side 矩形刀定位——
         # front 投影丢失 Y、side 丢失 X，旧代码把刀固定在 0 轴切错位置）。
@@ -3844,12 +3875,14 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                     ((_cx - _tcx) * scale_factor, (_cy - _tcy) * scale_factor,
                      _e.radius * scale_factor, _cx, _cy))
 
-        def _profile_depths(fi_cx, fi_r):
+        def _profile_depths(fi_cx, fi_r, profs=None):
             """竖线对 → CSG Z 深度段列表 [(z_top, z_bot), ...] 或 []。
 
             v0.6.2: top 视图一个俯视圆可能对应多段同径孔（顶沉孔段
             + 底出口段），旧逻辑只取第一段导致只切一半；现在返回
             全部匹配段（按半径偏差升序），无可靠候选返回 []。
+            profs: v0.6.8 传入 profiles_vis_by_view 时只看可见孔壁
+            （岛/孔分类用），默认 profiles_by_view 含隐藏线（切深用）。
             """
             try:
                 _bb = Bnd_Box()
@@ -3857,6 +3890,8 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 _z1, _z2 = _bb.Get()[2], _bb.Get()[5]
             except Exception:
                 return []
+            if profs is None:
+                profs = profiles_by_view
             cands = []
             for v in views:
                 if v["view_type"] == "top":
@@ -3865,7 +3900,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 y_span = ofc.get("y_max", 0) - ofc.get("y_min", 0)
                 if y_span <= 0:
                     continue
-                for pcx, pr, ylo, yhi in profiles_by_view.get(id(v), []):
+                for pcx, pr, ylo, yhi in profs.get(id(v), []):
                     # v0.6.2: 容差 0.5r → max(1.5, 0.06r)——0.5r 会把
                     # 相邻孔竖线对（φ50 匹配到 φ42/噪声对）混入限深段，
                     # 噪声段乱切导致体积大幅偏低
@@ -4021,6 +4056,19 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                     _z_t = _csg_z1 + (_yhi - _ofc2["y_min"]) / _ys2 * _csg_zspan
                     if 20.0 <= _pr <= 28.0 and _z_b <= _csg_z1 + 1.0:
                         _f_bot = _z_t if _f_bot is None else min(_f_bot, _z_t)
+                    # v0.6.8: F 段顶取大孔段（φ42）段顶——φ42 段底被
+                    # r25 孔垫高不贴主体底（贴底条件只影响 _f_bot），
+                    # 旧逻辑仅小孔段（φ14）参与 _f_top，φ14 孔顶延伸
+                    # 到凸台底把 F 段拉长 2.5mm（基准 φ42 孔只到
+                    # -24.5，多切段把 r16 岛/r21 环带挖空）。半径限定
+                    # |pr-_flange_r|≤2 只取 φ42 本径段：锥面斜线碎段
+                    # 噪声对（pr=26.5 y[2,12.1] 段顶 -38.4）会把 min
+                    # 拉低致 F 段顶错位；段高 >10mm 再排除浅沉孔段
+                    # （φ50 底沉 y[2,7] 高 5mm 段顶 -43.45 与 _f_bot
+                    # 相等会致 F 段派生失败、P3.2 整块跳过）
+                    if (abs(_pr - _flange_r) <= 2.0
+                            and _z_t - _z_b > 10.0):
+                        _f_top = _z_t if _f_top is None else min(_f_top, _z_t)
                     elif 5.0 <= _pr <= 9.5:
                         _f_top = _z_t if _f_top is None else min(_f_top, _z_t)
             if _f_bot is not None and _f_top is not None and _f_top > _f_bot:
@@ -4088,7 +4136,22 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                 break
                         if hit is None:
                             continue
-                        for z_top, z_bot in _profile_depths(fi_cx, fi_w / 2):
+                        _f_depths = list(_profile_depths(fi_cx, fi_w / 2))
+                        # v0.6.8: 凸台段矩形面跳过——匹配到的深度段全
+                        # 是"段底接 F 段顶且段浅(≤6mm)"的段时，该面是
+                        # F 段顶上方凸台的 front/side 投影（如 PF60K
+                        # φ16 凸台），圆柱刀会把凸起挖成孔腔；凸台截
+                        # 形由 P3.5 块统一处理。半径 ≥6 排除键槽面。
+                        _boss_face = (fi_w / 2 >= 6.0
+                                      and bool(_f_depths) and all(
+                            any(_s_bot >= _f_top - 0.5
+                                and _s_top - _s_bot <= 6.0
+                                for _f_top, _f_bot in (_flange_hole_segs
+                                                       or []))
+                            for _s_top, _s_bot in _f_depths))
+                        if _boss_face:
+                            continue
+                        for z_top, z_bot in _f_depths:
                             tools.append(create_cylinder_solid(
                                 hit, r3, z_top - z_bot + 2.0, z_bot - 1.0))
                         # v0.6.3: front/side 矩形面无深度匹配 → 凸台/噪声
@@ -4551,13 +4614,17 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                         inner_cut_count += 1
                         print(f"  [P3.2] r_f 补刀 r={_flange_r:.1f} "
                               f"Z[{_f_bot:.1f}~{_f_top:.1f}]")
-                # a) 岛融合：F 段内竖线对缺失的同心圆是内部材料岛
-                # （真孔在 front/side 均有竖线投影；岛的轮廓是内部
-                # 边界，被 HLR 消除 → 缺失即岛）。岛 = annulus(内孔
-                # →岛圆) × F 段，内孔 = 段与 F 段重叠的最大被切孔
-                # （芯孔 r7）。岛高填到 F 顶（φ42 孔顶~顶盘底间的
-                # 阶梯材料图纸无信息，填满为信息论最优）。
+                # a) 岛融合：F 段内的内部材料岛。分类信号（v0.6.8）：
+                #   可见孔壁与 F 段重叠 → 真孔开口（轮廓上可见的腔）；
+                #   仅隐藏线孔壁与 F 段重叠 → 内部特征材料岛（其轮廓
+                #   被 HLR 消除画为隐藏线，如 PF60K φ32 岛 x=26/58）；
+                #   完全无竖线对 → 岛（原始前提：岛轮廓完全被消除）。
+                #   岛 = annulus(内孔→岛圆) × 岛自身隐藏壁段（岛高由
+                #   图纸直接给出，PF60K 岛段 y[8,25.5] 比 F 段短 0.5，
+                #   避免垫高 0.5mm 假环）；内孔 = 可见壁与岛段重叠的
+                #   最大真孔（芯孔 r7）。
                 _island_r = 0.0
+                _island_seg = None
                 _hole_inner = 0.0
                 for _tx, _ty, _tr, _dx, _dy in top_hole_circles:
                     if abs(_dx - _tcx) > 1.5 or abs(_dy - _tcy) > 1.5:
@@ -4566,28 +4633,44 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                     if not (0.25 * _flange_r <= _r < _flange_r - 0.1):
                         continue
                     _isegs = _profile_depths(_dx, _r)
-                    if not _isegs:
+                    _vsegs = _profile_depths(_dx, _r, profiles_vis_by_view)
+                    _overlap = [s for s in _isegs
+                                if min(s[0], _f_top)
+                                - max(s[1], _f_bot) >= 0.5]
+                    _voverlap = [s for s in _vsegs
+                                 if min(s[0], _f_top)
+                                 - max(s[1], _f_bot) >= 0.5]
+                    if _voverlap:
+                        # 可见孔壁 → 真孔，内孔取最大者（芯孔）
+                        _hole_inner = max(_hole_inner, _r)
+                    elif _overlap:
+                        # 只有隐藏壁 → 内部材料岛，取最大半径圆
+                        # 并记录其隐藏壁段（岛高直接来自图纸）
+                        if _r > _island_r:
+                            _island_r = _r
+                            _island_seg = _overlap[0]
+                    elif not _isegs:
+                        # 完全无竖线对 → 岛（信息论回退）
                         _island_r = max(_island_r, _r)
-                    else:
-                        for _s_top, _s_bot in _isegs:
-                            if (min(_s_top, _f_top)
-                                    - max(_s_bot, _f_bot) >= 0.5):
-                                _hole_inner = max(_hole_inner, _r)
-                                break
                 if _island_r > _hole_inner + 0.5:
+                    _iz_top, _iz_bot = (_island_seg
+                                        if _island_seg is not None
+                                        else (_f_top, _f_bot))
+                    _iz_top = min(_iz_top, _f_top)
+                    _iz_bot = max(_iz_bot, _f_bot)
                     _island = create_concentric_solid(
                         (0.0, 0.0),
                         (_island_r * scale_factor,
                          _hole_inner * scale_factor) if _hole_inner > 0
                         else (_island_r * scale_factor,),
-                        _f_top - _f_bot, _f_bot)
+                        _iz_top - _iz_bot, _iz_bot)
                     if _island is not None:
                         _fo = BRepAlgoAPI_Fuse(combined, _island)
                         if _fo.IsDone():
                             combined = _fo.Shape()
                             print(f"  [P3.2] 岛融合 r[{_hole_inner:.1f},"
                                   f"{_island_r:.1f}] "
-                                  f"Z[{_f_bot:.1f}~{_f_top:.1f}]")
+                                  f"Z[{_iz_bot:.1f}~{_iz_top:.1f}]")
                 # c) 补刀
                 for _r, _segs in _concs:
                     if all(_f_bot - 0.5 <= s[1] and s[0] <= _f_top + 0.5
@@ -4603,6 +4686,14 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                 break
                         if _had:
                             continue
+                        # v0.6.8: 凸起段跳过——段底接 F 段顶且段浅
+                        # (≤6mm) 的段是 F 段顶上方凸台（基准 PF60K
+                        # φ16 凸台 z[-22~-17] 实测为 r8 实心凸起），
+                        # 补刀会把凸起挖成孔腔（伪 r8.5 孔腔）；
+                        # 凸台圆柱截形由 P3.5 块统一处理
+                        if (_s_bot >= _f_top - 0.5
+                                and _s_top - _s_bot <= 6.0):
+                            continue
                         # v0.6.3: 余量只 0.2——段端上下方可能有相邻
                         # 材料（F 段顶材料/主体底），大余量越界假切
                         _tool = create_cylinder_solid(
@@ -4617,13 +4708,17 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             except Exception as _e:
                 print(f"  [WARN] P3.2 孔内材料补全异常: {_e}")
 
-        # ---- v0.6.5: 顶段凸台圆柱截形 ----
-        # 顶段凸台（φ17）在 front/side 棱柱中只有 17 宽矩形投影，
-        # CSG 交集在凸台段产生 17×17 方柱；top 视图 R8.5 圆给出
-        # 圆柱截面。P0 帽判据跳过凸台切割（Cut 会削掉凸起），
-        # 此处改用 Common 把凸台段截成圆柱。凸台段竖线高 0.9mm
-        # 被 _vertical_hole_profiles 段高阈值 1.0 过滤，此处直接
-        # 扫竖线（阈值 0.5）：段顶贴视图顶且段浅（凸台特征）。
+        # ---- v0.6.5: 凸台圆柱截形（顶段 + 底面，v0.6.8 泛化）----
+        # 凸台（顶段 φ17 / 底面 φ16）在 front/side 棱柱中只有矩形
+        # 投影（凸台段竖线高 0.9mm 被 _vertical_hole_profiles 段高
+        # 阈值 1.0 过滤，_profile_depths 无凸台段），CSG 交集在凸
+        # 台段产生方柱；top 视图圆给出圆柱截面。P0 帽判据跳过凸台
+        # 切割（Cut 会削掉凸起），此处直接扫竖线（阈值 0.5）找凸
+        # 台段，用角块盒 ∩ 圆柱外材料把凸台段方角切掉：
+        #   顶段凸台: 段顶贴视图顶且段浅（v0.6.5，PF60K φ17）
+        #   底面凸台: 段底接 F 段顶上方（v0.6.8，PF60K φ16 凸台
+        #             z[-22~-17]，此前 P3.2 补刀把凸台段挖成伪
+        #             r8.5 孔腔）
         # 孔圆排除：段顶贴主体顶且段高 >4（深孔 R6，Common 会把
         # 凸台段切空）或段底贴主体底（贯穿孔）。
         try:
@@ -4633,7 +4728,12 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             _czmin = _zbb2.Get()[2]
             _czhalf = max(_zbb2.Get()[3] - _zbb2.Get()[0],
                           _zbb2.Get()[4] - _zbb2.Get()[1]) / 2
-            _boss_cands = []  # (r_csg, z_bot, cx, cy)
+            # v0.6.8: F 段顶（环带内孔顶）——底面凸台段底判据
+            _boss_f_top = None
+            if _flange_hole_segs:
+                _boss_f_top = max(s[0] for s in _flange_hole_segs)
+            _top_boss_cands = []  # 顶段凸台: (r_csg, z_bot, cx, cy)
+            _bot_boss_cands = []  # 底面凸台: (r_csg, z_bot, z_top, cx, cy)
             for _tx, _ty, _tr, _dx, _dy in top_hole_circles:
                 _r_dxf = _tr / scale_factor
                 if _r_dxf > _czhalf * 0.3:
@@ -4646,6 +4746,11 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                     if _s_bot <= _czmin + 2.0:
                         _is_hole = True
                 if _is_hole:
+                    continue
+                # v0.6.8: 只处理凸台级半径 [6,10]（φ12~φ20）——
+                # 小孔圆（φ3.3/φ5.5）与大圆（φ32 岛/φ42/φ50）
+                # 的竖线对段不可能是凸台段
+                if not (6.0 <= _r_dxf <= 10.0):
                     continue
                 # 凸台段底: 直接扫 front/side 竖线对，段顶贴视图顶
                 # 且段浅（凸台段）——底孔/芯孔段顶不贴顶被排除
@@ -4705,32 +4810,43 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                    and _ib < len(_mg_b)):
                                 _ylo = max(_mg_a[_ia][0], _mg_b[_ib][0])
                                 _yhi = min(_mg_a[_ia][1], _mg_b[_ib][1])
-                                if (_yhi - _ylo >= 0.5
-                                        and _yhi >= _vy2 - 1.5
-                                        and _ylo >= _vy2 - 4.5):
+                                if _yhi - _ylo >= 0.5:
                                     _z_bc = _czmin + (_ylo - _vy1) / _pys * (
                                         _czmax - _czmin)
-                                    if (_z_bot is None
-                                            or _z_bc > _z_bot):
-                                        _z_bot = _z_bc
-                                        # 截形半径用竖线对实测宽
-                                        # （r8/r8.5 邻圆同扫中，DXF
-                                        # 竖线 w=17 才对应凸台）
-                                        _z_r = _w / 2
+                                    _z_tc = _czmin + (_yhi - _vy1) / _pys * (
+                                        _czmax - _czmin)
+                                    # 顶段凸台: 段顶贴视图顶且段浅
+                                    if (_yhi >= _vy2 - 1.5
+                                            and _ylo >= _vy2 - 4.5):
+                                        if (_z_bot is None
+                                                or _z_bc > _z_bot):
+                                            _z_bot = _z_bc
+                                            # 截形半径用竖线对实测宽
+                                            # （r8/r8.5 邻圆同扫中，DXF
+                                            # 竖线 w=17 才对应凸台）
+                                            _z_r = _w / 2
+                                    # v0.6.8: 底面凸台段——段底接
+                                    # F 段顶上方（±1mm 内）且段浅
+                                    # (≤6mm)；段底上限 +5 排除更
+                                    # 高处的台阶/锥面噪声段
+                                    if (_boss_f_top is not None
+                                            and _boss_f_top - 1.0
+                                            <= _z_bc <= _boss_f_top + 5.0
+                                            and _z_tc - _z_bc <= 6.0):
+                                        _bot_boss_cands.append(
+                                            (_w / 2 * scale_factor,
+                                             _z_bc, _z_tc, _tx, _ty))
                                 if _mg_a[_ia][1] < _mg_b[_ib][1]:
                                     _ia += 1
                                 else:
                                     _ib += 1
-                if _z_bot is None:
-                    continue
-                if not (0.3 < _czmax - _z_bot <= 4.0):
-                    continue
-                _boss_cands.append(
-                    (_z_r * scale_factor, _z_bot, _tx, _ty))
-            if _boss_cands:
+                if _z_bot is not None and 0.3 < _czmax - _z_bot <= 4.0:
+                    _top_boss_cands.append(
+                        (_z_r * scale_factor, _z_bot, _tx, _ty))
+            if _top_boss_cands:
                 # 取最小半径圆柱截形（大圆柱截形不消除方角）
-                _boss_cands.sort()
-                _br, _bz, _bx, _by = _boss_cands[0]
+                _top_boss_cands.sort()
+                _br, _bz, _bx, _by = _top_boss_cands[0]
                 # 只切凸台段方形角部: (凸台段∩圆柱) 外材料 = 角块，
                 # 从主体切掉。全程 Common 会把整个主体截成圆柱
                 # （其余段材料全丢）。
@@ -4753,6 +4869,44 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                 print(f"  [P3.5] 凸台圆柱截形 "
                                       f"r={_br / scale_factor:.1f} "
                                       f"Z[{_bz:.1f}~{_czmax:.1f}]")
+            if _bot_boss_cands:
+                # v0.6.8: 段底降序取最贴 F 段顶的凸台段——φ14 芯
+                # 孔上段 (z_bot≈-21.95) 与 φ16 凸台段 (-21.92) 同
+                # 入围时，降序取段底更高者（凸台段）。底面凸台段
+                # 是 CSG 交集方柱（φ16 投影 16×16）+ 锥面过渡裁剪
+                # （P3.4）盘截面叠加：Fuse r8 圆柱补出凸台圆柱后，
+                # 需切除方柱内切方角块（方柱 16×16 内切于圆柱，
+                # 角块 = 盒内圆柱外材料）。角块盒取内切方盒
+                # (bx±br, by±br) 时盘材料全在圆柱内不受损；刀底
+                # 平贴盘面（_bz 不嵌入）——嵌入会堵 φ14 孔口并留
+                # 孔口月牙碎片（实测 +66 体积）；刀顶 +0.75 略高
+                # 过段顶消除 0.1mm 皮
+                _bot_boss_cands.sort(key=lambda _c: -_c[1])
+                _br, _bz, _bt, _bx, _by = _bot_boss_cands[0]
+                _boss = create_cylinder_solid(
+                    (_bx, _by), _br,
+                    _bt - _bz + 0.75, _bz)
+                if _boss is not None:
+                    _fo = BRepAlgoAPI_Fuse(combined, _boss)
+                    if _fo.IsDone():
+                        combined = _fo.Shape()
+                        _sq_box = BRepPrimAPI_MakeBox(
+                            gp_Pnt(_bx - _br, _by - _br, _bz),
+                            gp_Pnt(_bx + _br, _by + _br,
+                                   _bt + 0.75)).Shape()
+                        _seg_op = BRepAlgoAPI_Common(
+                            combined, _sq_box)
+                        if _seg_op.IsDone():
+                            _corner_op = BRepAlgoAPI_Cut(
+                                _seg_op.Shape(), _boss)
+                            if _corner_op.IsDone():
+                                _co2 = BRepAlgoAPI_Cut(
+                                    combined, _corner_op.Shape())
+                                if _co2.IsDone():
+                                    combined = _co2.Shape()
+                                    print(f"  [P3.5] 底面凸台圆柱截形 "
+                                          f"r={_br / scale_factor:.1f} "
+                                          f"Z[{_bz:.1f}~{_bt:.1f}]")
         except Exception as _e:
             print(f"  [WARN] 凸台圆柱截形异常: {_e}")
 
@@ -5023,7 +5177,8 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
         print(f"\n  尝试 CSG 体积求交 ({len(views)} 视图)...")
         body_solid, csg_holes = csg_reconstruct(
             views, edges, edge_vertices, vertex_pos, scale_factor,
-            annotations=annotations)
+            annotations=annotations,
+            hidden_vlines=metadata.get("_hidden_vlines"))
 
     if body_solid is not None:
         is_csg = True

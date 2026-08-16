@@ -42,8 +42,9 @@ for p in [str(PROJECT_ROOT), str(SRC_PATH)]:
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Section
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Pln
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_EDGE
+from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_IN
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
+from OCC.Core.BRepClass3d import BRepClass3d_SolidClassifier
 from OCC.Core.GeomAbs import GeomAbs_Circle, GeomAbs_Line
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
@@ -734,6 +735,27 @@ def _sketch_loop(driver, loop, no_snap=False):
         _draw()
 
 
+def _seg_bottom_in_solid(shape, seg, probe=0.15):
+    """孔段底部下方 0.15mm 处中心点是否在 CSG 实体内。
+
+    用于区分盲孔(孔底在实体内, 微缩防分离)与台阶孔链
+    (孔底下方是空腔, 微超打开孔口)。BRepClass3d_SolidClassifier
+    直接对 3D 实体分类, 不受截面环材料性歧义影响。
+    """
+    loop = seg["loop"]
+    if len(loop) == 1 and loop[0]["type"] == "circle":
+        cx, cy = loop[0]["cx"], loop[0]["cy"]
+    else:
+        pts = [e["p0"] for e in loop if e["type"] != "circle"]
+        if not pts:
+            return False
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+    cls = BRepClass3d_SolidClassifier(shape)
+    cls.Perform(gp_Pnt(cx, cy, seg["z_bot"] - probe), 1e-4)
+    return cls.State() == TopAbs_IN
+
+
 def _build_sw_model(driver, shape, outer_segs, hole_segs, shift):
     """SW 特征建模: 凸台序列自底向上 → 孔切除。返回特征计数统计。
 
@@ -877,16 +899,23 @@ def _build_sw_model(driver, shape, outer_segs, hole_segs, shift):
         # ⚠️ 孔深微缩 0.1mm: SW 实测孔底与特征接触面共面(或微越界)时
         # 会把合并实体切成分离块（顶段 4 孔深 9.1 → 实体 1→2），
         # 微缩使孔底高于接触面规避共面切除。
-        # ⚠️ 通孔(孔底 = 实体底面)不微缩、微超 0.05mm 保证切穿:
-        # 微缩会让通孔底部留 0.1mm 皮，把底面开口(r25 中心孔、
-        # 4 定位角孔)整个封住（实测用户验收: 底面多层圆环台阶
-        # 与定位孔全被封在内部）。贯穿切除 SW 自动截断到实体
-        # 边界，微超不会产生悬空几何。
+        # ⚠️ 孔底开口判据（三种情况）:
+        #   (1) 通孔(孔底 = 实体底面): 微超 0.05mm 切穿 — 微缩会让
+        #       通孔底部留 0.1mm 皮，把底面开口(r25 中心孔、4 定位
+        #       角孔)整个封住。贯穿切除 SW 自动截断到实体边界。
+        #   (2) 台阶孔链(孔底下方是空腔): 微超 0.05mm 打开孔口 —
+        #       r21 孔底落在 r25 孔腔顶台阶面上、孔口朝外，微缩
+        #       会在台阶面上留 0.1mm 皮把下一级圆环结构封住
+        #       （用户验收: "还有一个面封着"）。
+        #   (3) 盲孔(孔底在实体内): 保持微缩防共面分离，皮在
+        #       实体内部不可见。
         zmin_csg = -shift
         if all(s["z_bot"] <= zmin_csg + 0.05 for s in batch):
             cut_depth = depth + 0.05
-        else:
+        elif all(_seg_bottom_in_solid(shape, s) for s in batch):
             cut_depth = depth - 0.1
+        else:
+            cut_depth = depth + 0.05
         if not driver.feature_cut_extrude(
             cut_depth, feat_name=f"CutExtrude{feat_idx}", flip=False
         ):
