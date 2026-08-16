@@ -160,7 +160,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.4（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串与 git 同步：`app.py` = `"0.6.4"`、`main_window.py` 窗口标题 = `"v0.6.4"`、关于对话框 = `"v0.6.4"`：
+版本 v0.6.5（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串与 git 同步：`app.py` = `"0.6.5"`、`main_window.py` 窗口标题 = `"v0.6.5"`、关于对话框 = `"v0.6.5"`：
 
 ### ✅ 已完成实现
 
@@ -199,6 +199,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
     - 锥面过渡裁剪（front/side 斜线边信号标定 z_cone 区间，`BRepPrimAPI_MakeCone` 圆锥台裁剪方段 R40→主体 r30，`[P3.1] 锥面过渡裁剪` 日志）
     - 三点过圆 MakeEdge 兼容修复（HLR 顺时针小弧 `end < start` 直接构造产生满圆）
     - compare_models.py 增加 `--dz` z 平移对齐 / `--split` 逐段拆分（逐 solid 求交 + IsDone/体积上限兜底防 box 泄漏）
+  - v0.6.5 (P3.5): 顶段凸台圆柱截形 — φ17 凸台方形化根因修复。根因：凸台在 front/side 棱柱中只有 17 宽矩形投影（凸台段竖线高 0.9mm < `_vertical_hole_profiles` 段高阈值 1.0 被过滤，`_profile_depths` 无凸台段），CSG 交集产生 17×17 方柱，P0 帽判据只跳过切割（Cut 会削掉凸起）却无截形机制。修复：P3.2 后新增凸台截形块——直接扫 front/side 竖线对（阈值 0.5），段顶贴视图顶且段浅的圆为凸台（深孔 R6 顶贴顶但段深 >4 排除、贯穿孔贴底排除、r8/r8.5 邻圆同扫中截形半径取竖线对实测宽）；只切凸台段方形角部（凸台段盒 ∩ r8.5 圆柱外材料），全程 Common 会把整个主体截成圆柱。定量：凸台段多余 721→0.4，凸台 z[69.5,70.4] 缺失仅 1.8（= 键槽 0.5 深差 4×0.5×0.9）
   - 信息论局限（图纸无信息，无法修复，代码注释已说明）：F 段顶 3mm 环（φ42 孔壁竖线被 HLR 消除）；R8 vs R8.5 凹槽半径差（重建按图纸标注 φ17）；φ3.3 沉头锥（沉头外圈 R2.75 与 φ5.5 顶面孔投影完全重合，top 视图无法区分）；φ3.3/φ5.5 孔位 0.1mm 画图精度差（DXF 17.2 → ±24.8 vs 基准 ±24.7）
   - 注：文件内版本字符串仍为 v2.1（docstring/横幅），git 提交口径曾用 v3.x，实际功能以 git log 为准
 - **阶梯轴建模对话框**：`sw_dialog.py`（509 行）— 后台线程建模、进度反馈、参数编辑
@@ -263,7 +264,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.4`（代码内 `0.6.4`）——提交新版本时务必同步更新这些位置。
+- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.5`（代码内 `0.6.5`）——提交新版本时务必同步更新这些位置。
 - **README.md 路线图已过时**: README 中的开发路线图停留在项目早期规划阶段（v0.3.0~v1.0.0 均标为未完成），实际进度以本文件和 git log 为准。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.step`, `*.stp`, `*.igs`, `*.iges`）和 CAD 软件锁文件。不要将这些文件加入版本控制。
 

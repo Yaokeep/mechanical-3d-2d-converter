@@ -17,7 +17,6 @@
 
 import math
 import sys
-import os
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -4620,6 +4619,145 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                                   f"Z[{_s_bot:.1f}~{_s_top:.1f}]")
             except Exception as _e:
                 print(f"  [WARN] P3.2 孔内材料补全异常: {_e}")
+
+        # ---- v0.6.5: 顶段凸台圆柱截形 ----
+        # 顶段凸台（φ17）在 front/side 棱柱中只有 17 宽矩形投影，
+        # CSG 交集在凸台段产生 17×17 方柱；top 视图 R8.5 圆给出
+        # 圆柱截面。P0 帽判据跳过凸台切割（Cut 会削掉凸起），
+        # 此处改用 Common 把凸台段截成圆柱。凸台段竖线高 0.9mm
+        # 被 _vertical_hole_profiles 段高阈值 1.0 过滤，此处直接
+        # 扫竖线（阈值 0.5）：段顶贴视图顶且段浅（凸台特征）。
+        # 孔圆排除：段顶贴主体顶且段高 >4（深孔 R6，Common 会把
+        # 凸台段切空）或段底贴主体底（贯穿孔）。
+        try:
+            _zbb2 = Bnd_Box()
+            brepbndlib.Add(combined, _zbb2)
+            _czmax = _zbb2.Get()[5]
+            _czmin = _zbb2.Get()[2]
+            _czhalf = max(_zbb2.Get()[3] - _zbb2.Get()[0],
+                          _zbb2.Get()[4] - _zbb2.Get()[1]) / 2
+            _boss_cands = []  # (r_csg, z_bot, cx, cy)
+            for _tx, _ty, _tr, _dx, _dy in top_hole_circles:
+                _r_dxf = _tr / scale_factor
+                if _r_dxf > _czhalf * 0.3:
+                    continue
+                _segs = _profile_depths(_dx, _r_dxf)
+                _is_hole = False
+                for _s_top, _s_bot in _segs:
+                    if _s_top >= _czmax - 1.5 and _s_top - _s_bot > 4.0:
+                        _is_hole = True
+                    if _s_bot <= _czmin + 2.0:
+                        _is_hole = True
+                if _is_hole:
+                    continue
+                # 凸台段底: 直接扫 front/side 竖线对，段顶贴视图顶
+                # 且段浅（凸台段）——底孔/芯孔段顶不贴顶被排除
+                _z_bot = None
+                _tol = max(0.6, 0.06 * _r_dxf)
+                for _pv in views:
+                    if _pv["view_type"] == "top":
+                        continue
+                    _pofc = _pv.get("_outer_face") or {}
+                    _pys = (_pofc.get("y_max", 0) or 0) - (
+                        _pofc.get("y_min", 0) or 0)
+                    if _pys <= 0:
+                        continue
+                    _vx1 = _pofc.get("x_min")
+                    _vx2 = _pofc.get("x_max")
+                    _vy1 = _pofc.get("y_min")
+                    _vy2 = _pofc.get("y_max")
+                    if None in (_vx1, _vx2, _vy1, _vy2):
+                        continue
+                    _body_w = _vx2 - _vx1
+                    _vlines = {}
+                    for _e in edges:
+                        if getattr(_e, "etype", "") != "LINE":
+                            continue
+                        _ex1, _ey1 = _e.start[0], _e.start[1]
+                        _ex2, _ey2 = _e.end[0], _e.end[1]
+                        if abs(_ex1 - _ex2) > 0.3:
+                            continue
+                        _ex = (_ex1 + _ex2) / 2
+                        if not (_vx1 - 1 <= _ex <= _vx2 + 1):
+                            continue
+                        _eymin, _eymax = min(_ey1, _ey2), max(_ey1, _ey2)
+                        if not (_vy1 - 1 <= _eymin
+                                and _eymax <= _vy2 + 1):
+                            continue
+                        if _eymax - _eymin < 0.5:
+                            continue
+                        _vlines.setdefault(round(_ex, 1), []).append(
+                            (_eymin, _eymax))
+                    for _xa, _segs_a in _vlines.items():
+                        for _xb, _segs_b in _vlines.items():
+                            if _xa >= _xb:
+                                continue
+                            _w = _xb - _xa
+                            if _w < 2.0 or _w > _body_w * 0.85:
+                                continue
+                            if abs(_w / 2 - _r_dxf) > _tol:
+                                continue
+                            _vcx = (_xa + _xb) / 2
+                            if abs(_vcx - _dx) > _tol:
+                                continue
+                            # 两竖线各段合并后逐段取交集
+                            _mg_a = sorted(_segs_a)
+                            _mg_b = sorted(_segs_b)
+                            _ia = _ib = 0
+                            while (_ia < len(_mg_a)
+                                   and _ib < len(_mg_b)):
+                                _ylo = max(_mg_a[_ia][0], _mg_b[_ib][0])
+                                _yhi = min(_mg_a[_ia][1], _mg_b[_ib][1])
+                                if (_yhi - _ylo >= 0.5
+                                        and _yhi >= _vy2 - 1.5
+                                        and _ylo >= _vy2 - 4.5):
+                                    _z_bc = _czmin + (_ylo - _vy1) / _pys * (
+                                        _czmax - _czmin)
+                                    if (_z_bot is None
+                                            or _z_bc > _z_bot):
+                                        _z_bot = _z_bc
+                                        # 截形半径用竖线对实测宽
+                                        # （r8/r8.5 邻圆同扫中，DXF
+                                        # 竖线 w=17 才对应凸台）
+                                        _z_r = _w / 2
+                                if _mg_a[_ia][1] < _mg_b[_ib][1]:
+                                    _ia += 1
+                                else:
+                                    _ib += 1
+                if _z_bot is None:
+                    continue
+                if not (0.3 < _czmax - _z_bot <= 4.0):
+                    continue
+                _boss_cands.append(
+                    (_z_r * scale_factor, _z_bot, _tx, _ty))
+            if _boss_cands:
+                # 取最小半径圆柱截形（大圆柱截形不消除方角）
+                _boss_cands.sort()
+                _br, _bz, _bx, _by = _boss_cands[0]
+                # 只切凸台段方形角部: (凸台段∩圆柱) 外材料 = 角块，
+                # 从主体切掉。全程 Common 会把整个主体截成圆柱
+                # （其余段材料全丢）。
+                _boss = create_cylinder_solid(
+                    (_bx, _by), _br,
+                    _czmax - _bz + 1.0, _bz)
+                _boss_box = BRepPrimAPI_MakeBox(
+                    gp_Pnt(-500, -500, _bz),
+                    gp_Pnt(500, 500, _czmax + 1.0)).Shape()
+                if _boss is not None:
+                    _seg_op = BRepAlgoAPI_Common(combined, _boss_box)
+                    if _seg_op.IsDone():
+                        _corner_op = BRepAlgoAPI_Cut(
+                            _seg_op.Shape(), _boss)
+                        if _corner_op.IsDone():
+                            _co2 = BRepAlgoAPI_Cut(
+                                combined, _corner_op.Shape())
+                            if _co2.IsDone():
+                                combined = _co2.Shape()
+                                print(f"  [P3.5] 凸台圆柱截形 "
+                                      f"r={_br / scale_factor:.1f} "
+                                      f"Z[{_bz:.1f}~{_czmax:.1f}]")
+        except Exception as _e:
+            print(f"  [WARN] 凸台圆柱截形异常: {_e}")
 
         # 验证切割后主体是否仍然有效
         if inner_cut_count > 0:
