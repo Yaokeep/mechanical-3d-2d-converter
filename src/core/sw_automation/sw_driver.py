@@ -413,6 +413,43 @@ class SolidWorksDriver:
                 self._to_doc(x2), self._to_doc(y2), self._to_doc(z2),
             )
 
+    def draw_circle(
+        self,
+        cx: float, cy: float, cz: float,
+        radius: float,
+    ) -> None:
+        """在活动草图中绘制圆（圆心 + 半径，mm 坐标自动转文档单位）。
+
+        CreateCircleByRadius 在 SW2025 中未重命名，签名不变。
+        用于孔切除等圆形草图。
+        """
+        if self.sw_sketch_mgr:
+            self.sw_sketch_mgr.CreateCircleByRadius(
+                self._to_doc(cx), self._to_doc(cy), self._to_doc(cz),
+                self._to_doc(radius),
+            )
+
+    def draw_arc(
+        self,
+        cx: float, cy: float, cz: float,
+        x1: float, y1: float, z1: float,
+        x2: float, y2: float, z2: float,
+        clockwise: bool = False,
+    ) -> None:
+        """在活动草图中绘制圆弧（圆心 + 起止点 + 方向，mm 自动转文档单位）。
+
+        SW2025 已重命名 CreateArc3 → CreateArc（与 CreateLine 模式一致）。
+        方向参数: True=顺时针, False=逆时针（默认）。
+        用于 16 边方段角弧等非整圆轮廓。
+        """
+        if self.sw_sketch_mgr:
+            self.sw_sketch_mgr.CreateArc(
+                self._to_doc(cx), self._to_doc(cy), self._to_doc(cz),
+                self._to_doc(x1), self._to_doc(y1), self._to_doc(z1),
+                self._to_doc(x2), self._to_doc(y2), self._to_doc(z2),
+                clockwise,
+            )
+
     # ------------------------------------------------------------------
     # 特征操作
     # ------------------------------------------------------------------
@@ -468,6 +505,66 @@ class SolidWorksDriver:
         except Exception as e:
             logger.error(f"{feat_name}: 旋转特征异常 - {e}")
             raise SwFeatureError(f"旋转特征创建失败: {e}") from e
+
+    def feature_boss_extrude(
+        self,
+        depth_mm: float,
+        feat_name: str = "BossExtrude",
+    ) -> bool:
+        """在当前草图上创建凸台拉伸（FeatureExtrusion2, 23 参数）。
+
+        V45 验证签名（CAD/PostRevolve.bas 键槽补块实战通过）:
+          FeatureExtrusion2(Sd, Flip, Dir, T1, T2, D1, D2,
+            Dchk1, Dchk2, Ddir1, Ddir2, Dang1, Dang2,
+            OffsetReverse1, OffsetReverse2, TranslateSurface1, TranslateSurface2,
+            Merge, UseFeatScope, UseAutoSelect, T0, StartOffset, FlipStartOffset)
+
+        **注意**: 调用前需确保已在目标基准面上打开草图
+        （V45 规则: 草图保持打开状态调用特征方法）。
+
+        Args:
+            depth_mm: 拉伸深度（mm），从草图面沿法向正向。
+            feat_name: 特征名称。
+
+        Returns:
+            bool: 成功返回 True。
+        """
+        depth_m = self.mm_to_m(depth_mm)
+        try:
+            feat = self.sw_feat_mgr.FeatureExtrusion2(
+                True,       # Sd — 单方向
+                False,      # Flip — 不翻转
+                False,      # Dir — 不反向
+                0,          # T1 = swEndCondBlind
+                0,          # T2 (未使用)
+                depth_m,    # D1 — 方向1 拉伸深度 (米)
+                depth_m,    # D2 (未使用)
+                False,      # Dchk1
+                False,      # Dchk2
+                False,      # Ddir1
+                False,      # Ddir2
+                0.0,        # Dang1
+                0.0,        # Dang2
+                False,      # OffsetReverse1
+                False,      # OffsetReverse2
+                False,      # TranslateSurface1
+                False,      # TranslateSurface2
+                True,       # Merge — 与已有实体合并
+                True,       # UseFeatScope
+                True,       # UseAutoSelect
+                0,          # T0 = swStartSketchPlane
+                0.0,        # StartOffset
+                False,      # FlipStartOffset
+            )
+            if feat is None:
+                logger.error(f"{feat_name}: FeatureExtrusion2 返回 None")
+                return False
+            feat.Name = feat_name
+            logger.success(f"  [OK] {feat_name} (深度 {depth_mm}mm)")
+            return True
+        except Exception as e:
+            logger.error(f"{feat_name}: 凸台拉伸异常 - {e}")
+            raise SwFeatureError(f"凸台拉伸创建失败: {e}") from e
 
     def feature_chamfer_edge(
         self,
@@ -605,12 +702,20 @@ class SolidWorksDriver:
         depth_mm: float,
         feat_name: str = "CutExtrude",
         flip: bool = False,
+        auto_select: bool = False,
     ) -> bool:
-        """在当前草图上创建拉伸切除（FeatureCut4, 27 参数 — SW2025）。
+        """在当前草图上创建拉伸切除（FeatureCut3, 26 参数 — V45 验证）。
 
-        SW2025 FeatureCut4 比 VBA FeatureCut3 多 1 个参数 (T0 前置)。
+        ⚠️ SW2025 Python COM 下 FeatureCut4（27 参数, T0 前置假设）
+        返回 None 不可用；必须用与 V45 VBA 验证宏完全一致的
+        FeatureCut3 26 参数签名。
 
         **注意**: 调用前需确保已在正确的基准面上打开草图。
+
+        ⚠️ AutoSelect 必须为 False（实测 SW2025）: True 时 SW 会把
+        **其他草图**上的轮廓也自动选入切除轮廓集（如底段凸台草图的
+        r40 圆 + 当前草图 r25 圆 → 同心双轮廓 → 切成环带），导致
+        切除体积远超预期（法兰孔切除把整个法兰盘切空）。
 
         FeatureCut3 参数顺序 (V45 验证, SW2025):
           Sd, Flip, Dir, T1Both, T1, D1, Dchk1, T2, D2, Dchk2,
@@ -622,16 +727,18 @@ class SolidWorksDriver:
         Args:
             depth_mm: 切除深度（mm）。
             feat_name: 特征名称。
-            flip: 翻转切除侧（为 True 时反向切除）。
+            flip: 翻转切除侧。⚠️ 实测 SW2025: False = 沿草图法向
+                反侧（-Z，向下）切、只切草图轮廓（正确行为）；
+                True 时 SW 会把实体截面轮廓与草图圆组合成异常轮廓
+                （同心圆 → 切环带、包含 → 切截面盘挖孔），勿用。
+            auto_select: 自动选择轮廓（默认 False，只切活动草图轮廓）。
 
         Returns:
             bool: 成功返回 True。
         """
         depth_m = self.mm_to_m(depth_mm)
         try:
-            # SW2025 FeatureCut4: 27 params = T0 + VBA FeatureCut3 26 params
-            feat = self.sw_feat_mgr.FeatureCut4(
-                swStartSketchPlane,  # T0 — 新增参数 (SW2025)
+            feat = self.sw_feat_mgr.FeatureCut3(
                 True,           # Sd — 单方向
                 flip,           # Flip — 翻转切除侧
                 False,          # Dir — 不反向
@@ -640,7 +747,7 @@ class SolidWorksDriver:
                 depth_m,        # D1 — 方向1切除深度 (米)
                 False,          # Dchk1
                 0,              # T2 (未使用)
-                depth_m,        # D2 (未使用)
+                0.0,            # D2 (未使用, V45 验证宏为 0)
                 False,          # Dchk2
                 False,          # Ddir1
                 0.0, 0.0,       # Dval1, Dval2
@@ -654,18 +761,18 @@ class SolidWorksDriver:
                 True,           # Bcont
                 False,          # Boff
                 0.0,            # Offset
-                False,          # Merge
-                False,          # FeatureScope
-                False,          # AutoSelect
+                True,           # Merge — 合并结果（V45 单向切除验证值）
+                True,           # FeatureScope
+                auto_select,    # AutoSelect — 必须 False（见 docstring）
             )
             if feat is None:
-                logger.error(f"{feat_name}: FeatureCut4 返回 None (flip={flip})")
+                logger.error(f"{feat_name}: FeatureCut3 返回 None (flip={flip})")
                 return False
             feat.Name = feat_name
             logger.success(f"  [OK] {feat_name} (深度 {depth_mm}mm)")
             return True
         except Exception as e:
-            logger.error(f"{feat_name}: FeatureCut4 异常 - {e}")
+            logger.error(f"{feat_name}: FeatureCut3 异常 - {e}")
             raise SwFeatureError(f"拉伸切除创建失败: {e}") from e
 
     def feature_cut3_bidir(
