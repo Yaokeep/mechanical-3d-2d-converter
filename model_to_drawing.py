@@ -13,6 +13,7 @@ X 与 top 对齐→front）。
     python model_to_drawing.py input.step [output.dxf]
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -61,19 +62,43 @@ def project_all_views(shape):
 
 
 def _draw_view_elements(msp, view_dict, ox, oy):
-    """绘制一个视图的所有元素（linetype 显式设置）。"""
+    """绘制一个视图的所有元素（linetype 显式设置）。
+
+    circles/hidden_circles 元素为 (cx, cy, r, is_full, angles) 五元组：
+    整圆画 CIRCLE，部分弧按角度段画 ARC（v0.6.3 修复：弧画整圆会
+    放大假轮廓，见 generate_engineering_drawing.py 同函数）。
+
+    线型约定（与 generate_engineering_drawing.py 完全一致）：实体只设
+    layer、不设 linetype 属性（BYLAYER）。显式 "HIDDEN" 会让
+    dxf_to_3d_general 的 CIRCLE 解析命中 SKIP_LINETYPES——该管线的
+    v0.6.3 设计是隐藏层**整圆保留**（孔/台阶圆是 P0 切割刀具来源、
+    外环恢复依据），显式 HIDDEN 会把 16 个隐藏圆全部跳过（实测闭环
+    重建体积 +28.46%、CSG 60×60 丢法兰 φ80 的根因）。
+    """
     for x1, y1, x2, y2 in view_dict["lines"]:
         msp.add_line((x1 + ox, y1 + oy), (x2 + ox, y2 + oy),
-                     dxfattribs={"layer": "可见轮廓", "linetype": "CONTINUOUS"})
-    for cx, cy, r, is_full in view_dict["circles"]:
-        msp.add_circle((cx + ox, cy + oy), r,
-                       dxfattribs={"layer": "可见轮廓", "linetype": "CONTINUOUS"})
+                     dxfattribs={"layer": "可见轮廓"})
+    for cx, cy, r, is_full, angles in view_dict["circles"]:
+        if is_full:
+            msp.add_circle((cx + ox, cy + oy), r,
+                           dxfattribs={"layer": "可见轮廓"})
+        else:
+            for a1, a2 in angles:
+                msp.add_arc((cx + ox, cy + oy), r,
+                            math.degrees(a1), math.degrees(a2),
+                            dxfattribs={"layer": "可见轮廓"})
     for x1, y1, x2, y2 in view_dict["hidden_lines"]:
         msp.add_line((x1 + ox, y1 + oy), (x2 + ox, y2 + oy),
-                     dxfattribs={"layer": "隐藏线", "linetype": "HIDDEN"})
-    for cx, cy, r, is_full in view_dict["hidden_circles"]:
-        msp.add_circle((cx + ox, cy + oy), r,
-                       dxfattribs={"layer": "隐藏线", "linetype": "HIDDEN"})
+                     dxfattribs={"layer": "隐藏线"})
+    for cx, cy, r, is_full, angles in view_dict["hidden_circles"]:
+        if is_full:
+            msp.add_circle((cx + ox, cy + oy), r,
+                           dxfattribs={"layer": "隐藏线"})
+        else:
+            for a1, a2 in angles:
+                msp.add_arc((cx + ox, cy + oy), r,
+                            math.degrees(a1), math.degrees(a2),
+                            dxfattribs={"layer": "隐藏线"})
 
 
 def create_dxf(views, output_path: Path):

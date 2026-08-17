@@ -58,6 +58,10 @@ python generate_sw_macro.py
 python gen_vba_test.py
 python keyway_combine_macro.py
 
+# 调试小工具
+python debug_dxf_views.py CAD/xxx.dxf                          # 按布局区域打印三视图边/圆分布（仅 ezdxf）
+/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe debug_measure_step.py a.step b.step  # STEP 体积/bbox/实体数/面类型（需 OCC）
+
 # ---- 闭环验证链（真实模型 → 图纸 → 重建 → 定量对比） ----
 # 需要 cad-occt 环境；sw_export_step.py 需 SW 2025 COM
 python sw_export_step.py 三维/xxx.SLDPRT [out.step]      # SLDPRT → STEP 基准（SW COM）
@@ -123,13 +127,13 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 根目录独立脚本（不通过 main.py 调用，直接命令行运行）:
   dxf_to_sldprt.py       — DXF 阶梯轴 → SW .sldprt 原生文件（DXF 解析 + SW COM）
-  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，3099 行）
+  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，6057 行）
                            核心链: 边图构建→封闭环检测→视图分离(Y+X 间隙)→CSG 体积求交 / 单视图轮廓拉伸
                            CSG: 各视图外轮廓拉伸为棱柱→布尔交集→内部特征布尔减(P0)→投影验证(P1)
                            →注解驱动分析(P2，中心线对称 + HATCH 剖面验证)，全部自动执行
                            命令行: --single-view 强制轮廓拉伸 / --multi-view 强制包围盒
   convert_dwg_to_3d.py   — DXF → STEP 3D 转换流水线（含 DXF 阶梯轴几何解析 + PythonOCC 建模）
-  dxf_to_sw_features.py  — 通用 DXF 工程图 → SW 原生特征模型（933 行，v0.6.6 新）。复用
+  dxf_to_sw_features.py  — 通用 DXF 工程图 → SW 原生特征模型（1040 行，v0.6.6 新）。复用
                            dxf_to_3d_general 的 CSG 重建结果，z 切片环提取→轨迹跟踪→分段
                            （const/cone/vary）→ SW COM 特征建模（凸台序列自底向上+孔切除+材料岛）。
                            关键修复: 方∩圆法兰轮廓（_normalize_loops 弧端点重合判据，防整圆误合成）、
@@ -172,12 +176,17 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.10（git 最新提交为准；git tag 只到 v0.5.5）。代码内版本字符串与 git 同步：`app.py` = `"0.6.10"`、`main_window.py` 窗口标题 = `"v0.6.10"`、关于对话框 = `"v0.6.10"`：
+版本 v0.6.11（git 最新提交为准；git tag 到 v0.6.11）。代码内版本字符串与 git 同步：`app.py` = `"0.6.11"`、`main_window.py` 窗口标题 = `"v0.6.11"`、关于对话框 = `"v0.6.11"`：
+
+- **v0.6.11**: 闭环验证链两项工具修复（真实 SLDPRT → 图纸 → 重建全链路重跑验收，体积差 −0.08%）
+  - `model_to_drawing.py` 线型 bug：显式 `linetype: "HIDDEN"` 命中 dxf_to_3d_general 的 SKIP_LINETYPES，16 个隐藏层整圆被跳（v0.6.3 设计是隐藏整圆**保留**——孔/台阶圆是 P0 刀具来源、外环恢复依据），闭环重建 +28.46%（CSG 60×60 丢法兰 φ80、P0 仅 9 刀）。修复：实体只设 layer 不设 linetype（BYLAYER），与 generate_engineering_drawing.py 完全一致
+  - `compare_models.py` 重写：实体材料域 bbox（逐层 Common 扫描，绕开 SW 导出零厚度悬挂面片/游离顶点伪影）+ solid×solid 顺序布尔切割（compound 整体作刀具静默失效）+ IsDone 校验/ShapeFix 重试 + `--dz`/`--split` 逐段拆分
+  - `dxf_to_sw_features.py` 横幅版本 v0.1 → 当前版本
 
 ### ✅ 已完成实现
 
 - **GUI 骨架**：菜单栏/工具栏/Dock 面板，2D 视口（QGraphicsView 多视图布局框架），亮色/暗色主题
-- **SolidWorks 2025 COM 集成**：`sw_driver.py`（774 行）— 连接/断开/新建零件/草图/特征/倒角/圆角/键槽/保存，7/7 API 全部调通
+- **SolidWorks 2025 COM 集成**：`sw_driver.py`（888 行）— 连接/断开/新建零件/草图/特征/倒角/圆角/键槽/保存，7/7 API 全部调通
 - **DXF→SW 全流程建模**：`sw_shaft_builder.py`（1063 行）— 所有 6 个特征全部正确创建：
   - 旋转基体 (Revolve-ShaftBody)
   - 端面倒角 (Chamfer-LeftEnd / Chamfer-RightEnd) — 按 DXF 检测尺寸
@@ -185,7 +194,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
   - 键槽切除 (Keyway-N) — Python COM FeatureCut3(26参数)
 - **`dxf_to_sldprt.py`**：完整 — 命令行参数支持、DXF 几何参数自动检测、时间戳输出文件（防 SW 占用）
 - **`convert_dwg_to_3d.py`**：完整 — 使用 PythonOCC 进行 DXF→STEP 3D 实体建模（旋转体 + 键槽布尔减运算），OCC 懒加载设计使 DXF 解析可独立使用
-- **`dxf_to_3d_general.py`**（3099 行）：通用 DXF 工程图 → 3D STEP + SW .sldprt。核心算法链：边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 / 单视图轮廓拉伸。
+- **`dxf_to_3d_general.py`**（6057 行）：通用 DXF 工程图 → 3D STEP + SW .sldprt。核心算法链：边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 / 单视图轮廓拉伸。
   - v0.5.4: CSG 体积求交法 — 多视图外轮廓各自拉伸为棱柱 → 布尔交集 → 3D 实体
   - v0.5.5 (P0): 内部特征关联 — 各视图内部闭环（孔/槽）→ 3D 切割工具 → 布尔减运算
   - v0.5.5 (P1): 投影验证回路 — CSG 主体尺寸与视图期望值自动对比，偏差 >30% 自动缩放修正
@@ -217,7 +226,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
   - v0.6.8: 底面多层圆环台阶伪影根源修复（用户验收：重建模型底面有基准没有的多层圆环台阶）。根因链：① φ42 孔壁竖线画在隐藏线图层被 parse_dxf_edges 过滤 → F 段派生退化为锥面噪声对 → P3.2 整块错误；② 隐藏线并入后岛/孔分类信号反了（r16 材料岛被当孔、r6 φ12 孔被当岛）→ 新增可见壁/隐藏壁分类（可见孔壁竖线对与 F 段重叠=真孔、仅隐藏线壁=内部材料岛、无竖线=信息论回退）；③ 修复 8：P3.5 泛化新增底面凸台圆柱截形（F 段顶上方浅段识别 φ16 凸台 z[-22~-17]，Fuse r8 圆柱 + 内切方角块切除——锥面裁剪后凸台段是完整盘截面，Cut 角块式会删盘 r[8,30] 环带致实体断裂体积 −15.5k）；④ 补刀凸台段跳过（段底接 F 段顶且段浅的段是凸台）；⑤ P0 凸台面跳过。验收：中心链 −42.45 层 [40,21,16,7] 与基准完全一致，体积 261,894 vs 基准 261,935（−0.02%），1 实体，回归套件 6/6
   - v0.6.9: 内侧假材料柱/顶侧环带缺失/凸台孔堵塞三项通用根因修复（用户验收：内侧多余环形纹路 + 一侧环形结构丢失）。① 台阶环刀底余量 1.0→0.1——段底即台阶腔底，段底下方是台阶盘 r[25,40] 环带真材料，越界余量把腔底下方盘环带误切（PF60K 顶段缺失 1,518→153，余 0.05~0.1mm 为竖线对推导精度）；② 环刀芯融合加段底相接判据（芯段底须与刀段底相接 ±0.5）——芯段底明显高于刀段底的是刀内嵌套孔（φ14 孔底 −42.5 vs φ42 刀底 −43.5），旧逻辑融合实心芯柱把孔刀已切的孔填实（假 r7 材料柱，多余实体 V=1851.9），且芯柱位置改用匹配圆真实圆心（半圆刀 bbox 中心偏移 r/2 的错位同步修复）；③ 凸台延续下方同轴孔——P0 帽判据跳过凸台切割后 Fuse 实心圆柱把贯穿凸台的孔堵死（基准凸台是 r[7,8] 环形柱），新增通用规则：同轴孔段顶与凸台段底相接（±1.5）→ 孔延续切穿凸台段；④ 凸台刀顶余量 0.75→0.1——旧余量越界把凸台顶上方主体 r7 材料误切 0.65mm。验收：体积 261,661 vs 基准 261,935（−0.10%，此前 −0.02% 系多余/缺失抵消假象），1 实体，中心链全层 ✓ 或已知信息论差异，回归套件 6/6
   - v0.6.10: 底面沉头孔 + 键槽误检两项通用根因修复（靶子：SW 特征建模 CutExtrude7 FeatureCut3 返回 None 失败 + 重建底面结构与基准薄板实测不符）。① 底面浅段沉头孔化——P3.5 底面块 v0.6.8/v0.6.9 按凸台处理（Fuse r8 圆柱 + 内切方角块切除 + 芯孔切穿凸台）产生 r[7,8] 环形柱 + 16×16 方井，体积与基准仅差 16mm³ 骗过体积验收，但结构错误（基准逐 2mm 薄板 π(30²−8²)·2=5,253.6 精确吻合，为 φ16 沉头孔 z[0~5] 非凸台）且 SW 特征建模 8 边混合环草图开环拉伸失败；通用规则：F 段顶上方浅段 = 同轴孔沉头——半径取竖线对实测宽（r8.5 邻圆误匹配候选同段去重取小半径排除），直接切孔，沉头段底与下方同轴孔段顶相接（±1.5）时刀底取孔段顶（台阶面共面）；② 键槽检测槽壁竖线必须与孔壁竖线 y 范围重叠（`_detect_keyway` 内部判据）——同轴远处孔的键槽槽壁投影（顶段 φ12 键槽孔槽壁 x=±2）会被底部 φ14 孔误拾成键槽（基准 z[-2,0] 薄板 5,347 = π(30²−7²)·2 精确整圆无键槽），槽刀顶 z_top+1 越界伸入沉头段 1mm 产生 5 边槽口混合环伪影。验收：CSG 逐 2mm 薄板与基准全段吻合，体积 261,726 vs 基准 261,935（−0.08%）；SW 特征模型 18 特征全部创建成功（CutExtrude7 修复），体积 261,875 vs 基准 261,935（−0.02%）；回归套件 6/6。已知残留：顶段角凸 16 边棱柱近似差 −156（基准 z[66,68] 板 4,444 vs CSG 4,288，16 边多边形 vs R40 真弧系统差）
-- **`dxf_to_sw_features.py`**（933 行）：DXF 工程图 → SW 原生特征模型（可编辑特征树：Boss-Extrude/Cut-Extrude/Revolve）。核心链：复用 `dxf_to_3d_general.convert_dxf_to_3d` CSG 重建 → z 切片环提取（圆/线/弧分类）→ 环轨迹跟踪分段 → 段分类（const 拉伸 / cone 旋转 / vary 细分）→ SW COM 特征建模（凸台序列自底向上 + 孔切除 + 材料岛 + 锥面旋转凸台）。验收（PF60K 法兰盘，18 特征）：体积 259,284 vs CSG 259,123（+0.06%）/ SW 基准 261,935（-1.01%）
+- **`dxf_to_sw_features.py`**（1040 行）：DXF 工程图 → SW 原生特征模型（可编辑特征树：Boss-Extrude/Cut-Extrude/Revolve）。核心链：复用 `dxf_to_3d_general.convert_dxf_to_3d` CSG 重建 → z 切片环提取（圆/线/弧分类）→ 环轨迹跟踪分段 → 段分类（const 拉伸 / cone 旋转 / vary 细分）→ SW COM 特征建模（凸台序列自底向上 + 孔切除 + 材料岛 + 锥面旋转凸台）。验收（PF60K 法兰盘，18 特征）：体积 261,875 vs CSG 261,726（+0.06%）/ SW 基准 261,935（-0.02%）
   - v0.6.6: 方∩圆法兰轮廓修复 — `_normalize_loops` 整圆合成增加弧端点几何重合判据（原先仅角度区间连续性，方∩圆 4 弧被直线隔开、角度伪连续 → 误合成整圆 → SW 拉伸纯圆多出 4 弓形角，体积偏差 +44,803 主因）；φ12 孔与键槽相交混合环签名断段（原中心+半径匹配把混合环并入键槽矩形轨迹，φ12 孔漏切 -3,269）；凹口外环段（键槽切穿凸台）整圆简化 + 对应 cut 段深度延长补切（混合环线-弧 0.2mm 组装间隙致 SW 草图开环拉伸失败）
   - v0.6.7: 通孔切穿修复 — 孔切除统一 `depth-0.1` 微缩会让通孔（孔底=实体底面）留 0.1mm 皮，把底面开口（r25 中心孔 + 4 定位角孔）整个封住（用户验收：另一面多层圆环台阶与定位孔藏在内部）；改为通孔 `depth+0.05` 微超切穿（贯穿切除 SW 自动截断到实体边界），盲孔保持微缩。底面逐层截面与 CSG 基准完全一致。配套：`sw_driver.rebuild()` 增加 ForceRebuild3(True) 二次重建 — SW2025 惰性重建下仅 False 一次后立即 SaveAs3 导出 STEP 只输出草图几何（6.8KB 草图盘，模型看似被切空），双重建后导出完整实体
   - SetAddToDB 行为限制（实测 SW2025）：孔切除草图用 `_sketch_loop(no_snap=True)`（SetAddToDB 绕过草图推理捕捉，键槽矩形角部距截面圆边 0.04mm 会被吸附畸变致 FeatureCut3 None）；**boss 草图必须 no_snap=False**（SetAddToDB 模式线端点不自动合并，多线环开环拉伸失败，八边环实测）
@@ -240,7 +249,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 | 文件 | 行数 | 职责 |
 |------|------|------|
 | `sw_constants.py` | 39 | SW 2025 API 枚举常量（经验证的晚期绑定值），来源：`CAD/SW2025_API_REFERENCE.md` |
-| `sw_driver.py` | 774 | COM 驱动封装 — 连接/断开/新建零件/草图/特征/倒角/圆角/键槽/保存 |
+| `sw_driver.py` | 888 | COM 驱动封装 — 连接/断开/新建零件/草图/特征/倒角/圆角/键槽/保存 |
 | `sw_shaft_builder.py` | 1063 | 阶梯轴参数化建模 — 旋转基体 → VBScript（倒角+圆角）→ Python COM 键槽 |
 
 **SW 模块依赖**: `pywin32>=306` (Windows only)，通过 `win32com.client.Dispatch("SldWorks.Application")` 晚期绑定驱动 SW 2025。
@@ -283,7 +292,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.10`（代码内 `0.6.10`）——提交新版本时务必同步更新这些位置。
+- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.11`（代码内 `0.6.11`）——提交新版本时务必同步更新这些位置。
 - **README.md 路线图**: v0.6.5 梳理时已与实际进度对齐（标记已完成版本并指向 CLAUDE.md），后续新增功能时同步更新。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
 
