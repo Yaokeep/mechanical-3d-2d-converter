@@ -312,3 +312,4 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - **Co-Authored-By**: 每次 commit 末尾添加 `Co-Authored-By: Claude <noreply@anthropic.com>`
 - **自动推送**: 每次本地 commit 后自动 `git push`（用户偏好设置）
 - **每次建模使用新文件名**: SW 模型不能覆盖已有文件（防止 SW 进程占用导致保存失败），使用时间戳确保文件名唯一
+- **SW 建模后关闭文档**: 每次 SW COM 建模/导出完成后必须关闭旧模型文档（`CloseDoc`）再断开——SW 进程内模型堆积过多会导致 SolidWorks 崩溃。已实现：`sw_driver.py` 的 `disconnect()` 自动先关活动文档（覆盖 dxf_to_3d_general / dxf_to_sw_features / dxf_to_sldprt / GUI）；`sw2025_create_shaft.py` 独立封装同样处理；`sw_export_step.py` 已有 CloseDoc。新增 SW 脚本时收尾必须带文档关闭

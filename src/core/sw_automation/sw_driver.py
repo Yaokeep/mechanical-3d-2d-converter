@@ -148,7 +148,20 @@ class SolidWorksDriver:
         return True
 
     def disconnect(self) -> None:
-        """断开 COM 连接，释放引用。"""
+        """断开 COM 连接，释放引用。
+
+        先关闭活动文档（防 SW 进程内模型堆积导致崩溃）——
+        每次建模/导出完成后调用本方法即自动清理旧模型。
+        """
+        if self.sw_app is not None:
+            try:
+                doc = self.sw_app.ActiveDoc
+                if doc is not None:
+                    title = doc.GetTitle
+                    self.sw_app.CloseDoc(title)
+                    logger.info(f"已关闭 SW 活动文档: {title}")
+            except Exception as e:
+                logger.warning(f"关闭 SW 活动文档异常: {e}")
         self.sw_model = None
         self.sw_part = None
         self.sw_feat_mgr = None

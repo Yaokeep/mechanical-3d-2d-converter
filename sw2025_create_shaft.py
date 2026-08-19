@@ -108,7 +108,16 @@ class SolidWorksDriver:
         return True
 
     def disconnect(self):
-        """断开 COM 连接。"""
+        """断开 COM 连接（先关闭活动文档，防 SW 模型堆积崩溃）。"""
+        if self.sw_app is not None:
+            try:
+                doc = self.sw_app.ActiveDoc
+                if doc is not None:
+                    title = doc.GetTitle
+                    self.sw_app.CloseDoc(title)
+                    print(f"已关闭 SW 活动文档: {title}")
+            except Exception as e:
+                print(f"[WARN] 关闭 SW 活动文档异常: {e}")
         self.sw_model = None
         self.sw_part = None
         self.sw_app = None
