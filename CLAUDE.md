@@ -178,8 +178,9 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.12（git 最新提交为准；git tag 到 v0.6.12）。代码内版本字符串与 git 同步：`app.py` = `"0.6.12"`、`main_window.py` 窗口标题 = `"v0.6.12"`、关于对话框 = `"v0.6.12"`：
+版本 v0.6.13（git 最新提交为准；git tag 到 v0.6.13）。代码内版本字符串与 git 同步：`app.py` = `"0.6.13"`、`main_window.py` 窗口标题 = `"v0.6.13"`、关于对话框 = `"v0.6.13"`：
 
+- **v0.6.13**: 隐藏整圆按线型跳过的通用缺陷修复（用户验收：20260817 第一版 PF60K 图纸重建 60×60 丢法兰、体积 +28.5%，与基准差别太大）。根因：v0.6.3 设计注释明确"隐藏整圆**保留**"（孔/台阶圆是 P0 刀具来源、外环恢复依据），实现却按 SKIP_LINETYPES 跳过显式 HIDDEN 线型的圆（含编辑事故死代码）；v0.6.11 只修了图纸生成侧（model_to_drawing 不再写显式 HIDDEN），解析侧未修——旧图纸 24 个圆中 16 个 HIDDEN（含 r30 主体外圆）被跳 → CSG 60×60。修复：CIRCLE 只按图层关键词跳过（中心线/构造层等），不再看线型——解析器宽容生成器差异，不依赖图纸版本。验证：20260817 旧图纸 336,480 → 262,441.55（bbox 80×80 恢复，与 v2 修复后图纸重建**逐位一致**）；bracket +1968.67 vs 基线 +1968.59 零回归；reducer 正常；回归套件 6/6
 - **v0.6.12**: bracket angker 闭环验证驱动的棱柱居中量可信度门控修复（两回归修复）——bracket 迭代（`三维/bracket angker.stp` → 三视图 DXF → CSG 重建 → compare_models）期间居中量从"棱柱自身 bbox X 中心"改为"视图分离区域 bbox X 中心"引入两个回归（HEAD 1bee763 两用例均 PASS）：
   - **回归① block_3view FAIL**（体积 125,363 vs 黄金 167,196.20、X=77.5 vs 100）：`_separate_views_2d` 的 X 聚类阈值 `max(30, 宽×0.2)` 不拆分同 Y 层的 front/side（间隙 15<30）→ front 区域被 side 污染 X[0~145]、中心 72.5 ≠ 环中心 50 → 棱柱位移 −22.5
   - **回归② 图形练习 0 实体崩溃**：side 外轮廓是三角形（`_extract_rings_impl` len(vs)<4 跳过）走 bbox 回退分支；side 变换把 DXF X 映射到 3D Y、3D X 是拉伸轴，区域 X 中心沿拉伸轴平移 → 棱柱 x[−2415,−2107] → 三棱柱不相交 → `_common_chain` 只查 IsDone 不查空 → 0 实体 STEP → analyze_step TypeError
@@ -301,7 +302,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.12`（代码内 `0.6.12`）——提交新版本时务必同步更新这些位置。此外转换器脚本横幅（`dxf_to_3d_general.py` docstring/结尾 print、`dxf_to_sw_features.py` docstring/横幅 print）也含版本字符串。
+- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.13`（代码内 `0.6.13`）——提交新版本时务必同步更新这些位置。此外转换器脚本横幅（`dxf_to_3d_general.py` docstring/结尾 print、`dxf_to_sw_features.py` docstring/横幅 print）也含版本字符串。
 - **README.md 路线图**: v0.6.5 梳理时已与实际进度对齐（标记已完成版本并指向 CLAUDE.md），后续新增功能时同步更新。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
 

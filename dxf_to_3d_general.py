@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.12
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.13
 
 核心算法链（详见 CLAUDE.md「dxf_to_3d_general.py」条目）:
   边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 /
@@ -268,17 +268,19 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
     # (2) 内部孔/台阶圆（r25/r8.5/r1.6 等）是 P0 布尔减的刀具
     #     来源，必须保留。隐藏整圆不与可见线重合（不同几何），
     #     不会引入平行重复边问题。
+    # v0.6.13: 只按图层关键词跳过（中心线/构造层等），不再按
+    # 线型跳过——v0.6.11 前的 model_to_drawing 会写显式 HIDDEN
+    # 线型（20260817 第一版 DXF 16/24 个圆为 HIDDEN，含 r30 主体
+    # 外圆），按线型跳过致 φ80 法兰/外环丢失、CSG 60×60（+28.5%）。
+    # 图纸生成侧已修（v0.6.11），解析侧同按 v0.6.3 设计宽容处理，
+    # 旧图纸重建结果与修复后图纸逐位一致。
     for e in msp.query("CIRCLE"):
-        lt = _linetype_of(e, doc)
         try:
             layer = (e.dxf.layer or "").upper()
         except Exception:
             layer = ""
-        if lt in SKIP_LINETYPES or any(
-                k in layer for k in ("中心", "构造", "剖面", "标注",
-                                     "文字", "CENTER", "CONSTRUCTION")):
-            entity_counts["CIRCLE_SKIPPED"] = entity_counts.get("CIRCLE_SKIPPED", 0) + 1
-            continue
+        if any(k in layer for k in ("中心", "构造", "剖面", "标注",
+                                    "文字", "CENTER", "CONSTRUCTION")):
             entity_counts["CIRCLE_SKIPPED"] = entity_counts.get("CIRCLE_SKIPPED", 0) + 1
             continue
         cx, cy = e.dxf.center.x, e.dxf.center.y
@@ -7629,7 +7631,7 @@ def main():
         output_sldprt = str(input_dir / f"{input_stem}_{ts}.sldprt")
 
     print("=" * 60)
-    print("通用 DXF → 3D SolidWorks 转换器 v0.6.12")
+    print("通用 DXF → 3D SolidWorks 转换器 v0.6.13")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  STEP: {step_path}")
