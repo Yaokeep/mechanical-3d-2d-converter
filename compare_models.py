@@ -166,14 +166,20 @@ def _bool_shape(a, b, cut, label):
 
 
 def main() -> int:
-    # 参数: [--dz <毫米>] [--split <z1,z2,...>] 基准.step 重建.step
+    # 参数: [--dz <毫米>] [--dx <毫米>] [--dy <毫米>] [--split <z1,z2,...>] 基准.step 重建.step
     args = sys.argv[1:]
     dz = 0.0
+    dx = 0.0
+    dy = 0.0
     split_zs = None
     while args and args[0].startswith("--"):
         flag = args.pop(0)
         if flag == "--dz":
             dz = float(args.pop(0))
+        elif flag == "--dx":
+            dx = float(args.pop(0))
+        elif flag == "--dy":
+            dy = float(args.pop(0))
         elif flag == "--split":
             split_zs = [float(v) for v in args.pop(0).split(",")]
         else:
@@ -189,7 +195,7 @@ def main() -> int:
     rv, rb, rraw, rn = _measure(recon)
     print(f"基准 {args[0]}:")
     print(f"  体积={bv:.2f} bbox={_bbox_str(bb)} 实体={bn}")
-    print(f"重建 {args[1]} (z 平移 {dz:+.2f} 对齐):")
+    print(f"重建 {args[1]} (平移 dx={dx:+.2f} dy={dy:+.2f} dz={dz:+.2f} 对齐):")
     print(f"  体积={rv:.2f} bbox={_bbox_str(rb)} 实体={rn}")
     for name, mat, raw in (("基准", bb, braw), ("重建", rb, rraw)):
         if mat is not None and raw is not None:
@@ -204,7 +210,7 @@ def main() -> int:
     from OCC.Core.TopLoc import TopLoc_Location
 
     trsf = gp_Trsf()
-    trsf.SetTranslation(gp_Vec(0, 0, dz))
+    trsf.SetTranslation(gp_Vec(dx, dy, dz))
     recon_t = recon.Moved(TopLoc_Location(trsf))
 
     # 布尔差（逐 solid + IsDone 校验；零厚度伪影不贡献体积，无需预清理）

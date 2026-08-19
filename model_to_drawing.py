@@ -33,8 +33,12 @@ from generate_engineering_drawing import (  # noqa: E402
 
 from OCC.Core.STEPControl import STEPControl_Reader  # noqa: E402
 
-# 视图间隙（必须 > 分离算法的 X/Y 间隙阈值: max(30, 层宽20%)）
-VIEW_GAP = 50.0
+# 视图间隙（必须 > 分离算法的 X/Y 间隙阈值: max(30, Y簇宽×20%)）。
+# 固定 50 在宽图上不够: bracket 图 front+side 簇宽 308 → 阈值 61.6 > 50
+# → side 被并入 front（实测重建 X=51 vs 期望 184）。按 front 宽度 35%
+# 动态取: 间隙 G 需 > (W_front+W_side+G)×0.20 → G > 0.25×(W_front+W_side)，
+# 取 0.35×W_front 留余量，最小 50。
+VIEW_GAP_MIN = 50.0
 
 
 def load_step(step_path: Path):
@@ -121,12 +125,13 @@ def create_dxf(views, output_path: Path):
     f_bb = _bbox_all(views["front"])
     t_bb = _bbox_all(views["top"])
     s_bb = _bbox_all(views["side"])
+    gap = max(VIEW_GAP_MIN, (f_bb[2] - f_bb[0]) * 0.35)
 
     # 第三角布局: front@(0,0), top 在上, side 在右
     FX, FY = 0.0, 0.0
     TX = FX + (f_bb[2] - f_bb[0] - (t_bb[2] - t_bb[0])) / 2
-    TY = FY + (f_bb[3] - f_bb[1]) + VIEW_GAP
-    RX = FX + (f_bb[2] - f_bb[0]) + VIEW_GAP
+    TY = FY + (f_bb[3] - f_bb[1]) + gap
+    RX = FX + (f_bb[2] - f_bb[0]) + gap
     RY = FY + (f_bb[3] - f_bb[1] - (s_bb[3] - s_bb[1])) / 2
 
     def _off(bb, vx, vy):

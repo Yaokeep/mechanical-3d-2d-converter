@@ -84,7 +84,7 @@ python main.py
 
 ## 开发路线图
 
-当前版本 **v0.6.5**（详细进度以 `CLAUDE.md` 和 git log 为准）：
+当前版本 **v0.6.12**（详细进度以 `CLAUDE.md` 和 git log 为准）：
 
 - [x] v0.1.0 — 项目脚手架（目录结构、GUI 骨架）
 - [x] v0.2.0~v0.5.9 — SolidWorks COM 自动化、DXF→SW 全流程建模、
@@ -93,6 +93,10 @@ python main.py
 - [x] v0.6.0~v0.6.5 — P3 复杂图纸健壮性（reducer 263 边靶子）与
       闭环验证链驱动的精度修复（PF60K 法兰盘体积偏差 10,355 → 2,812，
       凸台/键槽/安装孔/锥面过渡逐一还原，回归套件 6/6）
+- [x] v0.6.6~v0.6.12 — SW 原生特征模型（`dxf_to_sw_features.py`，18 特征
+      全成）与闭环验证链工具修复（`model_to_drawing` 线型 bug、
+      `compare_models` 重写），PF60K 体积偏差收敛至 <0.1%；bracket angker
+      闭环验证驱动的棱柱居中量可信度门控（v0.6.12）
 - [ ] GUI 内 PythonOCC 集成 — `src/gui/view3d`、`projection`、
       `reconstruction` 模块骨架已就绪，待接入（核心算法已在根目录
       独立脚本 `dxf_to_3d_general.py` 等中完整实现）

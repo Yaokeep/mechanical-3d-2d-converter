@@ -61,6 +61,8 @@ python keyway_combine_macro.py
 # 调试小工具
 python debug_dxf_views.py CAD/xxx.dxf                          # 按布局区域打印三视图边/圆分布（仅 ezdxf）
 /c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe debug_measure_step.py a.step b.step  # STEP 体积/bbox/实体数/面类型（需 OCC）
+# 注：根目录另有针对特定靶子模型的一次性 debug_*.py（如 debug_top_*.py / debug_bracket_*.py），
+# 不入库（untracked），调试完即弃；正式修复应落在 dxf_to_3d_general.py 等主脚本
 
 # ---- 闭环验证链（真实模型 → 图纸 → 重建 → 定量对比） ----
 # 需要 cad-occt 环境；sw_export_step.py 需 SW 2025 COM
@@ -127,7 +129,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 根目录独立脚本（不通过 main.py 调用，直接命令行运行）:
   dxf_to_sldprt.py       — DXF 阶梯轴 → SW .sldprt 原生文件（DXF 解析 + SW COM）
-  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，6057 行）
+  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，7664 行）
                            核心链: 边图构建→封闭环检测→视图分离(Y+X 间隙)→CSG 体积求交 / 单视图轮廓拉伸
                            CSG: 各视图外轮廓拉伸为棱柱→布尔交集→内部特征布尔减(P0)→投影验证(P1)
                            →注解驱动分析(P2，中心线对称 + HATCH 剖面验证)，全部自动执行
@@ -152,9 +154,9 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 |------|------|
 | `.claude/` | `settings.local.json` — 预授权的 Bash 权限列表；`skills/` — 项目级启用的技能符号链接 |
 | `.agents/skills/` | 4 个技能：`mechanical-engineer`、`solidworks-cad`（泵叶轮参数化）、`python-code-review`（含 5 个参考文件）、`python-packaging`；仅前两个经符号链接在项目级启用。根目录 `skills-lock.json` 锁定 `mechanical-engineer` 来源 |
-| `CAD/` | 52 个 VBA 宏（含 VerifySW2025_v33~v45 验证系列）、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`）、`temp_output/` 闭环验证链工作区（三视图 DXF 迭代样本、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例、`verify_log/` 宏迭代历史 |
+| `CAD/` | 52 个 VBA 宏（含 VerifySW2025_v33~v45 验证系列）、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`）、`temp_output/` 闭环验证链工作区（三视图 DXF 迭代样本——含 `bracket_angker_三视图*.dxf`、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf` 等新靶子、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例、`verify_log/` 宏迭代历史 |
 | `PDF/` | 空目录（预留放参考 PDF 文档） |
-| `三维/` | 参考 SLDPRT 模型（`麒浚传动_PF60K-14-50-70-M4-L2-12.SLDPRT`，gitignored） |
+| `三维/` | 闭环验证参考模型（gitignored）：`麒浚传动_PF60K-14-50-70-M4-L2-12.SLDPRT`、`bracket angker.stp`、`spoon.SLDPRT` / `spoon.STEP`、`勺子/`（勺子参考图 + STEP/STL 副本） |
 | `soldwork/` | SW VBA 宏工作区（`.swp` 工程文件 + `.bas` 测试宏） |
 | `tools/libredwg/` | LibreDWG Windows 完整发行版 — `dwg2dxf.exe` 等命令行工具 + Python 绑定；`dxf_to_3d_general.py` 遇 .dwg 输入时自动调用转换 |
 
@@ -176,8 +178,14 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.11（git 最新提交为准；git tag 到 v0.6.11）。代码内版本字符串与 git 同步：`app.py` = `"0.6.11"`、`main_window.py` 窗口标题 = `"v0.6.11"`、关于对话框 = `"v0.6.11"`：
+版本 v0.6.12（git 最新提交为准；git tag 到 v0.6.12）。代码内版本字符串与 git 同步：`app.py` = `"0.6.12"`、`main_window.py` 窗口标题 = `"v0.6.12"`、关于对话框 = `"v0.6.12"`：
 
+- **v0.6.12**: bracket angker 闭环验证驱动的棱柱居中量可信度门控修复（两回归修复）——bracket 迭代（`三维/bracket angker.stp` → 三视图 DXF → CSG 重建 → compare_models）期间居中量从"棱柱自身 bbox X 中心"改为"视图分离区域 bbox X 中心"引入两个回归（HEAD 1bee763 两用例均 PASS）：
+  - **回归① block_3view FAIL**（体积 125,363 vs 黄金 167,196.20、X=77.5 vs 100）：`_separate_views_2d` 的 X 聚类阈值 `max(30, 宽×0.2)` 不拆分同 Y 层的 front/side（间隙 15<30）→ front 区域被 side 污染 X[0~145]、中心 72.5 ≠ 环中心 50 → 棱柱位移 −22.5
+  - **回归② 图形练习 0 实体崩溃**：side 外轮廓是三角形（`_extract_rings_impl` len(vs)<4 跳过）走 bbox 回退分支；side 变换把 DXF X 映射到 3D Y、3D X 是拉伸轴，区域 X 中心沿拉伸轴平移 → 棱柱 x[−2415,−2107] → 三棱柱不相交 → `_common_chain` 只查 IsDone 不查空 → 0 实体 STEP → analyze_step TypeError
+  - **修复**：① `outer_trusted` 可信度标志（5 个面选择决策点捕获：环路径/面路径覆盖 ≥50% 校验通过才可信，bbox 回退/front 跨越裁剪/晚期回退均不可信）；② front/top 共享轴同伴一致门控 `_use_own_cx`（面 X 中心与同伴视图区域 X 中心差 ≤3mm 用自身中心——区分"外环残缺"（bracket top 缺叉臂，面中心 125.5 ≠ 同伴区域 103.65 → 区域中心）与"区域污染"（block front 面中心 50 = 同伴区域 50 → 自身中心））；③ side 恒用自身中心（拉伸轴对区域中心无意义）；④ `_common_chain` 空形状加固（TopExp_Explorer 查 SOLID，空则 WARN + 放弃求交走回退链）
+  - **验证**：block_3view 167,196.17 / 图形练习 72,000.00（bbox 全部精确、实体=1）；bracket compare +1968.67 vs 基线 +1968.59（零回归，需 `CSG_WELD=1` 与基线同环境——两遍环提取焊接 HLR 碎段，top 环从 78% 残缺升级为完整环）；PF60K 三视图 DXF 重建 336,480.12 与 HEAD 逐位一致（该 DXF 与基线验收 −0.08% 所用 v2 图纸不一致，属图纸版本遗留，非代码改动）；回归套件 6/6
+  - **同期并入的 bracket 迭代机制**（工作区累积，详见代码注释）：台阶收腰刀、矩形内腔刀（front 隐藏竖线长带对 + top 隐藏水平线对联合证据）、隐藏水平线收录、CSG_WELD 微边链端点焊接、top x 镜像检测、自交环淘汰、P2 圆心所属视图判定（top>front>side，side 圆跳过）、外轮廓圆剔除圆心位置匹配、凸台条带补丁（后期 Fuse）；`model_to_drawing.py` 视图间隙动态化（固定 50 在宽图上不够——bracket front+side 簇宽 308 → 阈值 61.6 致 side 并入 front，改 gap = max(50, front 宽×0.35)）；`compare_models.py` 增加 `--dx`/`--dy` 平移对齐。已知残留：bracket 净差 +1968.59（多余 3308/缺失 1339，凸台 z[22,24] 两侧槽无信号等，信息论局限注释在代码中）
 - **v0.6.11**: 闭环验证链两项工具修复（真实 SLDPRT → 图纸 → 重建全链路重跑验收，体积差 −0.08%）
   - `model_to_drawing.py` 线型 bug：显式 `linetype: "HIDDEN"` 命中 dxf_to_3d_general 的 SKIP_LINETYPES，16 个隐藏层整圆被跳（v0.6.3 设计是隐藏整圆**保留**——孔/台阶圆是 P0 刀具来源、外环恢复依据），闭环重建 +28.46%（CSG 60×60 丢法兰 φ80、P0 仅 9 刀）。修复：实体只设 layer 不设 linetype（BYLAYER），与 generate_engineering_drawing.py 完全一致
   - `compare_models.py` 重写：实体材料域 bbox（逐层 Common 扫描，绕开 SW 导出零厚度悬挂面片/游离顶点伪影）+ solid×solid 顺序布尔切割（compound 整体作刀具静默失效）+ IsDone 校验/ShapeFix 重试 + `--dz`/`--split` 逐段拆分
@@ -194,7 +202,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
   - 键槽切除 (Keyway-N) — Python COM FeatureCut3(26参数)
 - **`dxf_to_sldprt.py`**：完整 — 命令行参数支持、DXF 几何参数自动检测、时间戳输出文件（防 SW 占用）
 - **`convert_dwg_to_3d.py`**：完整 — 使用 PythonOCC 进行 DXF→STEP 3D 实体建模（旋转体 + 键槽布尔减运算），OCC 懒加载设计使 DXF 解析可独立使用
-- **`dxf_to_3d_general.py`**（6057 行）：通用 DXF 工程图 → 3D STEP + SW .sldprt。核心算法链：边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 / 单视图轮廓拉伸。
+- **`dxf_to_3d_general.py`**（7664 行）：通用 DXF 工程图 → 3D STEP + SW .sldprt。核心算法链：边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 / 单视图轮廓拉伸。
   - v0.5.4: CSG 体积求交法 — 多视图外轮廓各自拉伸为棱柱 → 布尔交集 → 3D 实体
   - v0.5.5 (P0): 内部特征关联 — 各视图内部闭环（孔/槽）→ 3D 切割工具 → 布尔减运算
   - v0.5.5 (P1): 投影验证回路 — CSG 主体尺寸与视图期望值自动对比，偏差 >30% 自动缩放修正
@@ -289,10 +297,11 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 ## 路径与平台注意事项
 
 - 项目路径包含中文字符，在终端中操作时注意编码。
+- **控制台重定向日志是 GBK 编码**：脚本 `>` 重定向输出的日志为 GBK（Windows 控制台默认代码页）。日志混有非 GBK 字符（如 ✓）时 `iconv -f GBK -t UTF-8` 会中途失败，改用 `grep -a`（文本模式）直接读原始文件。
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.11`（代码内 `0.6.11`）——提交新版本时务必同步更新这些位置。
+- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git 为 `v0.6.12`（代码内 `0.6.12`）——提交新版本时务必同步更新这些位置。此外转换器脚本横幅（`dxf_to_3d_general.py` docstring/结尾 print、`dxf_to_sw_features.py` docstring/横幅 print）也含版本字符串。
 - **README.md 路线图**: v0.6.5 梳理时已与实际进度对齐（标记已完成版本并指向 CLAUDE.md），后续新增功能时同步更新。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
 

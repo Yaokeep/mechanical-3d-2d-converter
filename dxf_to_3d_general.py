@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.10
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.12
 
 核心算法链（详见 CLAUDE.md「dxf_to_3d_general.py」条目）:
   边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 /
@@ -65,6 +65,7 @@ def _ensure_occ():
     from OCC.Core.Bnd import Bnd_Box
     from OCC.Core.BRepBndLib import brepbndlib
     from OCC.Core.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCC.Core.GC import GC_MakeArcOfCircle
 
     g = globals()
     for name, obj in [
@@ -90,6 +91,8 @@ def _ensure_occ():
         ("STEPControl_Writer", STEPControl_Writer),
         ("STEPControl_AsIs", STEPControl_AsIs),
         ("IFSelect_RetDone", IFSelect_RetDone),
+        ("TopoDS_Shape", TopoDS_Shape), ("TopoDS_Face", TopoDS_Face),
+        ("TopoDS_Wire", TopoDS_Wire),
         ("TopExp_Explorer", TopExp_Explorer),
         ("TopAbs_EDGE", TopAbs_EDGE), ("TopAbs_WIRE", TopAbs_WIRE),
         ("TopAbs_FACE", TopAbs_FACE), ("TopAbs_SOLID", TopAbs_SOLID),
@@ -98,6 +101,7 @@ def _ensure_occ():
         ("BRep_Builder", BRep_Builder), ("breptools", breptools),
         ("BRepClass3d_SolidClassifier", BRepClass3d_SolidClassifier),
         ("Bnd_Box", Bnd_Box), ("brepbndlib", brepbndlib),
+        ("GC_MakeArcOfCircle", GC_MakeArcOfCircle),
     ]:
         g[name] = obj
     _OCC_LOADED = True
@@ -207,6 +211,11 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
     # 竖线对扫描（_vertical_hole_profiles），不进入边图面遍历
     # （避免 v0.6.3 的可见/隐藏平行重复边 8 字环问题）
     hidden_vlines = []
+    # v0.6.12: 隐藏水平线同步收录 [(ymid, xmin, xmax), ...]——
+    # 不可见内腔的腔口上下边画在 top 视图隐藏线图层（bracket 三视图），
+    # _hidden_cavity_boxes 用它确定腔的 Y 范围（旧逻辑用 top 竖线 y
+    # 范围，会被相邻塔区竖线误导成 18 宽腔刀，超切约 1.6 倍）
+    hidden_hlines = []
 
     # LINE（跳过中心线、构造线等辅助线）
     for e in msp.query("LINE"):
@@ -219,6 +228,9 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
             if abs(_x1 - _x2) <= 0.3 and max(_y1, _y2) - min(_y1, _y2) >= 0.5:
                 hidden_vlines.append(
                     ((_x1 + _x2) / 2, min(_y1, _y2), max(_y1, _y2)))
+            elif abs(_y1 - _y2) <= 0.3 and max(_x1, _x2) - min(_x1, _x2) >= 0.5:
+                hidden_hlines.append(
+                    ((_y1 + _y2) / 2, min(_x1, _x2), max(_x1, _x2)))
             continue
         x1, y1 = e.dxf.start.x, e.dxf.start.y
         x2, y2 = e.dxf.end.x, e.dxf.end.y
@@ -401,6 +413,7 @@ def parse_dxf_edges(dxf_path: str) -> tuple[list[Edge], dict]:
         "entity_counts": entity_counts,
         "total_edges": eid,
         "_hidden_vlines": hidden_vlines,
+        "_hidden_hlines": hidden_hlines,
     }
     return edges, metadata
 
@@ -1974,6 +1987,457 @@ def _vertical_hole_profiles(view, edges, hidden_vlines=None):
     return profiles
 
 
+def _hidden_cavity_boxes(views, top_bbox, hidden_vlines, sf, body_z,
+                         hidden_hlines=None):
+    """v0.6.12: 矩形内腔刀候选 — front 隐藏竖线长带对 + top 隐藏水平线对联合证据。
+
+    bracket 靶子：内腔 = 矩形槽 62×12(y±6)×z[0,28]（1mm 精细截面实测，
+    与图纸证据精确一致）——
+      X: front 投影左右壁隐藏竖线带 x=16 / x=78（间距 62，两带 y[2,30]）
+      Y: top 投影腔口上下边隐藏水平线对 y=145 / y=157（间距 12 = 腔宽）
+      Z: front 竖线带 y[2,30] 线性映射 → z[0,28]（无边距修正，实测精确）
+    旧版 Y 证据用 top 隐藏竖线 y 范围——bracket 该竖线 x=21.9 实为
+    相邻塔区采样，误判腔宽 18，加上 Y/Z 边距修正越界超切约 1.6 倍。
+
+    规则:
+      1. front 视图内隐藏竖线按 x 归带（间距 ≤2.5 且 y 重叠 → 合并，
+         同壁多采样收拢）；带高 ≥30% 视图高才是贯通壁。
+      2. 带间空隙 w ∈ [8, 0.85×视图宽] 为候选腔 X 范围；对每个候选
+         用 top 隐藏水平线对做 Y 证据筛选——top 视图内按 y 归带，
+         相邻带 y 间距 6~30 且两带 X 范围与腔 X 的 top 系区间（top
+         视图 x 镜像时取 [2×tcx−xb, 2×tcx−xa]）重叠 ≥30% 窗口宽。
+      3. 腔 Z = 两 front 带 y 范围并集线性映射到 CSG 主体 Z（与竖线对
+         补孔同约定）；腔 Y = 水平线对 y 值（top 视图中心化）。
+      4. X 中心取 front 外环与 top bbox 中心平均（front 外环可能缺弧
+         致中心偏移，主体交集中心才是真对齐基准）。
+    返回 [(box, w)] CSG 系 TopoDS_Shape 腔刀 + 腔宽（调用方据此做
+    top 整圆保护——圆孔已走圆刀路径）。box 在本函数内创建：
+    convert_dxf_to_3d 有局部 BRepPrimAPI_MakeBox import 遮蔽全局符号。
+    """
+    fv = next((v for v in views if v["view_type"] == "front"), None)
+    if fv is None or not hidden_vlines or not hidden_hlines:
+        return []
+    ofc = fv.get("_outer_face") or {}
+    vx1, vx2 = ofc.get("x_min"), ofc.get("x_max")
+    vy1, vy2 = ofc.get("y_min"), ofc.get("y_max")
+    if vx1 is None or vy1 is None:
+        return []
+    view_w, view_h = vx2 - vx1, vy2 - vy1
+
+    # front 视图内隐藏竖线按 x 归带
+    fh = sorted((hx, hylo, hyhi) for hx, hylo, hyhi in hidden_vlines
+                if vx1 - 1 <= hx <= vx2 + 1
+                and vy1 - 1 <= hylo <= vy2 + 1 and vy1 - 1 <= hyhi <= vy2 + 1)
+    bands = []  # [x_lo, x_hi, y_lo, y_hi]
+    for hx, hylo, hyhi in fh:
+        for b in bands:
+            if b[0] - 2.5 <= hx <= b[1] + 2.5 \
+                    and hylo <= b[3] + 2.5 and hyhi >= b[2] - 2.5:
+                b[0] = min(b[0], hx)
+                b[1] = max(b[1], hx)
+                b[2] = min(b[2], hylo)
+                b[3] = max(b[3], hyhi)
+                break
+        else:
+            bands.append([hx, hx, hylo, hyhi])
+    long_bands = [b for b in bands if b[3] - b[2] >= view_h * 0.3]
+
+    # top 视图内隐藏水平线按 y 归带（腔 Y 证据）——
+    # HLR 采样折线水平段常被碎成小段，归带后取总范围
+    tb = top_bbox
+    th = sorted((ym, xlo, xhi) for ym, xlo, xhi in hidden_hlines
+                if tb[0] - 1 <= xlo <= tb[2] + 1
+                and tb[0] - 1 <= xhi <= tb[2] + 1
+                and tb[1] - 1 <= ym <= tb[3] + 1)
+    ybands = []  # [y_lo, y_hi, x_lo, x_hi]
+    for ym, xlo, xhi in th:
+        for b in ybands:
+            if b[0] - 2.5 <= ym <= b[1] + 2.5 \
+                    and xlo <= b[3] + 2.5 and xhi >= b[2] - 2.5:
+                b[0] = min(b[0], ym)
+                b[1] = max(b[1], ym)
+                b[2] = min(b[2], xlo)
+                b[3] = max(b[3], xhi)
+                break
+        else:
+            ybands.append([ym, ym, xlo, xhi])
+    ybands.sort(key=lambda b: b[0])
+    # top 视图 x 镜像检测（环 x 方向与 front 相反时 top 系 X 取反号）
+    tv = next((v for v in views if v["view_type"] == "top"), None)
+    mirrored = bool(tv and tv.get("_x_mirrored"))
+
+    fcx = ((vx1 + vx2) / 2 + (tb[0] + tb[2]) / 2) / 2  # front/top 中心平均
+    tbcy = (tb[1] + tb[3]) / 2
+    z1, z2 = body_z
+    y_span = vy2 - vy1
+
+    out = []
+    for i in range(len(long_bands)):
+        for j in range(i + 1, len(long_bands)):
+            xa, xb = long_bands[i][1], long_bands[j][0]  # 带间空隙
+            w = xb - xa
+            if w < 8 or w > view_w * 0.85:
+                continue
+            # 腔 X 的 top 系区间（top x 镜像时取反号）
+            tcx = (tb[0] + tb[2]) / 2
+            win_lo, win_hi = (2 * tcx - xb, 2 * tcx - xa) if mirrored \
+                else (xa, xb)
+            win_w = win_hi - win_lo
+            # top 隐藏水平线对：任意两带 y 间距 6~30、X 与窗口重叠
+            # ≥30% 窗口宽（无 Y 证据的候选不生成刀，防误切）。
+            # 不能只取相邻带——腔口上下边之间可能插有相邻结构的
+            # 水平线带（bracket y=150/152 塔区线插在 145/157 之间），
+            # 相邻带间距全 <6 会把真腔口对排掉
+            best_y = None  # (x_ratio, overlap, ylo, yhi)
+            for k in range(len(ybands)):
+                for m in range(k + 1, len(ybands)):
+                    ylo, yhi = ybands[k][0], ybands[m][0]
+                    dy = yhi - ylo
+                    if dy < 6 or dy > 30:
+                        continue
+                    ov = min(ybands[k][3], ybands[m][3], win_hi) \
+                        - max(ybands[k][2], ybands[m][2], win_lo)
+                    if ov < win_w * 0.3:
+                        continue
+                    # v0.6.12: 带对首选"上下边 X 范围几乎相同"的对——
+                    # 跑道/矩形腔口上下边投影等长等位（bracket 145/157
+                    # 带 X[135.3,185.3] 完全相同），X 交集/并集比接近 1；
+                    # 相邻结构的更宽带对（130.1 带 X 左伸 12.3）比 0.80
+                    # 排后。旧评分只比 ov 会选错带对（130/157 dy=27
+                    # 与 145/157 dy=12 ov 相同，先遍历者胜 → 腔刀
+                    # y[-21,-6] 错位，腔 y[-6,6] 未切）。
+                    x_union = max(ybands[k][3], ybands[m][3]) \
+                        - min(ybands[k][2], ybands[m][2])
+                    x_ratio = ov / x_union if x_union > 0 else 0.0
+                    score = (x_ratio, ov)
+                    if best_y is None or score > best_y[0:2]:
+                        best_y = (x_ratio, ov, ylo, yhi)
+            if best_y is None:
+                continue
+            # 腔口水平边投影长应 ≈ 腔宽：线 X 范围与 win 的重叠
+            # ≥ win_w*0.75 才相互印证（HLR 常在两端削 ~6mm，bracket
+            # 实测 50/62=0.81；相邻结构的更宽带对如 (16,92) 只 0.66 被排）
+            if best_y[1] < win_w * 0.75:
+                continue
+            _, _, hylo, hyhi = best_y
+            # 腔 Z = 两带 y 并集（线性映射到 CSG 主体 Z）——无边距修正
+            zlo = min(long_bands[i][2], long_bands[j][2])
+            zhi = max(long_bands[i][3], long_bands[j][3])
+            bx1 = (xa - fcx) * sf
+            bx2 = (xb - fcx) * sf
+            by1 = (hylo - tbcy) * sf
+            by2 = (hyhi - tbcy) * sf
+            bz1 = z1 + (zlo - vy1) / y_span * (z2 - z1)
+            bz2 = z1 + (zhi - vy1) / y_span * (z2 - z1)
+            box = BRepPrimAPI_MakeBox(gp_Pnt(bx1, by1, bz1),
+                                      gp_Pnt(bx2, by2, bz2)).Shape()
+            out.append((box, w * sf))
+    return out
+
+
+def _hidden_step_boxes(views, top_bbox, hidden_vlines, hidden_hlines, sf,
+                       body_z, body_half_y, consumed_boxes, conc_groups):
+    """v0.6.12: 台阶收腰刀候选 — front 隐藏竖线长带对（台阶壁 X 证据）
+    + top 隐藏水平线宽对（叉臂 Y 证据）+ front 隐藏水平线（台阶顶证据）。
+
+    bracket 靶子：主体 z[22,28] 段应从船形全宽收腰为叉臂 y[±20]
+    x[-38,52] + 豁口空隙 x[52,96] + 塔环——
+      X: front 隐藏竖线带 x=92 / x=136.5（叉臂右端壁 / 塔左壁被底板
+         遮挡段 y[2,24]→z[0,22]，间距 44.5 = 豁口空隙宽）
+      Y: top 隐藏水平线对 y=131/171（间距 40 = 叉臂宽，叉臂直壁
+         台阶边在 top 的投影，被 HLR 隐藏）
+      Z: front 隐藏水平线 y=30 x[2,92]（叉臂顶边 → z=28）
+    腔刀机制的 top 水平线对窗口 dy∈[6,30] 把 dy=40 的叉臂对排掉，
+    豁口空隙从未被切（重建 z[22,28] 段多余 4,158 主因）。
+
+    与腔刀互补的判据（防止 PF60K 等回归件误触发）:
+      1. 长带对空隙 w∈[8,0.85W]，且未被腔刀消费（X 区间重叠跳过）
+      2. top 同心圆组有 r≈w/2（容差 2，与腔刀整圆保护同款）→
+         圆孔壁带对，圆刀已切，跳过（PF60K φ42/φ25/φ14 全被此保护）
+      3. 两带带底 ≈ 视图底（台阶壁从主体底升起，上方被台阶遮挡）
+      4. 带顶映射 z ∈ 主体 30%~80%（台阶位于主体上中部）
+      5. top 隐藏水平线对 dy∈[25,45]、两带等长等位（x_ratio≥0.7）、
+         单带距视图中心 ∈ (0.5,0.95)×主体半宽（叉臂墙在内外缘之间）
+      6. front 隐藏水平线 y∈(带顶,带顶+12]，x 从视图左缘起、
+         终点≈左带位置（叉臂顶边 → 台阶顶 Z）
+    刀形: band_box ∩ top 棱柱 − 叉臂 box − 塔盘圆柱——band x 覆盖
+    [主体左缘, 塔心+1] y 全宽。x2 只到空隙右端会留"塔左书架"
+    （空隙右端贴塔盘左缘弧时，塔盘外、斜边内、y∈[±叉臂,±25.5]
+    的船形材料——band 右面平面 vs 塔盘左缘圆弧，y 大处塔盘左缘
+    内缩，书架越往边越宽）；x2 到塔心覆盖书架全部+塔盘左缘弧，
+    塔盘左半进入 band 须减塔盘圆柱保护（塔环带是实心材料，塔盘
+    内孔已由 P0 圆刀切空，保护塔盘只少切书架不多留任何材料）。
+    不扩到视图右缘——塔盘右侧的 top 棱柱凸台投影会被误切。
+    返回 [(box, w*sf)] CSG 系台阶刀。
+    """
+    fv = next((v for v in views if v["view_type"] == "front"), None)
+    tv = next((v for v in views if v["view_type"] == "top"), None)
+    if fv is None or tv is None or not hidden_vlines or not hidden_hlines:
+        return []
+    top_prism = tv.get("_body_prism")
+    if top_prism is None:
+        return []
+    ofc = fv.get("_outer_face") or {}
+    vx1, vx2 = ofc.get("x_min"), ofc.get("x_max")
+    vy1, vy2 = ofc.get("y_min"), ofc.get("y_max")
+    if vx1 is None or vy1 is None:
+        return []
+    view_w, view_h = vx2 - vx1, vy2 - vy1
+
+    # front 视图内隐藏竖线按 x 归带（同腔刀机制）
+    fh = sorted((hx, hylo, hyhi) for hx, hylo, hyhi in hidden_vlines
+                if vx1 - 1 <= hx <= vx2 + 1
+                and vy1 - 1 <= hylo <= vy2 + 1 and vy1 - 1 <= hyhi <= vy2 + 1)
+    bands = []  # [x_lo, x_hi, y_lo, y_hi]
+    for hx, hylo, hyhi in fh:
+        for b in bands:
+            if b[0] - 2.5 <= hx <= b[1] + 2.5 \
+                    and hylo <= b[3] + 2.5 and hyhi >= b[2] - 2.5:
+                b[0] = min(b[0], hx)
+                b[1] = max(b[1], hx)
+                b[2] = min(b[2], hylo)
+                b[3] = max(b[3], hyhi)
+                break
+        else:
+            bands.append([hx, hx, hylo, hyhi])
+    long_bands = [b for b in bands if b[3] - b[2] >= view_h * 0.3]
+
+    # top 视图内隐藏水平线按 y 归带（同腔刀机制）
+    tb = top_bbox
+    th = sorted((ym, xlo, xhi) for ym, xlo, xhi in hidden_hlines
+                if tb[0] - 1 <= xlo <= tb[2] + 1
+                and tb[0] - 1 <= xhi <= tb[2] + 1
+                and tb[1] - 1 <= ym <= tb[3] + 1)
+    ybands = []  # [y_lo, y_hi, x_lo, x_hi]
+    for ym, xlo, xhi in th:
+        for b in ybands:
+            if b[0] - 2.5 <= ym <= b[1] + 2.5 \
+                    and xlo <= b[3] + 2.5 and xhi >= b[2] - 2.5:
+                b[0] = min(b[0], ym)
+                b[1] = max(b[1], ym)
+                b[2] = min(b[2], xlo)
+                b[3] = max(b[3], xhi)
+                break
+        else:
+            ybands.append([ym, ym, xlo, xhi])
+    ybands.sort(key=lambda b: b[0])
+
+    # front 视图内隐藏水平线按 y 归带（叉臂顶边 Z 证据）——
+    # HLR 把长隐藏水平线碎成头尾相接的小段，必须归带后
+    # 检查带级 X 范围（bracket 叉臂顶边 y=30 碎成 2.4~94.7 几十段）
+    fhls_raw = sorted((ym, xlo, xhi) for ym, xlo, xhi in hidden_hlines
+                      if vx1 - 1 <= xlo <= vx2 + 1
+                      and vx1 - 1 <= xhi <= vx2 + 1
+                      and vy1 - 1 <= ym <= vy2 + 1)
+    fhls = []  # [y_lo, y_hi, x_lo, x_hi]
+    for ym, xlo, xhi in fhls_raw:
+        for b in fhls:
+            if b[0] - 2.5 <= ym <= b[1] + 2.5 \
+                    and xlo <= b[3] + 2.5 and xhi >= b[2] - 2.5:
+                b[0] = min(b[0], ym)
+                b[1] = max(b[1], ym)
+                b[2] = min(b[2], xlo)
+                b[3] = max(b[3], xhi)
+                break
+        else:
+            fhls.append([ym, ym, xlo, xhi])
+    fhls.sort(key=lambda b: b[0])
+
+    # 已消费空隙 X 区间（腔刀 box CSG 系 → front DXF 系）
+    fcx = ((vx1 + vx2) / 2 + (tb[0] + tb[2]) / 2) / 2
+    tbcy = (tb[1] + tb[3]) / 2
+    consumed = []
+    for cbox in consumed_boxes:
+        try:
+            cbb = Bnd_Box()
+            brepbndlib.Add(cbox, cbb)
+            cx1, _cy1, _cz1, cx2, _cy2, _cz2 = cbb.Get()
+            if sf > 0:
+                consumed.append((cx1 / sf + fcx, cx2 / sf + fcx))
+        except Exception:
+            continue
+
+    z1, z2 = body_z
+    y_span = vy2 - vy1
+    out = []
+    for i in range(len(long_bands)):
+        for j in range(i + 1, len(long_bands)):
+            xa, xb = long_bands[i][1], long_bands[j][0]  # 带间空隙
+            w = xb - xa
+            if w < 8 or w > view_w * 0.85:
+                continue
+            # 腔刀已消费该空隙（X 区间重叠）→ 跳过
+            if any(not (xa > c[1] + 2 or xb < c[0] - 2) for c in consumed):
+                continue
+            # 两带带底 ≈ 视图底——台阶壁从主体底升起
+            if long_bands[i][2] > vy1 + 3 or long_bands[j][2] > vy1 + 3:
+                continue
+            zhi_y = min(long_bands[i][3], long_bands[j][3])
+            z_lo = z1 + (zhi_y - vy1) / y_span * (z2 - z1)
+            if not (z1 + (z2 - z1) * 0.3 <= z_lo <= z1 + (z2 - z1) * 0.8):
+                continue
+            # top 同心圆组整圆保护（与腔刀同款）：r≈w/2 是圆孔壁
+            if any(abs(_r - w / 2) < 2.0
+                   for _ck, _grp in conc_groups.items()
+                   if tb[0] <= _ck[0] <= tb[2] and tb[1] <= _ck[1] <= tb[3]
+                   for _r in _grp["radii"]):
+                continue
+            # 空隙内跨过 top 同心圆组中心（CSG x）→ 空隙内有柱体
+            # （塔盘），不是纯台阶空隙，跳过（bracket 带对 (92,177.7)
+            # /(92,185.4) 空隙跨塔心 58 会切掉塔环，(92,136.5) 不跨）
+            mirrored = bool(tv.get("_x_mirrored"))
+            tcx = (tb[0] + tb[2]) / 2
+            _gap_lo = (xa - fcx) * sf
+            _gap_hi = (xb - fcx) * sf
+            _hit_center = False
+            for _ck, _grp in conc_groups.items():
+                if not (tb[0] <= _ck[0] <= tb[2]
+                        and tb[1] <= _ck[1] <= tb[3]):
+                    continue
+                _cx_csg = (tcx - _ck[0]) * sf if mirrored \
+                    else (_ck[0] - tcx) * sf
+                if _gap_lo - 2 < _cx_csg < _gap_hi + 2:
+                    _hit_center = True
+                    break
+            if _hit_center:
+                continue
+            # 叉臂顶边：front 隐藏水平线带，x 起于视图左缘、终于左带
+            best_hl = None
+            for _ylo, _yhi, _xlo, _xhi in fhls:
+                if not (zhi_y < _ylo <= zhi_y + 12):
+                    continue
+                if _xlo > vx1 + 3 or abs(_xhi - xa) > 3:
+                    continue
+                if best_hl is None or abs(_xhi - xa) < abs(best_hl[1] - xa):
+                    best_hl = (_ylo, _xhi)
+            if best_hl is None:
+                continue
+            z_top = z1 + (best_hl[0] - vy1) / y_span * (z2 - z1)
+            if z_top <= z_lo + 1:
+                continue
+            # 叉臂 Y 墙：top 隐藏水平线带对 dy∈[25,45]，等长等位，
+            # 墙在主体内外缘之间（0.5~0.95 × 主体半宽）。墙线位置
+            # 用两带 4 端点对称配对取——HLR 弧投影碎片会拉偏带
+            # 下界/中心（bracket 171 带 y[169.2,171.05] 下界是 R9.4
+            # 弧碎片，对称配对自动选 (131.05,171.05) 两端距视图
+            # 中心相等，叉臂墙 y=±20 精确）
+            best_y = None  # (x_ratio, a, b)
+            for k in range(len(ybands)):
+                for m in range(k + 1, len(ybands)):
+                    _y_k = (ybands[k][0], ybands[k][1])
+                    _y_m = (ybands[m][0], ybands[m][1])
+                    if _y_m[1] - _y_k[0] < 25 or _y_m[1] - _y_k[0] > 45:
+                        continue
+                    x_union = max(ybands[k][3], ybands[m][3]) \
+                        - min(ybands[k][2], ybands[m][2])
+                    ov = min(ybands[k][3], ybands[m][3]) \
+                        - max(ybands[k][2], ybands[m][2])
+                    x_ratio = ov / x_union if x_union > 0 else 0.0
+                    if x_ratio < 0.7:
+                        continue
+                    best_pair = None  # (a, b, |d1-d2|)
+                    for a in _y_k:
+                        for b in _y_m:
+                            d1 = abs(a - tbcy) * sf
+                            d2 = abs(b - tbcy) * sf
+                            if d1 <= body_half_y * 0.5 \
+                                    or d1 >= body_half_y * 0.95 \
+                                    or d2 <= body_half_y * 0.5 \
+                                    or d2 >= body_half_y * 0.95:
+                                continue
+                            if abs(d1 - d2) > 2.5:
+                                continue
+                            if best_pair is None \
+                                    or abs(d1 - d2) < best_pair[2]:
+                                best_pair = (a, b, abs(d1 - d2))
+                    if best_pair is None:
+                        continue
+                    if best_y is None or x_ratio > best_y[0]:
+                        best_y = (x_ratio, best_pair[0], best_pair[1])
+            if best_y is None:
+                continue
+            _, hylo, hyhi = best_y
+            # 刀形组装：band ∩ top 棱柱 − 叉臂 box − 塔盘圆柱
+            bx1 = (vx1 - fcx) * sf
+            fbx2 = (xa - fcx) * sf
+            by1 = (hylo - tbcy) * sf
+            by2 = (hyhi - tbcy) * sf
+            # 塔盘保护：取"左缘贴空隙右端"（csg_cx − r ≈ gap_hi）
+            # 的 top 同心圆组最大半径圆作圆柱。band 扩到视图右缘后
+            # 塔盘左半进入 band，不保护会切掉塔环带实心材料；塔盘
+            # 内孔已由 P0 圆刀切空，保护塔盘只少切书架、不多留
+            # 材料。按左缘贴合选半径而非组内 max——bracket 塔组
+            # 含 R28.5 装饰圆（左缘 29.85 不贴空隙），max 会保护
+            # 过度把书架外半保留。
+            tower_cyl = None  # (csg_cx, r)
+            _gap_hi_csg = (xb - fcx) * sf
+            for _ck, _grp in conc_groups.items():
+                if not (tb[0] <= _ck[0] <= tb[2]
+                        and tb[1] <= _ck[1] <= tb[3]):
+                    continue
+                _cx_csg = (tcx - _ck[0]) * sf if mirrored \
+                    else (_ck[0] - tcx) * sf
+                for _r in _grp["radii"]:
+                    if abs((_cx_csg - _r) - _gap_hi_csg) <= 2:
+                        if tower_cyl is None or _r > tower_cyl[1]:
+                            tower_cyl = (_cx_csg, _r)
+            # band x2：书架只在塔盘左缘弧外侧（x ∈ [空隙右端, 塔盘
+            # 左缘弧最大 x]），x2 取塔心+1 即全覆盖；扩到视图右缘
+            # 会切掉 top 棱柱里的凸台投影（bracket 凸台贴塔盘右缘
+            # 起 x=83.7，视图右缘 101.6 覆盖凸台 → 缺失 1,926）
+            if tower_cyl is not None:
+                bx2 = tower_cyl[0] + 1.0
+            else:
+                bx2 = (xb - fcx) * sf
+            try:
+                # band z 扩到主体顶——斜边∩塔盘的月牙不只存在于
+                # 台阶段（z[z_lo,z_top]），台阶上方 z[z_top,主体顶]
+                # 塔盘左缘同样是圆弧（基准环带全高），重建 top 棱柱
+                # 斜边在塔盘左缘外留月牙（bracket z[28,35] 差实体
+                # 截面实测：x=96.5 竖带 y[2.4,24.5] = 斜边×塔盘交
+                # 月牙，多余 1,141+873.8 主因）。叉臂保护体仍只到
+                # z_top（叉臂仅存在于台阶段），塔盘保护圆柱全高。
+                band = BRepPrimAPI_MakeBox(
+                    gp_Pnt(bx1, -body_half_y - 2, z_lo),
+                    gp_Pnt(bx2, body_half_y + 2, z2)).Shape()
+                # 叉臂保护体 = 矩形主体（x 到圆端圆心左缘）+ 右端
+                # R20 半圆头。右端圆端半径图纸无直接证据（y 向鼓出
+                # 投影成切线竖线），取与叉臂左端 R20 圆对称（top
+                # 视图左端 R20 可见）；基准 z[22,25] 喇叭口 R23/20.76
+                # 图纸不可见，统一 R20 是信息论局限（误差 ~±100mm³）。
+                # 矩形主体只延伸到圆端圆心左缘——延伸到右缘会把
+                # 方角（矩形角 − 圆端外材料）也保住，方角切不掉。
+                fork_protect = BRepPrimAPI_MakeBox(
+                    gp_Pnt(bx1, by1, z_lo),
+                    gp_Pnt(fbx2 - 20.0, by2, z_top)).Shape()
+                _fcx0 = fbx2 - 20.0  # 圆端圆心 CSG x
+                _cyl_fork = create_cylinder_solid(
+                    (_fcx0, 0.0), 20.0 * sf,
+                    z_top - z_lo, z_lo)
+                fuse = BRepAlgoAPI_Fuse(fork_protect, _cyl_fork)
+                if not fuse.IsDone():
+                    continue
+                fork_protect = fuse.Shape()
+                com = BRepAlgoAPI_Common(band, top_prism)
+                if not com.IsDone():
+                    continue
+                cut = BRepAlgoAPI_Cut(com.Shape(), fork_protect)
+                if not cut.IsDone():
+                    continue
+                if tower_cyl is not None:
+                    _tcx, _tr = tower_cyl
+                    cyl = create_cylinder_solid(
+                        (_tcx, 0.0), _tr * sf,
+                        z2 - z_lo + 2, z_lo - 1)
+                    cut = BRepAlgoAPI_Cut(cut.Shape(), cyl)
+                    if not cut.IsDone():
+                        continue
+                out.append((cut.Shape(), w * sf))
+            except Exception:
+                continue
+    return out
+
+
 def _build_inner_cut_tool(face_info, view_type, edges, edge_vertices,
                           vertex_pos, scale_factor, extrude_half,
                           outer_face_center=None, z_align_offset=None):
@@ -2294,6 +2758,121 @@ def _separate_views_2d(faces_info, total_bbox):
     return result
 
 
+def weld_chain_ends(edges, vertex_pos, edge_vertices):
+    """v0.6.12: 微边链端点焊接（保守，CSG_WELD 门控，模块级便于探针复用）。
+
+    B 样条/弧碎段与相邻折线端点有 0.2~0.3mm HLR 精度间隙
+    （bracket top 弧碎段 2213 终点 (21.34,159.78) 与相贯折线
+    1005 起点 (21.42,159.99) 差 0.23mm）→ 无合并图断开、链被
+    悬边修剪。焊接范围：链自由端点（簇内度 1）与最近长边端点
+    （<0.3mm）一对一；长边-长边绝不焊接（v15 教训：外环线端点
+    与内圆 r20 弧端点 0.03mm 近邻误焊 → 内圆混入外环）。
+    焊接目标限定为长边度 1 端点——front 伪影挂线悬空端焊到长边
+    碎段内点（度 2）会把内点分裂成分叉顶点，破坏已闭合的 front
+    环（weld 后 front 环消失）；真正的碎段间隙桥接只发生在链
+    端点处。"""
+    from collections import defaultdict, Counter
+    ep = []  # (vid, x, y, is_micro)
+    for _eid, _e in enumerate(edges):
+        _vm = abs(_e.start[0] - _e.end[0]) < 0.3 and \
+            abs(_e.start[1] - _e.end[1]) < 0.3
+        ep.append((edge_vertices[_eid][0], _e.start[0], _e.start[1], _vm))
+        ep.append((edge_vertices[_eid][1], _e.end[0], _e.end[1], _vm))
+    buckets = defaultdict(list)
+    for _i, (_vid, _x, _y, _vm) in enumerate(ep):
+        if _vm:
+            buckets[(int(_x / 0.25), int(_y / 0.25))].append(_i)
+    par = {}
+
+    def _f(i):
+        par.setdefault(i, i)
+        while par[i] != i:
+            par[i] = par[par[i]]
+            i = par[i]
+        return i
+
+    def _u(i, j):
+        ri, rj = _f(i), _f(j)
+        if ri != rj:
+            par[ri] = rj
+
+    for _i, (_vid, _x, _y, _vm) in enumerate(ep):
+        if not _vm:
+            continue
+        for bx in (-1, 0, 1):
+            for by in (-1, 0, 1):
+                for _j in buckets.get((int(_x / 0.25) + bx,
+                                       int(_y / 0.25) + by), []):
+                    if _j == _i:
+                        continue
+                    _vj, _xj, _yj, _ = ep[_j]
+                    if math.hypot(_xj - _x, _yj - _y) < 0.25:
+                        _u(_vid, _vj)
+    # 链自由端点（簇内微边端点度 1）→ 最近长边端点 <0.3mm
+    long_deg = Counter(vid for vid, x, y, vm in ep if not vm)
+    long_ep = [(i, vid, x, y) for i, (vid, x, y, vm) in enumerate(ep)
+               if not vm and long_deg[vid] == 1]
+    long_buckets = defaultdict(list)
+    for i, vid, x, y in long_ep:
+        long_buckets[(int(x / 0.3), int(y / 0.3))].append((i, vid, x, y))
+    deg = Counter(_f(vid) for vid, x, y, vm in ep if vm)
+    for _i, (vid, x, y, vm) in enumerate(ep):
+        if not vm:
+            continue
+        r = _f(vid)
+        if deg[r] != 1:
+            continue
+        best = None
+        for bx in (-1, 0, 1):
+            for by in (-1, 0, 1):
+                for j, vj, xj, yj in long_buckets.get(
+                        (int(x / 0.3) + bx, int(y / 0.3) + by), []):
+                    d = math.hypot(xj - x, yj - y)
+                    if d < 0.3 and (best is None or d < best[0]):
+                        best = (d, vj)
+        if best is not None:
+            _u(vid, best[1])
+    # 簇内顶点坐标统一到首见端点坐标
+    rep_pos = {}
+    for _i, (vid, x, y, _vm) in enumerate(ep):
+        rep_pos.setdefault(_f(vid), (x, y))
+    for v in list(vertex_pos.keys()):
+        r = _f(v)
+        if r in rep_pos:
+            vertex_pos[v] = rep_pos[r]
+    return [(_f(vs), _f(ve)) for vs, ve in edge_vertices]
+
+
+def _ring_geom_bbox(ring, edges):
+    """环几何 bbox（含弧顶）——顶点级 bbox 丢弧顶（bracket front
+    叉尖 r12 弧顶 x=205.3 不是顶点，顶点 bbox 只有 193.3），P2 特征
+    映射中心因此偏移 9.6mm（塔孔刀错位到左块）。"""
+    xs, ys = [], []
+    for eid, _f, _t in ring:
+        e = edges[eid]
+        xs += [e.start[0], e.end[0]]
+        ys += [e.start[1], e.end[1]]
+        if e.etype == "ARC" and e.radius:
+            cx, cy = e.center
+            a1, a2 = e.start_angle, e.end_angle
+            if e.clockwise:
+                # 顺时针: 角度递减从 a1 到 a2（可能跨 0°）
+                if a2 > a1:
+                    a2 -= 360.0
+            else:
+                if a2 < a1:
+                    a2 += 360.0
+            for base in (0, 90, 180, 270):
+                for shift in (-360, 0, 360):
+                    th = base + shift
+                    if a1 - 1e-6 <= th <= a2 + 1e-6:
+                        rad = math.radians(base)
+                        xs.append(cx + e.radius * math.cos(rad))
+                        ys.append(cy + e.radius * math.sin(rad))
+                        break
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
 def extract_outer_rings_no_merge(edges, views):
     """v0.6.1: 在无合并边图上提取各视图外轮廓环。
 
@@ -2310,10 +2889,131 @@ def extract_outer_rings_no_merge(edges, views):
                           "vertex_pos": {vid: (x, y)},
                           "area": float, "bbox": (xmin, ymin, xmax, ymax)}}
     """
+    vertex_pos, edge_vertices, nv = build_vertex_map(edges)
+    # v0.6.12: CSG_WELD 时两遍提取，每视图取面积大者——碎段间隙视图
+    # （bracket top 顶边 0.02mm 间隙断链）必须焊接才能闭合；伪影挂线
+    # 视图（bracket front）焊接会把挂线接回主干拐走环。焊接先做：
+    # impl 会向 edges 追加合成边（整圆合成/bbox 回退/方∩圆增强），
+    # weld_chain_ends 按 edges 全长索引 edge_vertices，必须在追加前调用。
+    weld_vp = weld_ev = None
+    if _micro_chain_lengths(edges) and \
+            __import__("os").environ.get("CSG_WELD"):
+        weld_vp = dict(vertex_pos)
+        weld_ev = weld_chain_ends(edges, weld_vp, edge_vertices)
+    result = _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv)
+    if weld_ev is not None:
+        result2 = _extract_rings_impl(edges, views, weld_vp, weld_ev, nv)
+        for name, rd in result2.items():
+            if name not in result or rd["area"] > result[name]["area"]:
+                result[name] = rd
+    # v0.6.12: top 视图 x 镜像检测——model_to_drawing / SW 工程图的
+    # 俯视图是沿 −Z 看（up=Y）的镜像投影（DXF_X = −3D_X），而
+    # _get_view_transform top 是恒等（不镜像）。对称件（法兰/阶梯轴）
+    # 两种约定几何相同从未暴露；bracket 不对称，top 棱柱 x 反向把
+    # 塔剃成板宽柱（front 塔 CSG x=+58 vs top 塔 −58 错位后交集）。
+    # 检测: front 环 x 形心偏移 of 与 top 环 x 形心偏移 ot——
+    # 同向时 ot≈of、镜像时 ot≈−of；对称件 of≈0 无法判定，取同向
+    # （恒等变换，对对称件几何无差异、零回归风险）。
+    def _ring_x_hist(rdata, x0, x1, nbins):
+        """环 x 几何采样直方图（front/top 共享 x 轴区间）——顶点级
+        直方图丢弧顶（bracket front 叉尖 r12 弧顶 205.3 非顶点），
+        叉尖信号过弱相关无法区分镜像；弧每 30° 采样保证弧顶入 bin。"""
+        hist = [0] * nbins
+
+        def _add(x):
+            i = int((x - x0) / (x1 - x0) * nbins)
+            if i < 0:
+                i = 0
+            elif i >= nbins:
+                i = nbins - 1
+            hist[i] += 1
+
+        for eid, _f, _t in rdata["ring"]:
+            e = edges[eid]
+            _add(e.start[0])
+            _add(e.end[0])
+            if e.etype == "ARC" and e.radius:
+                a1, a2 = e.start_angle, e.end_angle
+                if e.clockwise:
+                    if a2 > a1:
+                        a2 -= 360.0
+                else:
+                    if a2 < a1:
+                        a2 += 360.0
+                for k in range(1, 12):
+                    th = math.radians(a1 + (a2 - a1) * k / 12)
+                    _add(e.center[0] + e.radius * math.cos(th))
+        return hist
+
+    def _corr(a, b):
+        n = len(a)
+        ma = sum(a) / n
+        mb = sum(b) / n
+        num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+        da = sum((x - ma) ** 2 for x in a) ** 0.5
+        db = sum((y - mb) ** 2 for y in b) ** 0.5
+        return num / (da * db) if da > 0 and db > 0 else 0.0
+
+    for name in result:
+        result[name]["x_mirrored"] = False
+    if "front" in result and "top" in result:
+        _fg = result["front"].get("geom_bbox") or result["front"]["bbox"]
+        _tg = result["top"].get("geom_bbox") or result["top"]["bbox"]
+        x0 = min(_fg[0], _tg[0])
+        x1 = max(_fg[2], _tg[2])
+        if x1 - x0 > 10:
+            hf = _ring_x_hist(result["front"], x0, x1, 10)
+            ht = _ring_x_hist(result["top"], x0, x1, 10)
+            r_same = _corr(hf, ht)
+            r_flip = _corr(hf, ht[::-1])
+            # 镜像时 flip 相关显著更高；对称件两者相等 → 同向（零回归）
+            result["top"]["x_mirrored"] = r_flip > r_same + 0.05
+    return result
+
+
+def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv):
+    """extract_outer_rings_no_merge 的单遍实现（不焊接/已焊接边图各跑一遍）。"""
     from collections import defaultdict
 
-    vertex_pos, edge_vertices, nv = build_vertex_map(edges)
     adj = build_adjacency(vertex_pos, edge_vertices, edges, nv)
+
+    # ---- v0.6.12: 几何签名（往返副本识别） ----
+    # HLR 对同一几何输出正反双副本（往返弧对 sa/ea 完全相同、折线
+    # 同端点三副本）。环遍历在副本 tie（转角相同）时选回头副本 →
+    # 走支路丢轮廓（bracket top 左端 r25.5 弧碎段链 X 19.8~46 全丢，
+    # CSG X=140 vs 期望 203）。签名相同的边视为一条：遍历时排除
+    # 已用边的同签名副本。碎段链端点精确重合（同几何参数切分），
+    # 无需顶点焊接。
+    micro_chain_len = _micro_chain_lengths(edges)
+    edge_sig = {}
+    for _eid, _e in enumerate(edges):
+        # v0.6.12: 弧签名角度 round 1 + 排序对——HLR 往返弧对
+        # （同几何正反双副本）sa/ea 数值差 0.03°（round 2 后不同
+        # 号漏排），round 1 同号；排序对使反向副本（sa/ea 对调）
+        # 也同签名。半圆对 (0,180)/(180,360) sorted 后仍不同，
+        # 不会误并相邻真实弧段。
+        if _e.etype == "ARC" and _e.radius > 0:
+            _a1 = round(_e.start_angle, 1)
+            _a2 = round(_e.end_angle, 1)
+            edge_sig[_eid] = ("A", round(_e.center[0], 2),
+                              round(_e.center[1], 2), round(_e.radius, 2),
+                              min(_a1, _a2), max(_a1, _a2))
+        else:
+            _x1, _y1, _x2, _y2 = _e.start[0], _e.start[1], _e.end[0], _e.end[1]
+            edge_sig[_eid] = ("L", round(min(_x1, _x2), 2),
+                              round(min(_y1, _y2), 2),
+                              round(max(_x1, _x2), 2), round(max(_y1, _y2), 2))
+
+    # ---- v0.6.12: 微边链端点焊接说明 ----
+    # B 样条/弧碎段与相邻折线端点有 0.2~0.3mm HLR 精度间隙
+    # （bracket top 弧碎段 2213 终点 (21.34,159.78) 与相贯折线
+    # 1005 起点 (21.42,159.99) 差 0.23mm）→ 无合并图断开、链被
+    # 悬边修剪。焊接在 extract_outer_rings_no_merge 外壳层完成
+    # （两遍提取合并策略）：本 impl 直接使用传入的（已焊接或未
+    # 焊接）edge_vertices，不再自行决策。焊接范围：链自由端点
+    # （簇内度 1）与最近长边端点（<0.3mm）一对一；长边-长边绝不
+    # 焊接（v15 教训：外环线端点与内圆 r20 弧端点 0.03mm 近邻
+    # 误焊 → 内圆混入外环）。
 
     # 连通分量
     seen = set()
@@ -2351,6 +3051,19 @@ def extract_outer_rings_no_merge(edges, views):
             changed = True
     if n_pruned:
         print(f"[环提取] 修剪悬边: {n_pruned} 个度 1 顶点")
+
+    def _is_micro_edge(eid):
+        """v0.6.11: HLR 弧裁剪伪影微边（<0.3mm 抖动边）——遍历时跳过
+        其支路（bracket top r25.5 整圆被 0.26mm 微线挂线，最右转
+        遍历走微线支路丢左下 185° 弧）。全局删除不可行（微边含
+        真实弧离散碎段，删后 front/side 环断链）。
+        v0.6.12: 长链微边（B 样条投影离散碎段链 ≥2mm）是真实轮廓，
+        豁免——bracket top 左端凸耳轮廓就是 0.02~0.3mm 碎段折线。"""
+        e = edges[eid]
+        if abs(e.start[0] - e.end[0]) >= 0.3 \
+                or abs(e.start[1] - e.end[1]) >= 0.3:
+            return False
+        return micro_chain_len.get(eid, 0.0) < 2.0
 
     def ring_area_pts(pts):
         a = 0.0
@@ -2477,24 +3190,55 @@ def extract_outer_rings_no_merge(edges, views):
             return None
         # 定向: 从环上任一点出发沿唯一未用弧走回起点
         used = set()
+        used_sigs = set()
         start = best[0]
         cur = start
         prev = None
         ring = []
         while True:
             nxts = [(eid, w) for eid, w in arc_adj[cur]
-                    if eid not in used and w != prev]
+                    if eid not in used and edge_sig[eid] not in used_sigs
+                    and w != prev]
             if not nxts:
                 break
             eid, w = nxts[0]
             ring.append((eid, cur, w))
             used.add(eid)
+            used_sigs.add(edge_sig[eid])
             prev, cur = cur, w
             if cur == start:
                 break
         if ring and ring[-1][2] == start:
             return ring
         return None
+
+    def _arc_cont(prev_edge, incoming, eid, ang_out):
+        """候选弧是否与来边同圆同向续段（0=是, 1=否）。
+
+        v0.6.12: HLR 把外轮廓弧 split 成多段，交点处直线支路
+        （顶面轮廓线等）在 max/min-ccw 下转角更极端会被误选成支路
+        （8 字自交环）。同圆续段是同一曲线的延续（弦向差 <90°），
+        外环必须走它；反向同圆弧 = 掉头绕圆回走（PF60K 跑道形
+        圆-切线切点、v0.6.3 fix2 内圆交点场景），微弧 = 切点碎段，
+        均不触发保持原行为。
+        """
+        pe = edges[prev_edge] if prev_edge is not None else None
+        ce = edges[eid]
+        if pe is None or pe.etype != "ARC" or ce.etype != "ARC" \
+                or not pe.radius or not ce.radius:
+            return 1
+        if abs(pe.center[0] - ce.center[0]) > 0.1 \
+                or abs(pe.center[1] - ce.center[1]) > 0.1 \
+                or abs(pe.radius - ce.radius) > 0.1:
+            return 1
+        if _is_micro_edge(eid):
+            return 1
+        d = ang_out - incoming
+        while d > math.pi:
+            d -= 2 * math.pi
+        while d < -math.pi:
+            d += 2 * math.pi
+        return 0 if abs(d) < math.pi / 2 else 1
 
     def polyline_ring(vids, ccw_rule="min"):
         """折线外环遍历（排除已用边，回到起点闭合）。
@@ -2508,25 +3252,50 @@ def extract_outer_rings_no_merge(edges, views):
         """
         v0 = min(vids, key=lambda v: (vertex_pos[v][1], vertex_pos[v][0]))
         cur_v = v0
-        incoming = math.pi  # 虚拟: 从右向左进入最下顶点
+        # v0.6.12: 初始移动方向 = 向东——最下顶点处外环沿底边向东
+        # （内部在上方），左面遍历的虚拟来向 = 向西。
+        incoming = 0.0
         used = set()
+        used_sigs = set()
         ring = []
+        prev_edge = None
         for _ in range(10000):
+            # v0.6.12: 左面遍历 = 来向（incoming+π）逆时针扫到的
+            # 第一条边 = 最小逆时针转角；反平行（掉头）候选转角
+            # 归一后为 0，会排在直行前——必须赋 2π 排最后
+            # （bracket front 底边 split 点 v342 处回头边 ccw=0
+            # 被误选、v0 处弧折线 803 vs 竖线直行同理）。
             out_ref = incoming + math.pi
             if out_ref > math.pi:
                 out_ref -= 2 * math.pi
             cands = []
             for eid_out, other, ang_out in adj.get(cur_v, []):
-                if eid_out in used:
+                if eid_out in used or edge_sig[eid_out] in used_sigs:
                     continue
                 ccw = ang_out - out_ref
                 if ccw < -math.pi:
                     ccw += 2 * math.pi
                 if ccw < 0:
                     ccw += 2 * math.pi
+                if ccw < 0.1 or ccw > 2 * math.pi - 0.1:
+                    ccw = 2 * math.pi  # 掉头排最后（容差 5.7°：HLR 弧碎段
+                    # 端点切向抖动可达 2°——bracket top 塔圆底 v0 处
+                    # 2231 ang=-178° vs incoming=0 反平行差 2°，0.6° 容差
+                    # 漏判 → min-ccw 选左弧回走丢基环底边）
+                elif abs(ccw - math.pi) < 0.1:
+                    ccw = math.pi  # 直行归一（容差 5.7°：HLR 弧碎段切向
+                    # 抖动 2°——bracket top φ6 孔弧碎段 ccw=178° 与
+                    # y=161.05 直线 ccw=180° 差 2°，弧碎段抖近直行
+                    # 把外环拐进内部孔弧死路）
                 cands.append((ccw, eid_out, other, ang_out))
             if not cands:
                 return None
+            # v0.6.11: 微边支路跳过（HLR 伪影挂线）——仅当存在
+            # 非微边候选时；退化全微边情形保底走原逻辑
+            big_cands = [c for c in cands
+                         if not _is_micro_edge(c[1])]
+            if big_cands:
+                cands = big_cands
             # v0.6.3: ccw 相同时弧优先——直线与弧相切（切线方向
             # 相同）时转角 tie，纯排序会走直线把外环带偏（法兰叶片角
             # 竖线与 r=30 圆相切于 (72,-87)）；弧是转向圆心侧的
@@ -2535,15 +3304,44 @@ def extract_outer_rings_no_merge(edges, views):
             # 相交的 (12,-87)）处必须直线优先——弧优先会把内部
             # 台阶圆并入外环, 环绕内圆一圈后自交（top 环面积虚高
             # 5376>bbox 3600, CSG 棱柱求交为空）。
+            # v0.6.12: max 规则 = 右面遍历 = 掉头同样排最后、
+            # 右转最优先（顺时针扫描第一条）：key = -((ccw+ε) mod 2π)
+            # 使掉头 2π 落回最后一位；min 规则升序掉头天然最后。
             deg = len(adj.get(cur_v, []))
             tie_arc_first = deg <= 2
-            cands.sort(key=lambda c: (c[0] if ccw_rule == "min" else -c[0],
+            # v0.6.12: 交点（deg>2）处同圆续段让位于直线优先——
+            # bracket front (193.3,36) 叉尖圆顶部：2193 左弧与
+            # 2138 同圆同向，_arc_cont 压过 tie 键把外环带进
+            # 圆盘内部左弧（顶边 300/713 才是外环）。
+            cands.sort(key=lambda c: (_arc_cont(prev_edge, incoming,
+                                                c[1], c[3])
+                                      if deg <= 2 else 1,
+                                      c[0] if ccw_rule == "min"
+                                      else -((c[0] + 1e-6) % (2 * math.pi)),
                                       0 if (edges[c[1]].etype == "ARC")
                                       == tie_arc_first else 1))
             _, eid_out, nxt, ang = cands[0]
             ring.append((eid_out, cur_v, nxt))
             used.add(eid_out)
-            incoming = ang
+            used_sigs.add(edge_sig[eid_out])
+            # v0.6.12: incoming 必须 = 到达下一顶点的移动方向。
+            # ang 是弧在出发端的切向，到达端切向沿弧转动 sweep 角
+            # （逆时针弧 sweep>0）——r12 右弧 2137 上 sweep=90°，
+            # 不校正会使 (205.3,24) 处 incoming 差 90° 走支路。
+            e = edges[eid_out]
+            if e.etype == "ARC":
+                if e.clockwise:
+                    sweep = math.radians(e.start_angle - e.end_angle)
+                else:
+                    sweep = math.radians(e.end_angle - e.start_angle)
+                while sweep > math.pi:
+                    sweep -= 2 * math.pi
+                while sweep < -math.pi:
+                    sweep += 2 * math.pi
+            else:
+                sweep = 0.0
+            incoming = ang + sweep
+            prev_edge = eid_out
             cur_v = nxt
             if cur_v == v0:
                 return ring
@@ -2564,37 +3362,75 @@ def extract_outer_rings_no_merge(edges, views):
             return None, 0.0
         ring = [(eid0, v_from, v_to)]
         used = {eid0}
+        used_sigs = {edge_sig[eid0]}
         incoming = ang0
         cur_v = v_to
         start_v = v_from
+        prev_edge = eid0
         for _ in range(10000):
+            # v0.6.12: 同 polyline_ring——掉头候选赋 2π 排最后，
+            # 右面遍历排序（掉头最后、右转最优先）。
             out_ref = incoming + math.pi
             if out_ref > math.pi:
                 out_ref -= 2 * math.pi
             cands = []
             for eid_out, other, ang_out in adj.get(cur_v, []):
-                if eid_out in used:
+                if eid_out in used or edge_sig[eid_out] in used_sigs:
                     continue
                 ccw = ang_out - out_ref
                 if ccw < -math.pi:
                     ccw += 2 * math.pi
                 if ccw < 0:
                     ccw += 2 * math.pi
+                if ccw < 0.1 or ccw > 2 * math.pi - 0.1:
+                    ccw = 2 * math.pi  # 掉头排最后（容差 5.7°：HLR 弧碎段
+                    # 端点切向抖动可达 2°——bracket top 塔圆底 v0 处
+                    # 2231 ang=-178° vs incoming=0 反平行差 2°，0.6° 容差
+                    # 漏判 → min-ccw 选左弧回走丢基环底边）
+                elif abs(ccw - math.pi) < 0.1:
+                    ccw = math.pi  # 直行归一（容差 5.7°：HLR 弧碎段切向
+                    # 抖动 2°——bracket top φ6 孔弧碎段 ccw=178° 与
+                    # y=161.05 直线 ccw=180° 差 2°，弧碎段抖近直行
+                    # 把外环拐进内部孔弧死路）
                 cands.append((ccw, eid_out, other, ang_out))
             if not cands:
                 return None, 0.0
-            # 左面 = 最小顺时针转角 = 最大 ccw；ccw 相同时弧优先
-            # （直线与弧相切点 tie-break，见 polyline_ring 注释）；
-            # 交点（度>2）直线优先（v0.6.3 fix2，同上）
+            # v0.6.11: 微边支路跳过（HLR 伪影挂线），同 polyline_ring
+            big_cands = [c for c in cands if not _is_micro_edge(c[1])]
+            if big_cands:
+                cands = big_cands
+            # 右面遍历 = 顺时针扫描第一条（右转 > 直行 > 左转 > 掉头）；
+            # ccw 相同时弧优先（直线与弧相切点 tie-break，见
+            # polyline_ring 注释）；交点（度>2）直线优先（v0.6.3 fix2）
             deg = len(adj.get(cur_v, []))
             tie_arc_first = deg <= 2
-            cands.sort(key=lambda c: (-c[0],
+            # v0.6.12: 交点（deg>2）处同圆续段让位于直线优先
+            # （见 polyline_ring 注释）
+            cands.sort(key=lambda c: (_arc_cont(prev_edge, incoming,
+                                                c[1], c[3])
+                                      if deg <= 2 else 1,
+                                      -((c[0] + 1e-6) % (2 * math.pi)),
                                       0 if (edges[c[1]].etype == "ARC")
                                       == tie_arc_first else 1))
             _, eid_out, nxt, ang = cands[0]
             ring.append((eid_out, cur_v, nxt))
             used.add(eid_out)
-            incoming = ang
+            used_sigs.add(edge_sig[eid_out])
+            # v0.6.12: 弧切向 sweep 校正（见 polyline_ring 注释）
+            e = edges[eid_out]
+            if e.etype == "ARC":
+                if e.clockwise:
+                    sweep = math.radians(e.start_angle - e.end_angle)
+                else:
+                    sweep = math.radians(e.end_angle - e.start_angle)
+                while sweep > math.pi:
+                    sweep -= 2 * math.pi
+                while sweep < -math.pi:
+                    sweep += 2 * math.pi
+            else:
+                sweep = 0.0
+            incoming = ang + sweep
+            prev_edge = eid_out
             cur_v = nxt
             if cur_v == start_v:
                 pts = [vertex_pos[f] for _, f, _ in ring]
@@ -2643,20 +3479,33 @@ def extract_outer_rings_no_merge(edges, views):
         # 候选环: arc/polyline(min/max)/面遍历全部参与，按面积取大者
         # （polyline 规则在分支点可能返回错误小环，面积比较兜底）
         cands = []
-        for r in (arc_ring(vs), polyline_ring(vs, "min"),
-                  polyline_ring(vs, "max")):
+        for _lbl, r in (("arc", arc_ring(vs)), ("poly-min",
+                                                polyline_ring(vs, "min")),
+                        ("poly-max", polyline_ring(vs, "max"))):
             if r is not None:
-                cands.append(r)
+                cands.append((_lbl, r))
         # v0.6.3: 面遍历始终参与——混合环（弧+线，如法兰叶片角）
         # 的 arc_ring 返回 None，polyline min/max 规则在挂线分支点
         # （(72,-87) 顶点度 12）均可能走错；面遍历按左面规则
         # 遍历所有有向边，对平面图保证外环正确，由面积比较兜底
         fr = face_rings_all(vs)
         if fr is not None:
-            cands.append(fr)
+            cands.append(("face", fr))
         ring = None
         best_area = -1.0
-        for r in cands:
+        for _lbl, r in cands:
+            # v0.6.12: 自交环淘汰——绕内部孔圆全周的环重复访问顶点
+            # （孔-轮廓交点两次经过），面积虚高会被误选；重复顶点
+            # 即 8 字/绕圈自交，直接淘汰走次优候选。
+            _vc = {}
+            _dup = False
+            for _, f, _t in r:
+                if f in _vc:
+                    _dup = True
+                    break
+                _vc[f] = 1
+            if _dup:
+                continue
             a = ring_area_pts([vertex_pos[f] for _, f, _ in r])
             if a > best_area:
                 best_area = a
@@ -2680,6 +3529,10 @@ def extract_outer_rings_no_merge(edges, views):
                 "vertex_pos": vertex_pos,
                 "area": area,
                 "bbox": bbox,
+                # v0.6.12: 几何 bbox（含弧顶）——外轮廓面 dict 与
+                # P2 特征映射中心用此值；顶点 bbox 保留给方∩圆增强
+                # 的弧端点落边判据（几何 bbox 会把弦端点推到界外）
+                "geom_bbox": _ring_geom_bbox(ring, edges),
             }
 
     # ---- v0.6.3: 方∩圆叶片角外环增强 ----
@@ -2792,7 +3645,339 @@ def extract_outer_rings_no_merge(edges, views):
     # ±30）——矩形化对叶片材料无收益，却抹掉了 front/side 外环在
     # 台阶段的 ±25 收窄（φ50 台阶竖线），使台阶段假材料从 1,004
     # 恶化到 4,639。撤销矩形化，保留原始外环。
+
+    # ---- v0.6.12: 外环直径弦弧对补全 ----
+    # HLR 删除主体端部圆柱被相贯遮挡侧的大弧（bracket top 左端
+    # r25.5 缺左半 87.66~272.34°、右端 r20 缺右半 87.85~272.15°），
+    # 环退化走内半弧（X 宽 159 vs 真 185.5）。相邻两弧同圆心同半径
+    # 且自由端弦长≈直径（2r）→ 替换为绕外侧（环行进方向左侧）的
+    # 整段弧。PF60K 方∩圆 4 角弧同圆但自由端弦 ≈r 级≠2r 不触发。
+    for vname, rdata in list(result.items()):
+        ring = rdata["ring"]
+        n = len(ring)
+        if n < 3:
+            continue
+        new_ring = []
+        i = 0
+        while i < n:
+            eid, f, t = ring[i]
+            e = edges[eid]
+            eid2, f2, t2 = ring[(i + 1) % n]
+            e2 = edges[eid2]
+            if (t == f2 and e.etype == "ARC" and e2.etype == "ARC"
+                    and e.radius and e2.radius
+                    and abs(e.center[0] - e2.center[0]) < 0.1
+                    and abs(e.center[1] - e2.center[1]) < 0.1
+                    and abs(e.radius - e2.radius) < 0.1):
+                p1 = vertex_pos[f]
+                p2 = vertex_pos[t2]
+                d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                if abs(d - 2 * e.radius) < 0.5:
+                    # 新弧 f → t2 逆时针（顺时针环的外凸侧）
+                    sa = math.degrees(math.atan2(
+                        p1[1] - e.center[1], p1[0] - e.center[0]))
+                    ea = math.degrees(math.atan2(
+                        p2[1] - e.center[1], p2[0] - e.center[0]))
+                    if ea < sa:
+                        ea += 360.0
+                    # 跨度上限 200° 防全周（已覆盖侧 >200° 时放弃）
+                    if ea - sa <= 200.0:
+                        ne = Edge(len(edges), "ARC", p1, p2,
+                                  center=e.center, radius=e.radius,
+                                  start_angle=sa, end_angle=ea)
+                        edges.append(ne)
+                        new_ring.append((ne.id, f, t2))
+                        i += 2
+                        continue
+            new_ring.append((eid, f, t))
+            i += 1
+        if len(new_ring) != len(ring):
+            pts = [vertex_pos[f] for _, f, _ in new_ring]
+            na = abs(sum(pts[k][0] * pts[(k + 1) % len(pts)][1]
+                         - pts[k][1] * pts[(k + 1) % len(pts)][0]
+                         for k in range(len(pts)))) / 2
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            result[vname] = dict(rdata, ring=new_ring, area=na,
+                                 bbox=(min(xs), min(ys), max(xs), max(ys)))
     return result
+
+
+def _micro_chain_lengths(edges):
+    """v0.6.12: 微边（<0.3mm）端点聚类（<0.25mm）后的链长表 eid→链总长。
+
+    HLR B 样条投影的离散碎段（0.02~0.3mm 微段）端点带 0.03~0.06mm
+    DXF 精度间隙，无合并图中互不邻接；真伪影（弧裁剪挂线）是孤立
+    短微边，真实轮廓碎段连成长链（bracket top 左端凸耳轮廓碎段链
+    19.1mm/12.4mm）。链长表供微边跳过逻辑豁免长链（≥2mm 是轮廓）。
+    """
+    def _micro_geom(e):
+        return abs(e.start[0] - e.end[0]) < 0.3 and \
+            abs(e.start[1] - e.end[1]) < 0.3
+
+    micro_eids = [i for i, e in enumerate(edges) if _micro_geom(e)]
+    result = {}
+    if not micro_eids:
+        return result
+    ep = []  # (边序, 端点 0/1, x, y)
+    for i, eid in enumerate(micro_eids):
+        e = edges[eid]
+        ep.append((i, 0, e.start[0], e.start[1]))
+        ep.append((i, 1, e.end[0], e.end[1]))
+    m = len(ep)
+    # 端点桶化聚类（0.25mm 网格）
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for i in range(m):
+        buckets[(int(ep[i][2] / 0.25), int(ep[i][3] / 0.25))].append(i)
+    par = list(range(m))
+
+    def _find(i):
+        while par[i] != i:
+            par[i] = par[par[i]]
+            i = par[i]
+        return i
+
+    for i in range(m):
+        xa, ya = ep[i][2], ep[i][3]
+        for bx in (-1, 0, 1):
+            for by in (-1, 0, 1):
+                for j in buckets.get((int(xa / 0.25) + bx,
+                                      int(ya / 0.25) + by), []):
+                    if j <= i:
+                        continue
+                    if math.hypot(ep[j][2] - xa, ep[j][3] - ya) < 0.25:
+                        ri, rj = _find(i), _find(j)
+                        if ri != rj:
+                            par[ri] = rj
+    # 边连通分量 → 链长
+    edge_par = list(range(len(micro_eids)))
+
+    def _efind(i):
+        while edge_par[i] != i:
+            edge_par[i] = edge_par[edge_par[i]]
+            i = edge_par[i]
+        return i
+
+    for i in range(len(micro_eids)):
+        r0, r1 = _find(2 * i), _find(2 * i + 1)
+        for j in range(i + 1, len(micro_eids)):
+            if _find(2 * j) in (r0, r1) or _find(2 * j + 1) in (r0, r1):
+                ri, rj = _efind(i), _efind(j)
+                if ri != rj:
+                    edge_par[ri] = rj
+    chain_len = {}
+    for i, eid in enumerate(micro_eids):
+        e = edges[eid]
+        seg = math.hypot(e.end[0] - e.start[0], e.end[1] - e.start[1])
+        chain_len[_efind(i)] = chain_len.get(_efind(i), 0.0) + seg
+    for i, eid in enumerate(micro_eids):
+        result[eid] = chain_len[_efind(i)]
+    return result
+
+
+def _clean_ring_dups(ring, vertex_pos, edges):
+    """v0.6.11: 消去环中的往返重复边与微边碎屑。
+
+    HLR 弧裁剪处在无合并边图上产生同几何正反双弧（同一弧两条方向
+    相反的边）与 0.3mm 级微边，最右转遍历把它们全收进环 → wire
+    自交、MakeWire 抛 StdFail_NotDone（bracket top 视图 13 ARC 环
+    实测：边 5/6、9/12 为 r25.5 往返弧对）。往返对删除后剩余边
+    序列的断点由 ShapeFix FixConnected 容差 0.5 焊接。
+    """
+    n = len(ring)
+    if n < 4:
+        return ring
+    drop = [False] * n
+    # 1) 微边碎屑 (< 0.3mm, 弧裁剪交点处)——v0.6.12: 长链微边
+    # （B 样条投影离散碎段链 ≥2mm）是真实轮廓，豁免
+    mcl = _micro_chain_lengths(edges)
+    for i, (eid, f, t) in enumerate(ring):
+        e = edges[eid]
+        p1, p2 = vertex_pos[f], vertex_pos[t]
+        if math.hypot(p1[0] - p2[0], p1[1] - p2[1]) < 0.3 \
+                and mcl.get(eid, 0.0) < 2.0:
+            drop[i] = True
+    # 2) 往返对: 同顶点对、反向、同几何（ARC 须同圆心同半径）
+    for i in range(n):
+        if drop[i]:
+            continue
+        eid_i, f_i, t_i = ring[i]
+        e_i = edges[eid_i]
+        for j in range(i + 1, n):
+            if drop[j]:
+                continue
+            eid_j, f_j, t_j = ring[j]
+            if f_i != t_j or t_i != f_j:
+                continue
+            e_j = edges[eid_j]
+            if e_i.etype != e_j.etype:
+                continue
+            if e_i.etype == "ARC" and (
+                    abs(e_i.center[0] - e_j.center[0]) > 1e-6
+                    or abs(e_i.center[1] - e_j.center[1]) > 1e-6
+                    or abs(e_i.radius - e_j.radius) > 1e-6):
+                continue
+            drop[i] = drop[j] = True
+            break
+    return [r for r, d in zip(ring, drop) if not d]
+
+
+def _weld_ring_vertices(ring, vertex_pos, tol=0.3):
+    """v0.6.11: 焊接环内距离 < tol 的顶点为同一点。
+
+    环提取器的内部顶点表没有 0.5mm 级近邻合并（edge_vertices 的
+    merge_close_vertices 只作用于边图），HLR 弧-线端点 0.03mm 间隙
+    的顶点在环里是两个不同顶点 → 删除微边后相邻边断开 0.03mm，
+    MakeWire DisconnectedWire / ShapeFix FixConnected 焊接不可靠
+    （实测 FixConnected(0.5) 后 face 仍无效）。
+
+    并查集把 < tol 的顶点对合并（坐标取首见值），返回
+    (new_ring, new_vertex_pos)——焊接后相邻边端点精确重合，
+    MakeWire 直接成功（bracket top cleaned 12 边环实测）。
+    """
+    used = {}
+    for _eid, f, t in ring:
+        used[f] = vertex_pos[f]
+        used[t] = vertex_pos[t]
+    ids = list(used)
+    parent = {v: v for v in ids}
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            ra, rb = _find(ids[i]), _find(ids[j])
+            if ra == rb:
+                continue
+            pa, pb = used[ids[i]], used[ids[j]]
+            if math.hypot(pa[0] - pb[0], pa[1] - pb[1]) < tol:
+                parent[ra] = rb
+    new_pos = {}
+    remap = {}
+    for v in ids:
+        r = _find(v)
+        if r not in new_pos:
+            new_pos[r] = used[r]
+        remap[v] = r
+    new_ring = [(_eid, remap[f], remap[t]) for _eid, f, t in ring]
+    return new_ring, new_pos
+
+
+def _build_wire_impl(ring, vertex_pos, edges, sf, allow_loose,
+                     use_3pt_arc=False):
+    """构建 wire 的内部实现。allow_loose=True 时 MakeWire 失败改用
+    BRep_Builder 松散组装（断点由 ShapeFix FixConnected 焊接）。
+    use_3pt_arc=True 时 ARC 用三点定弧构造（端点精确等于环顶点）——
+    顶点焊接后弧端点（圆上参数点）与焊接顶点仍有 0.03mm 偏差，
+    参数弧 + MakeWire 的严格端点检查依然断开；三点定弧保证边端点
+    与顶点精确重合（bracket top cleaned 环实测）。"""
+    wb = BRepBuilderAPI_MakeWire()
+    built_edges = []
+    for eid, f, t in ring:
+        e = edges[eid]
+        p1 = vertex_pos[f]
+        p2 = vertex_pos[t]
+        # v0.6.12: 微边链焊接后碎段两端点坐标统一 → 零长边
+        # MakeEdge StdFail_NotDone。跳过（前后边端点已重合，环仍连通）
+        if abs(p1[0] - p2[0]) < 1e-7 and abs(p1[1] - p2[1]) < 1e-7:
+            continue
+        if e.etype == "ARC" and e.radius > 0 and use_3pt_arc:
+            # 三点定弧: p1 → pmid（DXF 扫角中点方位）→ p2
+            sa = math.radians(e.start_angle)
+            ea = math.radians(e.end_angle)
+            if ea <= sa:
+                ea += 2 * math.pi
+            mid_ang = (sa + ea) / 2
+            cx = e.center[0] * sf
+            cy = e.center[1] * sf
+            r = e.radius * sf
+            pmid = (cx + r * math.cos(mid_ang), cy + r * math.sin(mid_ang))
+            arc3 = GC_MakeArcOfCircle(
+                gp_Pnt(p1[0] * sf, p1[1] * sf, 0),
+                gp_Pnt(pmid[0], pmid[1], 0),
+                gp_Pnt(p2[0] * sf, p2[1] * sf, 0))
+            if not arc3.IsDone():
+                # 三点退化（近似共线）→ 回退参数弧构造
+                sa_rad, ea_rad = math.radians(e.start_angle), \
+                    math.radians(e.end_angle)
+                if ea_rad <= sa_rad:
+                    ea_rad += 2 * math.pi
+                circ = gp_Circ(
+                    gp_Ax2(gp_Pnt(cx, cy, 0), gp_Dir(0, 0, 1)), r)
+                occ_edge = BRepBuilderAPI_MakeEdge(
+                    circ, sa_rad, ea_rad).Edge()
+                d_start = ((p1[0] - e.start[0]) ** 2
+                           + (p1[1] - e.start[1]) ** 2)
+                d_end = ((p1[0] - e.end[0]) ** 2
+                         + (p1[1] - e.end[1]) ** 2)
+                if d_start > d_end:
+                    occ_edge.Reverse()
+            else:
+                occ_edge = BRepBuilderAPI_MakeEdge(arc3.Value()).Edge()
+        elif e.etype == "ARC" and e.radius > 0:
+            circ = gp_Circ(
+                gp_Ax2(gp_Pnt(e.center[0] * sf, e.center[1] * sf, 0),
+                       gp_Dir(0, 0, 1)),
+                e.radius * sf)
+            # v0.6.11: 直接用 DXF 扫角参数构造，端点匹配判定方向。
+            # 原 atan2 反推方向对 HLR 微弧失效: 0.09° 弧 (sa=87.85
+            # ea=87.94) 的 atan2 端点角差 -0.0015 rad，end>=start
+            # 判逆时针后 a2+=2π 把短弧放大成 6.28 rad 整圆，wire
+            # 自交构建失败 (bracket top 视图 13 ARC 环实测)。
+            # p1 靠近 DXF start 点 → 正向 (sa→ea)；靠近 end 点 →
+            # 反向 (ea→sa，OCC 参数递减 = 顺时针，HLR 顺时针小弧
+            # end < start 即此情形)。端点与 LINE 顶点的微小偏差由
+            # ShapeFix_Wire 容差 0.5 修复。
+            sa_rad = math.radians(e.start_angle)
+            ea_rad = math.radians(e.end_angle)
+            d_start = ((p1[0] - e.start[0]) ** 2
+                       + (p1[1] - e.start[1]) ** 2)
+            d_end = ((p1[0] - e.end[0]) ** 2
+                     + (p1[1] - e.end[1]) ** 2)
+            # v0.6.11: 始终构造 sa→ea 小弧（ea<sa 时 +2π 保证
+            # 参数递增），反向边用 Reverse()。旧代码反向时直接
+            # MakeEdge(ea, sa)——ea>sa 时 OCC 产生 2π-跨度的大弧
+            # （bracket top r20 微弧 sa=87.85 ea=87.94 反向构造出
+            # 359.9° 大弧 → wire 自交 NotDone，v7 成功 v8 失败的
+            # 非确定根因之一）。
+            if ea_rad <= sa_rad:
+                ea_rad += 2 * math.pi
+            occ_edge = BRepBuilderAPI_MakeEdge(circ, sa_rad, ea_rad).Edge()
+            if d_start > d_end:
+                occ_edge.Reverse()
+        else:
+            occ_edge = BRepBuilderAPI_MakeEdge(
+                gp_Pnt(p1[0] * sf, p1[1] * sf, 0),
+                gp_Pnt(p2[0] * sf, p2[1] * sf, 0)).Edge()
+        wb.Add(occ_edge)
+        built_edges.append(occ_edge)
+    try:
+        wire = wb.Wire()
+    except Exception:
+        if not allow_loose:
+            return None
+        # MakeWire 严格容差(1e-7)下 HLR 弧端点与线端点 ~0.03mm 偏差
+        # 抛 StdFail_NotDone；改用 BRep_Builder 松散组装
+        bld = BRep_Builder()
+        wire = TopoDS_Wire()
+        bld.MakeWire(wire)
+        for ce in built_edges:
+            bld.Add(wire, ce)
+    fixer = ShapeFix_Wire()
+    fixer.SetPrecision(0.5)
+    fixer.Load(wire)
+    fixer.FixReorder()
+    fixer.FixConnected()
+    fixer.FixClosed()
+    wire = fixer.Wire()
+    if not BRepCheck_Analyzer(wire).IsValid():
+        return None
+    return wire
 
 
 def build_wire_from_directed_ring(ring, vertex_pos, edges, scale_factor=1.0):
@@ -2800,55 +3985,66 @@ def build_wire_from_directed_ring(ring, vertex_pos, edges, scale_factor=1.0):
 
     ARC 端点夹取到圆上（HLR 输出弧端点与圆心距有 ~0.03mm 偏差），
     LINE 直接用两端点。
+
+    v0.6.11: 保守清理——先原环构建（保护 side 等成功路径），wire
+    组装失败（自交 StdFail_NotDone）才消去往返对/微边重试
+    （bracket top 环的 HLR 往返弧对）。清理后顶点焊接
+    （_weld_ring_vertices）消除微边删除留下的 0.03mm 端点间隙——
+    ShapeFix FixConnected 对此不可靠（实测焊接后 face 仍无效）。
     """
     try:
-        sf = scale_factor
-        wb = BRepBuilderAPI_MakeWire()
-        for eid, f, t in ring:
-            e = edges[eid]
-            p1 = vertex_pos[f]
-            p2 = vertex_pos[t]
-            if e.etype == "ARC" and e.radius > 0:
-                circ = gp_Circ(
-                    gp_Ax2(gp_Pnt(e.center[0] * sf, e.center[1] * sf, 0),
-                           gp_Dir(0, 0, 1)),
-                    e.radius * sf)
-                # v0.6.4: 参数版弧构造——三点过圆重载在 pythonocc
-                # 7.7.2 中不存在（MakeEdge(circ, P1, P2, P3) 抛
-                # TypeError 被 except 吞掉），历史上所有 ARC 边静默
-                # 退化为弦线（PF60K 顶段 R40 角弧变 45° 斜面，
-                # "圆形突起变方形"的根源）。改用参数构造，方向由
-                # DXF 扫角决定（HLR 顺时针小弧 end < start），
-                # 端点与 LINE 顶点的微小偏差由 ShapeFix_Wire 容差
-                # 0.5 修复。
-                a1 = math.atan2(p1[1] - e.center[1], p1[0] - e.center[0])
-                a2 = math.atan2(p2[1] - e.center[1], p2[0] - e.center[0])
-                if e.end_angle >= e.start_angle:
-                    # DXF 逆时针弧 p1→p2
-                    while a2 <= a1:
-                        a2 += 2 * math.pi
-                    occ_edge = BRepBuilderAPI_MakeEdge(circ, a1, a2).Edge()
-                else:
-                    # DXF 顺时针弧（HLR end < start）: 逆时针 p2→p1
-                    # 段与之几何重合（wire 方向由 FixReorder 统一）
-                    while a1 <= a2:
-                        a1 += 2 * math.pi
-                    occ_edge = BRepBuilderAPI_MakeEdge(circ, a2, a1).Edge()
-            else:
-                occ_edge = BRepBuilderAPI_MakeEdge(
-                    gp_Pnt(p1[0] * sf, p1[1] * sf, 0),
-                    gp_Pnt(p2[0] * sf, p2[1] * sf, 0)).Edge()
-            wb.Add(occ_edge)
-        wire = wb.Wire()
-        fixer = ShapeFix_Wire()
-        fixer.SetPrecision(0.5)
-        fixer.Load(wire)
-        fixer.FixReorder()
-        fixer.FixConnected()
-        fixer.FixClosed()
-        return fixer.Wire()
+        wire = _build_wire_impl(ring, vertex_pos, edges, scale_factor,
+                                allow_loose=False)
+        if wire is None:
+            # v0.6.12: 首次失败无论清理有无变化都三点定弧重试——
+            # cleaned 长度不变时参数弧端点与顶点仍有 0.03mm 偏差，
+            # 严格 MakeWire NotDone 直接返回 None（bracket top 10 边
+            # 跑道形环实测）；三点定弧端点精确等于顶点 + 松散组装 +
+            # ShapeFix 焊接可修复。
+            cleaned = _clean_ring_dups(ring, vertex_pos, edges)
+            welded, wpos = _weld_ring_vertices(cleaned, vertex_pos)
+            wire = _build_wire_impl(welded, wpos, edges, scale_factor,
+                                    allow_loose=True, use_3pt_arc=True)
+        return wire
     except Exception:
         return None
+
+
+def _remove_roundtrip_arcs(edges):
+    """v0.6.12: 全局往返弧对剔除，返回被剔 eid 集合（保留正向弧）。
+
+    HLR 弧裁剪处同几何正反双弧：同一圆弧被拆成方向相反的两条边
+    （同圆心同半径、端点互换），角度互补。整圆角度覆盖统计若不
+    剔除，半圆弧对的 sum 会虚增成整圆（PF60K 内孔圆 r21/r25/r16
+    实测 4 段 720°）。_clean_ring_dups 的环内往返对删除依赖顶点
+    索引，此处按坐标匹配供全局弧组统计用。
+    """
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for i, e in enumerate(edges):
+        if e.etype != "ARC" or not e.radius or e.radius <= 0:
+            continue
+        groups[(round(e.center[0], 3), round(e.center[1], 3),
+                round(e.radius, 3))].append(i)
+    drop = set()
+    for idxs in groups.values():
+        n = len(idxs)
+        if n < 2:
+            continue
+        for a in range(n):
+            if idxs[a] in drop:
+                continue
+            for b in range(a + 1, n):
+                if idxs[b] in drop:
+                    continue
+                ea, eb = edges[idxs[a]], edges[idxs[b]]
+                # 端点互换（正弧 start=反弧 end 且正弧 end=反弧 start）
+                if (abs(ea.start[0] - eb.end[0]) < 1e-6
+                        and abs(ea.start[1] - eb.end[1]) < 1e-6
+                        and abs(ea.end[0] - eb.start[0]) < 1e-6
+                        and abs(ea.end[1] - eb.start[1]) < 1e-6):
+                    drop.add(idxs[b])  # 剔后一条（反向弧）
+    return drop
 
 
 def _find_inner_body_circle(ring_data, edges):
@@ -2876,14 +4072,30 @@ def _find_inner_body_circle(ring_data, edges):
     rw, rh = rb[2] - rb[0], rb[3] - rb[1]
     if min(rw, rh) <= 0:
         return None
+    # v0.6.12: 分体只对近方形 top 外环生效（方角法兰特征）——
+    # 长条件（bracket 跑道形 2.75:1）端部的真整圆（右端 r20 圆筒
+    # 投影）不是内接主体圆，旧判据把它当主体圆分体会把主体棱柱
+    # 换成端部圆棱柱（主体丢大半材料）。
+    if max(rw, rh) > min(rw, rh) * 1.25:
+        return None
     half = min(rw, rh) / 2
     n_lines = sum(1 for eid, _, _ in ring_data["ring"]
                   if edges[eid].etype == "LINE")
     if n_lines < 4:
         return None
+    # v0.6.12: 往返弧对剔除——HLR 弧裁剪处同几何正反双弧（同圆心同
+    # 半径、端点互换）按全局弧组统计会把端半圆累计成假整圆（bracket
+    # top r25.5 半圆实测 653°、PF60K 内孔圆 720°）。剔除反向弧后
+    # 正弧覆盖正确（半圆 175° 排除、整圆 360° 保留）。
+    # v0.6.12 修订：不用"清理后环上的弧"过滤——PF60K 主体整圆 r30
+    # 与内孔圆 r21/r25/r16 都在外环之外（[叶片角] 增强把外环换成
+    # 8 段合成轮廓），环过滤会把它们全排除 → 主体圆/环带内孔丢失、
+    # 环上 r40 合成角弧（负角度区间误拆成 491°）冒充主体圆。
+    rt_drop = _remove_roundtrip_arcs(edges)
     arc_groups = {}
     for e in edges:
-        if e.etype != "ARC" or not e.radius or e.radius <= 0:
+        if (e.etype != "ARC" or not e.radius or e.radius <= 0
+                or e.id in rt_drop):
             continue
         key = (round(e.center[0], 2), round(e.center[1], 2),
                round(e.radius, 2))
@@ -2900,7 +4112,37 @@ def _find_inner_body_circle(ring_data, edges):
         if not (rb[0] + r * 0.2 < cx < rb[2] - r * 0.2
                 and rb[1] + r * 0.2 < cy < rb[3] - r * 0.2):
             continue
-        span = sum(abs(e.end_angle - e.start_angle) for e in es)
+        # v0.6.11: 角度覆盖用区间合并去重——原 sum(abs(ea-sa)) 会把
+        # HLR 往返弧对重复累计 (bracket top 环 r25.5 端半圆 8 段弧含
+        # 2 对往返, sum=653° > 300° 误触发分体, 主体被换成圆棱柱
+        # X=128/203)。跨 0° 弧 (ea<sa) 拆两段, 合并后覆盖半圆 175°
+        # < 300° 正确排除; PF60K 主体整圆 16 段合并成 (0,360) 保持。
+        # v0.6.12: 角度先归一化到 [0,360)——atan2 负角度弧（合成角弧
+        # lo=-131 hi=-139）hi<lo 并非跨 0° 而是负区间短弧，旧逻辑
+        # 误拆成 (lo,360)+(0,hi) 把 7.2° 短弧累计成 491° 假整圆
+        # （PF60K r40 合成角弧冒充主体圆、环带面积 24 的根因）。
+        # 合成角弧的字段角度方向与环行进相反（reverse 小弧），归一化
+        # 后仍是 hi<lo 且补集跨度 >180°——此时取 (hi,lo) 短弧区间，
+        # 只有真跨 0° 弧（补集 <180°）才拆两段。
+        segs = []
+        for e in es:
+            lo, hi = e.start_angle % 360.0, e.end_angle % 360.0
+            if hi < lo:
+                if 360.0 - lo + hi > 180.0:
+                    segs.append((hi, lo))
+                else:
+                    segs.append((lo, 360.0))
+                    segs.append((0.0, hi))
+            else:
+                segs.append((lo, hi))
+        segs.sort()
+        merged = []
+        for lo, hi in segs:
+            if merged and lo <= merged[-1][1] + 1.0:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        span = sum(hi - lo for lo, hi in merged)
         if span < 300.0:
             continue
         full_circles.append((r, cx, cy))
@@ -3056,19 +4298,41 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
 
     for v in views:
         ring_data = no_merge_rings.get(v["name"])
+        # v0.6.11: 外轮廓合理性校验——无合并边图上有局部断点
+        # （端点间隙 > SNAP_TOL 0.01）时，最右转遍历会退回视图内部的
+        # 局部小环 (bracket front 提取到 31/203=15% 宽的小环，CSG 主体
+        # X 只剩 51/184)。环 bbox 覆盖视图 bbox 不足 50% 视为非外轮廓，
+        # 回退 face 遍历外轮廓选择 / 包围盒矩形路径。
+        if ring_data is not None:
+            rb = ring_data["bbox"]
+            vb = v["bbox"]
+            vw, vh = vb[2] - vb[0], vb[3] - vb[1]
+            rw, rh = rb[2] - rb[0], rb[3] - rb[1]
+            if vw > 0 and vh > 0 and (rw < vw * 0.5 or rh < vh * 0.5):
+                print(f"  [v0.6.11] 视图 '{v['name']}' 无合并环仅覆盖 "
+                      f"{rw/vw*100:.0f}%×{rh/vh*100:.0f}% 视图区, "
+                      f"视为非外轮廓回退")
+                ring_data = None
         if ring_data is not None:
             # 新路径: 直接用无合并外环，绕过 face 遍历外轮廓选择
             rb = ring_data["bbox"]
+            gb = ring_data.get("geom_bbox") or rb
             outer_face = {
                 "edges": None,
                 "area": ring_data["area"],
                 "face_type": "no_merge_ring",
-                "x_min": rb[0], "y_min": rb[1],
-                "x_max": rb[2], "y_max": rb[3],
+                # v0.6.12: 几何 bbox（含弧顶）——P2 特征映射中心与
+                # half_w 用此值；顶点 bbox 丢弧顶会偏 9.6mm
+                "x_min": gb[0], "y_min": gb[1],
+                "x_max": gb[2], "y_max": gb[3],
             }
             use_bbox_fallback = False
             use_ring_wire = True
             ring_wire_data = ring_data
+            # v0.6.12: top 视图 x 镜像标志（extract_outer_rings_no_merge
+            # 检测），棱柱构建与 P2 特征映射共用
+            v["_x_mirrored"] = ring_data.get("x_mirrored", False)
+            outer_trusted = True  # v0.6.12: 环已通过双维 ≥50% 覆盖校验
         else:
             use_ring_wire = False
             ring_wire_data = None
@@ -3083,6 +4347,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
 
             outer_face = None
             use_bbox_fallback = False
+            outer_trusted = False  # v0.6.12: 可信度标志（面路径默认不可信）
             if line_faces:
                 outer_face = line_faces[0]
             elif arc_faces:
@@ -3098,6 +4363,8 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 if (view_x_span > 0 and face_x_span < view_x_span * 0.50) or \
                    (view_y_span > 0 and face_y_span < view_y_span * 0.50):
                     outer_face = None  # 触发包围盒回退
+            if outer_face is not None:
+                outer_trusted = True  # v0.6.12: 面覆盖双维 ≥50%
 
         if outer_face is None and len(v["faces"]) >= 1:
             # 用视图包围盒构建矩形外轮廓
@@ -3187,17 +4454,37 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                         outer_face["area"] = ((outer_face["x_max"] - outer_face["x_min"])
                                               * (split_y - outer_face["y_min"]))
                         use_bbox_fallback = True
+                        outer_trusted = False  # v0.6.12: 几何变为裁剪矩形
 
         if outer_face is None:
             print(f"  [WARN] 视图 '{v['name']}' 无有效外轮廓，跳过")
             continue
 
         # ---- P3: 视图 DXF 中心（供 CSG 特征坐标映射） ----
-        # 用视图分离区域 bbox 的中心（而非外轮廓中心）作为映射基准：
-        # 特征坐标相对视图区域的偏移在 bbox 回退扩展前后保持一致，
-        # 且 CSG 棱柱居中平移后主体中心在原点附近，特征需减去此基准。
-        v["_dxf_center_x"] = (v["bbox"][0] + v["bbox"][2]) / 2 * scale_factor
-        v["_dxf_center_y"] = (v["bbox"][1] + v["bbox"][3]) / 2 * scale_factor
+        # v0.6.12: 与棱柱居中量同源——外环可信且与共享轴同伴（front/top
+        # 互为同伴）区域中心一致（≤3mm）时用外轮廓面中心：区域被相邻
+        # 视图污染时仍正确（block_3view front 区域中心 72.5 ≠ 环中心 50）；
+        # 外环残缺时（bracket top 缺叉臂，环中心偏离区域中心）回退区域
+        # 中心。_dxf_center_x 存无符号中心，top 镜像取号在消费端（P2）。
+        face_cx = (outer_face["x_min"] + outer_face["x_max"]) / 2
+        face_cy = (outer_face["y_min"] + outer_face["y_max"]) / 2
+        _peer_cx = None
+        if v["view_type"] in ("front", "top"):
+            for _pv in views:
+                if _pv is v or _pv["view_type"] not in ("front", "top"):
+                    continue
+                _peer_cx = (_pv["bbox"][0] + _pv["bbox"][2]) / 2
+                break
+        _agree = _peer_cx is None or abs(face_cx - _peer_cx) <= 3.0
+        v["_use_own_cx"] = outer_trusted and _agree
+        if v["_use_own_cx"]:
+            v["_dxf_center_x"] = face_cx * scale_factor
+        else:
+            v["_dxf_center_x"] = (v["bbox"][0] + v["bbox"][2]) / 2 * scale_factor
+        if outer_trusted:
+            v["_dxf_center_y"] = face_cy * scale_factor
+        else:
+            v["_dxf_center_y"] = (v["bbox"][1] + v["bbox"][3]) / 2 * scale_factor
 
         # 构建 Wire → Face
         if use_bbox_fallback:
@@ -3223,9 +4510,59 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             print(f"  [WARN] 视图 '{v['name']}' Wire 构建失败")
             continue
         occ_face = build_occ_face(wire)
+        # v0.6.11: face 无效（wire 含往返对自交但拓扑有效）→ 清理
+        # +顶点焊接+三点定弧重试（bracket top 24 边环 strict 成 wire
+        # 但 face 无效、拉伸失败）
+        if occ_face is not None and not BRepCheck_Analyzer(occ_face).IsValid() \
+                and use_ring_wire and ring_wire_data:
+            _cl = _clean_ring_dups(ring_wire_data["ring"],
+                                   ring_wire_data["vertex_pos"], edges)
+            if len(_cl) != len(ring_wire_data["ring"]):
+                _wld, _wpos = _weld_ring_vertices(
+                    _cl, ring_wire_data["vertex_pos"])
+                _w2 = _build_wire_impl(_wld, _wpos, edges, scale_factor,
+                                       allow_loose=True, use_3pt_arc=True)
+                _f2 = build_occ_face(_w2) if _w2 is not None else None
+                if _f2 is not None and BRepCheck_Analyzer(_f2).IsValid():
+                    occ_face = _f2
         if occ_face is None:
             print(f"  [WARN] 视图 '{v['name']}' Face 构建失败")
             continue
+        if not BRepCheck_Analyzer(occ_face).IsValid():
+            # v0.6.12: 回退前先 ShapeFix 修复——bracket front 120 边环
+            # 松散组装 wire 的 face 无效但 ShapeFix 后有效（多碎段
+            # 折线/弧组装间隙）；修复成功可保留 z 阶梯等轮廓细节，
+            # bbox 矩形回退只有主体尺寸。
+            _fx = ShapeFix_Shape(occ_face)
+            _fx.Perform()
+            _fxd = _fx.Shape()
+            if BRepCheck_Analyzer(_fxd).IsValid():
+                occ_face = _fxd
+                print(f"  [FIX] 视图 '{v['name']}' Face ShapeFix 修复成功")
+        if not BRepCheck_Analyzer(occ_face).IsValid():
+            # v0.6.12: face 无效回退 bbox 矩形——自交环（bracket front
+            # 120 边环绕孔弧自交）直接 continue 会丢整视图棱柱；矩形
+            # 棱柱保留主体尺寸，形状细节由其他视图/P0 特征约束
+            print(f"  [WARN] 视图 '{v['name']}' Face 无效（自交未消除）, bbox 回退")
+            _vbb = v["bbox"]
+            _wb2 = BRepBuilderAPI_MakePolygon(
+                gp_Pnt(_vbb[0] * scale_factor, _vbb[1] * scale_factor, 0),
+                gp_Pnt(_vbb[2] * scale_factor, _vbb[1] * scale_factor, 0),
+                gp_Pnt(_vbb[2] * scale_factor, _vbb[3] * scale_factor, 0),
+                gp_Pnt(_vbb[0] * scale_factor, _vbb[3] * scale_factor, 0),
+                True)
+            occ_face = build_occ_face(_wb2.Wire())
+            if occ_face is None \
+                    or not BRepCheck_Analyzer(occ_face).IsValid():
+                continue
+            # v0.6.12: 几何已变为 bbox 矩形——可信度降级，门控与特征
+            # 映射基准（L4483 已按原外环算过）重算为区域中心
+            outer_trusted = False
+            v["_use_own_cx"] = False
+            v["_dxf_center_x"] = (_vbb[0] + _vbb[2]) / 2 * scale_factor
+            v["_dxf_center_y"] = (_vbb[1] + _vbb[3]) / 2 * scale_factor
+
+        v["_outer_trusted"] = outer_trusted
 
         # ---- v0.6.3 P3.1: top 视图分体（主体圆棱柱 + 环带棱柱） ----
         # 方角法兰外环内接主体整圆时, 单外环求交得方柱而非圆柱。
@@ -3298,6 +4635,19 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         full16_face = None
         if v.get("_full16_face") is not None:
             full16_face = _apply_view_transform(v["_full16_face"], v["view_type"])
+        # v0.6.12: top 视图镜像投影（DXF_X = −3D_X）补偿——图纸侧
+        # 俯视图是镜像的，棱柱必须 x 翻面才能与 front/side 对齐
+        # （bracket 不对称件此前 top 棱柱 x 反向，交集把塔剃成板宽柱）
+        if v["view_type"] == "top" and v.get("_x_mirrored"):
+            trsf_mir = gp_Trsf()
+            trsf_mir.SetMirror(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)))
+            occ_face = BRepBuilderAPI_Transform(occ_face, trsf_mir).Shape()
+            if split_face is not None:
+                split_face = BRepBuilderAPI_Transform(split_face,
+                                                      trsf_mir).Shape()
+            if full16_face is not None:
+                full16_face = BRepBuilderAPI_Transform(full16_face,
+                                                       trsf_mir).Shape()
 
         # 对齐：非前视图面平移使 Z_min=0（统一内部特征偏移基准；
         # 前视图面位于 XZ 平面，Z 范围由 DXF_Y 决定，不做此平移）
@@ -3340,11 +4690,34 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         # 棱柱居中到原点：避免大坐标导致的布尔运算精度问题
         # （在拉伸后整体平移，保持各维度的相对位置正确；分体的两个
         # 棱柱共用外环棱柱的居中平移量，保持主体与环带相对位置）
+        # v0.6.12: 居中量 X 按可信度门控——外环可信（环/面覆盖视图
+        # 区域 ≥50%）且与共享轴同伴区域中心一致（≤3mm）时用棱柱自身
+        # bbox X 中心：区域被相邻视图污染时仍正确（block_3view front
+        # 区域中心 72.5 ≠ 环中心 50）；外环残缺时（bracket top 缺叉臂，
+        # 环中心偏离区域中心）回退视图区域中心（top 镜像取反号），
+        # front/top 统一居中消除相对位移（22mm）。side 视图 DXF X
+        # 映射到 3D Y、3D X 是拉伸轴，恒用自身中心（图形练习 0 实体
+        # 回归）。Y/Z 方向各视图是不同物理轴，仍用棱柱自身 bbox 中心
+        # 各自居中。对称完整外环（PF60K）时与原先行为完全一致。
         try:
             prism_bbox = Bnd_Box()
             brepbndlib.Add(prism, prism_bbox)
             px1, py1, pz1, px2, py2, pz2 = prism_bbox.Get()
-            pcx = (px1 + px2) / 2
+            # 镜像视图（top 已翻 X）的棱柱中心 = −视图中心，
+            # 居中量须取反号：翻后 [−205.3,−2] + 103.65 → [−101.65,101.65]
+            _mir = v["view_type"] == "top" and v.get("_x_mirrored")
+            _sgn = -1 if _mir else 1
+            if v["view_type"] == "side":
+                # side: DXF X 映射到 3D Y，3D X 是拉伸轴——区域 X 中心
+                # 对该轴无意义，恒用棱柱自身中心（图形练习 0 实体回归）
+                pcx = (px1 + px2) / 2
+            elif v.get("_use_own_cx"):
+                # 外环可信且与同伴一致: 棱柱自身 bbox X 中心。top 镜像
+                # 时棱柱已翻面，自身中心自动含镜像，无需 _sgn
+                pcx = (px1 + px2) / 2
+            else:
+                # 外环残缺: 回退视图区域中心（top 镜像取反号）
+                pcx = _sgn * (v["bbox"][0] + v["bbox"][2]) / 2 * scale_factor
             pcy = (py1 + py2) / 2
             pcz = (pz1 + pz2) / 2
             if abs(pcx) > 0.01 or abs(pcy) > 0.01 or abs(pcz) > 0.01:
@@ -3360,11 +4733,67 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         except Exception:
             pass
 
+        # v0.6.12: 外环棱柱无条件记录——台阶收腰刀需要 top 棱柱做
+        # band 截形（bracket 无环带分体，此前 _body_prism 不赋值）
+        v["_body_prism"] = prism
+        # v0.6.12: top 条带参数提取（不在此 Fuse——棱柱级 Fuse 会
+        # 被后续台阶收腰刀/孔刀切掉，条带补丁在全部切割完成后、
+        # 返回前 Fuse 到 combined）。联合轮廓外环（塔环带+叉臂
+        # 圆头+凸台条边混合）填充时凸台条边 y=±1 右半未闭合进环
+        # （条边右端与右端竖线/折线断裂），y[±1] 窄带从填充右界
+        # 到条左端成空洞（bracket 凸台条缺 x[147.65,165.15] 段）。
+        # 判据: top 视图存在距视图中心 ±2 内、y 差 1.5~2.5 的水平
+        # 线对（凸台条边 y=±1 投影），x 重叠 ≥70% → 记录条带盒
+        # 参数（x=线对范围 CSG 映射、y=线对带、z=条段）。PF60K/
+        # 回归件 top 视图无此类条边对，不触发。
+        if v["view_type"] == "top" and v.get("_x_mirrored"):
+            _hl = {}
+            _n_line = 0
+            for _e in edges:
+                if getattr(_e, "etype", "") != "LINE":
+                    continue
+                _n_line += 1
+                (_x1, _y1), (_x2, _y2) = _e.start, _e.end
+                if abs(_y1 - _y2) > 0.3:
+                    continue
+                _ym = (min(_y1, _y2) + max(_y1, _y2)) / 2
+                _hl.setdefault(round(_ym, 1), []).append(
+                    (min(_x1, _x2), max(_x1, _x2)))
+            _vyc = (v["bbox"][1] + v["bbox"][3]) / 2
+            _band_x = None
+            for _ya in sorted(_hl):
+                for _yb in sorted(_hl):
+                    if _yb - _ya < 1.5:
+                        continue
+                    if _yb - _ya > 2.5:
+                        break
+                    if abs((_ya + _yb) / 2 - _vyc) > 2.0:
+                        continue
+                    _sa, _sb = _hl[_ya], _hl[_yb]
+                    _xa_lo = min(s[0] for s in _sa)
+                    _xa_hi = max(s[1] for s in _sa)
+                    _xb_lo = min(s[0] for s in _sb)
+                    _xb_hi = max(s[1] for s in _sb)
+                    _w = min(_xa_hi, _xb_hi) - max(_xa_lo, _xb_lo)
+                    if _w < 0.7 * (_xa_hi - _xa_lo):
+                        continue
+                    _band_x = (max(_xa_lo, _xb_lo), min(_xa_hi, _xb_hi))
+                    break
+                if _band_x:
+                    break
+            if _band_x:
+                # DXF → CSG 映射（镜像+居中: CSG_x = pcx_abs − DXF_x）
+                _pxc = (v["bbox"][0] + v["bbox"][2]) / 2 * scale_factor
+                _bx1 = _pxc - _band_x[1]
+                _bx2 = _pxc - _band_x[0]
+                _by1 = (_ya - _vyc) * scale_factor
+                _by2 = (_yb - _vyc) * scale_factor
+                v["_band_patch"] = (min(_bx1, _bx2), max(_bx1, _bx2),
+                                    min(_by1, _by2), max(_by1, _by2))
         prisms.append(prism)
         if flange_prism is not None:
             # 环带棱柱单独收集, 求交时与 front/side 棱柱再求交
             prisms_flange.append(flange_prism)
-            v["_body_prism"] = prism
         if full16_prism is not None:
             # v0.6.4: 16 边实心棱柱，供顶段环柱补丁（修复 45° 斜切角）
             v["_full16_prism"] = full16_prism
@@ -3381,6 +4810,15 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             v["_outer_ring_radii"] = set(
                 round(edges[eid].radius, 1) for eid, _, _ in ring_data["ring"]
                 if edges[eid].etype == "ARC" and edges[eid].radius > 0)
+            # v0.6.12: 外环弧圆心+半径——P2 轮廓圆剔除需圆心位置匹配
+            # （同半径轮廓弧只与同圆心的孔组构成重合，bracket 块端
+            # R20 轮廓弧不应误剔块中部 r20 顶沉口整圆）
+            v["_outer_ring_arcs"] = [
+                (round(edges[eid].center[0], 1),
+                 round(edges[eid].center[1], 1),
+                 round(edges[eid].radius, 1))
+                for eid, _, _ in ring_data["ring"]
+                if edges[eid].etype == "ARC" and edges[eid].radius > 0]
 
         # 提取该视图的所有内部面（除主体外的闭环，不限于圆/弧）
         inner_faces = [f for f in v["faces"]
@@ -3405,11 +4843,18 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         c = plist[0]
         for i, p in enumerate(plist[1:], 1):
             op = BRepAlgoAPI_Common(c, p)
-            if op.IsDone():
-                c = op.Shape()
-            else:
+            if not op.IsDone():
                 print(f"  [WARN] 棱柱{i+1}交集失败")
                 return None
+            _r = op.Shape()
+            # v0.6.12: 空交集加固——IsDone 但无 SOLID（棱柱错位/不相交）
+            # 原逻辑静默把空形状走完管线，最终 0 实体 STEP 崩溃
+            _ex = TopExp_Explorer(_r, TopAbs_SOLID)
+            if not _ex.More():
+                print(f"  [WARN] 棱柱{i+1}交集为空——视图棱柱错位/不相交，"
+                      f"放弃求交")
+                return None
+            c = _r
         return c
 
     print(f"\n  CSG 求交: {len(prisms)} 个棱柱 → 交集"
@@ -4989,6 +6434,32 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 except Exception:
                     pass
 
+        # v0.6.12: top 条带补丁（后期 Fuse）——联合轮廓填充时条边
+        # y=±1 右半未闭合进环致 y[±1] 窄带空洞，所有切割完成后
+        # 直接 Fuse 条带盒到 combined（棱柱级 Fuse 会被台阶收腰刀
+        # 切掉）。z 界 = 条段（条底 z=17 物理 → CSG −5；条顶 34
+        # 物理 = CSG 12，front R12 弧顶）——条底下方 z[10,17] 物理
+        # 段基准无条材料（凸台底 R12 弧面起于 10、条 y[±1] 起于
+        # 17），直盒填该段会成假条（+732 多余）。
+        try:
+            for v in views:
+                if v.get("_band_patch") is None:
+                    continue
+                _bx1, _bx2, _by1, _by2 = v["_band_patch"]
+                _band_box = BRepPrimAPI_MakeBox(
+                    gp_Pnt(_bx1 - 0.2, _by1 - 0.2, -5.0),
+                    gp_Pnt(_bx2 + 0.2, _by2 + 0.2, 12.0)).Shape()
+                _fu = BRepAlgoAPI_Fuse(combined, _band_box)
+                if _fu.IsDone():
+                    combined = _fu.Shape()
+        except Exception as _be:
+            print(f"  [WARN] 条带补丁异常: {_be}")
+
+        # 信息论局限（bracket 凸台 z[22,24] 两侧槽 x[150.4,156.0]×
+        # y[1,10]∪[−10,−1]）：槽壁竖线在 front 投影中被宽体 y[±7,
+        # ±10] 遮挡、槽边界线在 top 投影被宽体覆盖，全部 HLR 消隐
+        # ——三视图无任何槽信号，无法重建（缺失约 204mm³）。
+
     return combined, hole_data
 
 
@@ -5311,31 +6782,20 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                 if vcx is None:
                     continue
                 if v["view_type"] == "top" and top_center_x is None:
-                    # v0.6.3: 同 front——top 特征映射基准用外环中心
-                    # （与 CSG 棱柱居中平移一致），区域 bbox 可能并入
-                    # 相邻视图导致中心偏移
-                    ofc_top = v.get("_outer_face") or {}
-                    if all(k in ofc_top for k in ("x_min", "x_max",
-                                                  "y_min", "y_max")):
-                        top_center_x = (ofc_top["x_min"] + ofc_top["x_max"]) / 2 * sf
-                        top_center_y = (ofc_top["y_min"] + ofc_top["y_max"]) / 2 * sf
-                    else:
-                        top_center_x = vcx
-                        top_center_y = v.get("_dxf_center_y")
+                    # v0.6.12: 特征映射基准统一用视图区域 bbox 中心
+                    # （与棱柱居中量同基准——居中已改为视图中心，见
+                    # csg_reconstruct 棱柱居中块）。外环中心在外环残缺
+                    # 时（bracket top 缺叉臂）偏移 22mm，孔与主体相对
+                    # 位置错位；同基准下孔相对主体位置自洽。
+                    top_center_x = vcx
+                    top_center_y = v.get("_dxf_center_y")
                 elif v["view_type"] == "front" and front_center_x is None:
-                    # v0.6.3: front 特征映射基准用外环中心（与 CSG 棱柱
-                    # 居中平移一致）——视图区域 bbox 可能并入相邻视图
-                    # （block_3view: front+side 同 Y 层 X 间隙 15<30
-                    # 未拆分，区域中心 72.5 ≠ 外环中心 50，孔 X 错位）
+                    # v0.6.12: 同上——front 特征映射基准统一用视图区域
+                    # bbox 中心（与棱柱居中量同基准）。
                     ofc = v.get("_outer_face") or {}
                     front_outer_face = ofc
-                    if all(k in ofc for k in ("x_min", "x_max",
-                                              "y_min", "y_max")):
-                        front_center_x = (ofc["x_min"] + ofc["x_max"]) / 2 * sf
-                        front_center_y = (ofc["y_min"] + ofc["y_max"]) / 2 * sf
-                    else:
-                        front_center_x = vcx
-                        front_center_y = v.get("_dxf_center_y")
+                    front_center_x = vcx
+                    front_center_y = v.get("_dxf_center_y")
 
             # v0.6.1: 孔深度推理 — top 视图竖直孔的真实深度由 front/side
             # 视图竖线对（X=cx±r 处的孔投影竖线）Y 范围确定。
@@ -5400,20 +6860,31 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                 radii = sorted(group["radii"], reverse=True)
                 gtype = group.get("group_type", "concentric")
 
-                # 判断：圆心落在 top 视图 bbox 内 → 俯视图特征
-                # （不能用 Y > 200 硬编码：图纸布局视图位置不固定，
-                #   本模型 top 视图 Y[153~233]，凸台圆心 cy=192.9 < 200）
-                is_top_view_feature = False
-                top_view = None
-                for v in views:
-                    if v["view_type"] != "top":
-                        continue
-                    tb = v["bbox"]
-                    if tb[1] - 5 <= cy <= tb[3] + 5 and \
-                       tb[0] - 5 <= cx <= tb[2] + 5:
-                        is_top_view_feature = True
-                        top_view = v
+                # v0.6.12: 判断圆心所属视图（top > front > side）——
+                # 原逻辑只认 top（其余全按 front 映射），side 视图圆
+                # 用 front 中心映射打偏到主体外、front 叉尖轮廓圆被
+                # 当孔贯穿切（bracket 体积 −19% 主因之一）。
+                own_view = None
+                for vtype in ("top", "front", "side"):
+                    for v in views:
+                        if v["view_type"] != vtype:
+                            continue
+                        tb = v["bbox"]
+                        if tb[1] - 5 <= cy <= tb[3] + 5 and \
+                           tb[0] - 5 <= cx <= tb[2] + 5:
+                            own_view = v
+                            break
+                    if own_view is not None:
                         break
+                if own_view is None:
+                    continue  # 不在任何视图内（标题栏/注释区）——跳过
+                if own_view["view_type"] == "side":
+                    # side 视图的圆是沿 X 的横孔端面投影，深度与方向
+                    # 从三视图不可靠恢复（bracket 塔侧斜孔 r3 轴向
+                    # (−1,−0.04,0)），沿 Y 贯穿切只会挖错——跳过。
+                    continue
+                is_top_view_feature = own_view["view_type"] == "top"
+                top_view = own_view if is_top_view_feature else None
 
                 # v0.6.1: 剔除外轮廓弧半径——外轮廓圆（如 φ80 法兰圆）
                 # 被同心圆聚类并进组后会把最外层半径当凸台（R40 凸台
@@ -5421,32 +6892,76 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                 # 回退: 外环 ARC 折线化（DXF 弧离散成 LINE）时
                 # _outer_ring_radii 为空, 用外轮廓 bbox 半宽推导轮廓半径,
                 # 半径 ≥ 0.95×半宽的圆必是轮廓圆（孔不可能大于主体半径）。
-                if top_view is not None:
-                    outer_rs = set(top_view.get("_outer_ring_radii") or [])
-                    # bbox 半宽始终并入: 外环 ARC 半径只是局部弧半径
-                    # （如 φ80 角弧 R40），bbox 半宽对应整体轮廓圆
-                    # （如 φ60 锥面顶圆 R30 = 60/2），两者都要剔除。
-                    of = top_view.get("_outer_face") or {}
-                    if all(k in of for k in ("x_min", "x_max",
-                                             "y_min", "y_max")):
-                        half_w = min(of["x_max"] - of["x_min"],
-                                     of["y_max"] - of["y_min"]) / 2.0
-                    else:
-                        tb = top_view["bbox"]
-                        half_w = min(tb[2] - tb[0], tb[3] - tb[1]) / 2.0
-                    if half_w > 0:
-                        outer_rs.add(round(half_w, 1))
-                    radii = [r for r in radii
-                             if not any(abs(r - or_) < 0.5
-                                        or r >= or_ * 0.95
-                                        for or_ in outer_rs)]
+                outer_rs = set(own_view.get("_outer_ring_radii") or [])
+                # bbox 半宽始终并入: 外环 ARC 半径只是局部弧半径
+                # （如 φ80 角弧 R40），bbox 半宽对应整体轮廓圆
+                # （如 φ60 锥面顶圆 R30 = 60/2），两者都要剔除。
+                of = own_view.get("_outer_face") or {}
+                if all(k in of for k in ("x_min", "x_max",
+                                         "y_min", "y_max")):
+                    half_w = min(of["x_max"] - of["x_min"],
+                                 of["y_max"] - of["y_min"]) / 2.0
+                else:
+                    tb = own_view["bbox"]
+                    half_w = min(tb[2] - tb[0], tb[3] - tb[1]) / 2.0
+                if half_w > 0:
+                    outer_rs.add(round(half_w, 1))
+                # v0.6.12: 半径过滤修正——外环弧半径集合会混入孔口弧
+                # （环走行穿过孔口时把孔口弧并入环：bracket top 环带
+                # 微边链含塔侧 r3/块端 r20/塔外 r25.5 弧），因此：
+                # ① 精确匹配只作用于组内最外层半径——轮廓圆只可能是
+                #    最外层（内层是台阶孔/通孔，环含其孔口弧是环走行
+                #    伪影，不是轮廓证据）；
+                # ② 0.95 规则原意"半径 ≥ 0.95×半宽必是轮廓圆"，只对
+                #    半宽生效——对小孔口弧取 0.95 会把所有 ≥2.85 的
+                #    真孔全杀掉（塔内孔 r15.7 因此未切，体积缺失 34k）。
+                outermost = radii[0]
+                # v0.6.12: 最外层轮廓圆剔除改为圆心位置匹配——同半径
+                # 的外环弧只与同圆心的孔组构成"孔口与轮廓同圆"重合
+                # （bracket 块端 R20 轮廓弧 vs 块中部 r20 顶沉口整圆：
+                # 半径相同但圆心不同，按半径值匹配会把后者误剔，漏切
+                # 双沉头台阶孔的外段）。半宽规则（孔不可能大于主体
+                # 半宽）保留，与圆心无关。
+                _arcs = own_view.get("_outer_ring_arcs") or []
+                _out_hit = any(
+                    ar >= outermost - 0.5 and
+                    abs(acx - cx) <= 2.0 and abs(acy - cy) <= 2.0
+                    for acx, acy, ar in _arcs)
+                radii = [r for r in radii
+                         if not (r >= outermost - 0.5 and _out_hit)
+                         and not r >= half_w * 0.95]
+                # v0.6.12: 同心组最外层是轮廓圆（外环弧半径）时整组
+                # 是轮廓圆系——内部圆是端面内部投影（bracket 叉尖
+                # r12 轮廓圆 + r9 弯管投影），沿 Y 贯穿切会把外轮廓
+                # 圆柱挖空。真实竖直孔组最外层不在外环中（PF60K
+                # front φ42 孔口是内部圆），不受影响。top 视图不受
+                # 此限（法兰圆剔除后内孔仍真实，PF60K 依赖）。
+                if not is_top_view_feature and \
+                        any(abs(max(group["radii"]) - or_) < 0.5
+                            for or_ in outer_rs):
+                    continue  # 跳过整组（front 轮廓圆系）
 
                 if is_top_view_feature:
                     # 俯视图特征：DXF Y → 3D Y（减去视图中心基准），放在主体顶面
-                    feat_3d_x = cx * sf - (top_center_x if top_center_x is not None else 0)
+                    if own_view.get("_x_mirrored"):
+                        # v0.6.12: top 视图镜像投影（DXF_X = −3D_X），
+                        # 与棱柱侧翻面补偿一致（bracket 塔孔此前刀落
+                        # 在左块 x=−49，实位 +58）
+                        feat_3d_x = (top_center_x
+                                     if top_center_x is not None else 0) \
+                            - cx * sf
+                    else:
+                        feat_3d_x = cx * sf - (top_center_x
+                                               if top_center_x is not None
+                                               else 0)
                     # P3: 上下分布的孔（如法兰上下角孔）DXF Y 差异必须保留，
                     # 不能统一压到 body_cy（凸台场景 cy≈视图中心，两者等价）
-                    feat_3d_y = cy * sf - (top_center_y if top_center_y is not None else body_cy)
+                    # v0.6.12: 不再减 body_cx/body_cy——棱柱居中后特征
+                    # 绝对位置 = 视图中心映射（居中平移量即视图中心），
+                    # body 实测中心只在外环完整时 = 0（bracket front
+                    # 环右端缺 12mm 时 body_cx=−8.65，旧式减 body_cx
+                    # 使全部孔刀偏 +8.65 切偏块右半）
+                    feat_3d_y = cy * sf - (top_center_y if top_center_y is not None else 0)
                     feat_z_base = bz2    # 从主体顶面开始
                 else:
                     # 前视图特征：DXF x → 3D X、DXF y → 3D Z（各减视图中心基准），
@@ -5531,16 +7046,28 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
             all_group_radii = []
             for _ck, group in concentric_groups.items():
                 all_group_radii.extend(group["radii"])
+            # v0.6.11: 直径装不进 top 视图短边的"孔"必然是假——
+            # 它在 top 视图会与外轮廓相交产生轮廓变化，不可能被
+            # HLR 整体丢失（bracket front 外轮廓竖边 X=2 与内部
+            # 竖线 X=146 配对产生 R=72 假孔，直径 144 > top 短边 51）
+            _top_v = next((_v for _v in views if _v["view_type"] == "top"),
+                          None)
+            top_short = None
+            if _top_v is not None:
+                _tb = _top_v["bbox"]
+                top_short = min(_tb[2] - _tb[0], _tb[3] - _tb[1])
             prof_seen = set()
             for v in ([] if _p2_skip else views):
                 if v["view_type"] == "top":
                     continue
-                ofc = v.get("_outer_face") or {}
-                if ofc.get("x_min") is None:
+                # v0.6.12: 竖线对映射基准同 P2 统一视图区域 bbox 中心
+                vcx = v.get("_dxf_center_x")
+                if vcx is None:
                     continue
-                vcx = (ofc["x_min"] + ofc["x_max"]) / 2
                 for pcx, pr, _ylo, _yhi in _vertical_hole_profiles(v, edges):
                     if pr <= 0:
+                        continue
+                    if top_short is not None and pr * 2 > top_short:
                         continue
                     key = (round(pr, 1), round(pcx - vcx, 1))
                     if key in prof_seen:
@@ -5562,6 +7089,8 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                             continue
                     else:
                         z_top, z_bot = bz2, bz1
+                    # v0.6.12: 同 P2 映射——绝对 CSG 位置不减速 body_cx
+                    # （body 实测中心在外环残缺时 ≠ 0，减它会整体错位）
                     feat_x = (pcx - vcx) * sf
                     hole = create_cylinder_solid(
                         (feat_x, 0.0), pr * sf,
@@ -5571,6 +7100,84 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                         hole_count += 1
                         print(f"  竖线对补孔({feat_x:.0f},0): "
                               f"R={pr:.1f}, Z[{z_bot:.0f}~{z_top:.0f}]")
+
+            # v0.6.12: 矩形内腔刀 — front 隐藏竖线长带对（腔 X/Z 证据）
+            # + top 隐藏水平线对（腔 Y 证据，bracket 内腔 62×12×28：
+            # front 壁竖线带 x=16~78 y[2,30] + top 腔口边水平线对
+            # y=145/157 间距 12）。圆孔刀对大半径竖线对多重跳过（孤立
+            # 大圆保护），矩形内腔必须矩形刀；top 有对应整圆（圆孔已
+            # 走圆刀路径）时跳过。
+            if _top_v is not None and body_solid is not None:
+                _tbb = _top_v["bbox"]
+                _hvs = metadata.get("_hidden_vlines") or []
+                _hhs = metadata.get("_hidden_hlines") or []
+                _bzr = (bz1, bz2)
+                _cand = _hidden_cavity_boxes(views, _tbb, _hvs, sf, _bzr,
+                                             hidden_hlines=_hhs)
+                for _cbox, _cw in _cand:
+                    # top 整圆保护：腔宽/2 半径处已有同心圆组 → 圆孔
+                    # 已走圆刀路径。容差固定 2.0——圆孔半径匹配必须
+                    # 精确（弧拟合误差 <0.5）；bracket 主体左端弧 r28.5
+                    # 与腔宽半 31 差 2.5 不属同一圆（比例容差会把外
+                    # 轮廓弧误当腔圆证据）
+                    _is_round = False
+                    for _ck, _grp in concentric_groups.items():
+                        if not (_tbb[0] <= _ck[0] <= _tbb[2]
+                                and _tbb[1] <= _ck[1] <= _tbb[3]):
+                            continue
+                        if any(abs(_r - _cw / 2) < 2.0
+                               for _r in _grp["radii"]):
+                            _is_round = True
+                            break
+                    if _is_round:
+                        continue
+                    # v0.6.12: 腔口圆系孔移除——top 视图跑道腔两端半圆
+                    # （R6）及其同心大圆（R20）是腔口投影不是孔，P2 已
+                    # 误加贯穿孔刀（bracket 两组 (135.3,151.1)/(185.3,151.1)：
+                    # 日志"贯穿孔(-32,0): R=20.0 / R=6.0"）。判据：圆柱
+                    # 中心在腔刀 X 区间内、Y 贴近腔 Y 中心，且半径 ≥
+                    # 腔 Y 半宽−2——腔端半圆（r=半宽）与同心大圆（r>
+                    # 半宽）都命中；真正小于腔半宽的内孔不受影响。
+                    _cbb = Bnd_Box()
+                    brepbndlib.Add(_cbox, _cbb)
+                    _cx1, _cy1, _cz1, _cx2, _cy2, _cz2 = _cbb.Get()
+                    _cyc = (_cy1 + _cy2) / 2.0
+                    _chy = (_cy2 - _cy1) / 2.0
+                    _kept = []
+                    for _h in all_holes:
+                        _hbb = Bnd_Box()
+                        brepbndlib.Add(_h, _hbb)
+                        _hx1, _hy1, _hz1, _hx2, _hy2, _hz2 = _hbb.Get()
+                        _hx = (_hx1 + _hx2) / 2.0
+                        _hy = (_hy1 + _hy2) / 2.0
+                        _hr = (_hx2 - _hx1) / 2.0
+                        if _cx1 - 3 <= _hx <= _cx2 + 3 \
+                                and abs(_hy - _cyc) <= _chy + 3 \
+                                and _hr >= _chy - 2:
+                            continue
+                        _kept.append(_h)
+                    all_holes = _kept
+                    all_holes.append(_cbox)
+                    hole_count += 1
+                    print(f"  矩形腔刀: 宽{_cw:.1f}")
+
+                # v0.6.12: 台阶收腰刀 — 腔刀机制的 dy∈[6,30] 窗口把
+                # 叉臂宽对（dy=40）排掉，豁口空隙从未被切。独立机制：
+                # front 隐藏竖线长带对（台阶壁）+ top 隐藏水平线宽对
+                # （叉臂 Y）+ front 隐藏水平线（叉臂顶 Z）联合证据，
+                # 刀形 = band ∩ top 棱柱 − 叉臂 box（bracket 船形主体
+                # z[22,28] 收腰为叉臂+豁口+塔环，多余 4,158 → 0 预期）
+                _bbs = Bnd_Box()
+                brepbndlib.Add(body_solid, _bbs)
+                _bx1, _by1, _bz1, _bx2, _by2, _bz2 = _bbs.Get()
+                _half_y = max(abs(_by1), abs(_by2))
+                _consumed = [_cb[0] for _cb in _cand]
+                for _sbox, _sw in _hidden_step_boxes(
+                        views, _tbb, _hvs, _hhs, sf, _bzr, _half_y,
+                        _consumed, concentric_groups):
+                    all_holes.append(_sbox)
+                    hole_count += 1
+                    print(f"  台阶收腰刀: 带隙宽{_sw:.1f}")
 
             if boss_count or hole_count:
                 print(f"  CSG 特征: {boss_count} 凸台 + {hole_count} 孔")
@@ -6022,7 +7629,7 @@ def main():
         output_sldprt = str(input_dir / f"{input_stem}_{ts}.sldprt")
 
     print("=" * 60)
-    print("通用 DXF → 3D SolidWorks 转换器 v0.6.5")
+    print("通用 DXF → 3D SolidWorks 转换器 v0.6.12")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  STEP: {step_path}")
