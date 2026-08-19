@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.13
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.14
 
 核心算法链（详见 CLAUDE.md「dxf_to_3d_general.py」条目）:
   边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 /
@@ -66,6 +66,8 @@ def _ensure_occ():
     from OCC.Core.BRepBndLib import brepbndlib
     from OCC.Core.BRepExtrema import BRepExtrema_DistShapeShape
     from OCC.Core.GC import GC_MakeArcOfCircle
+    from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
+    from OCC.Core.GeomAbs import GeomAbs_Circle, GeomAbs_Line
 
     g = globals()
     for name, obj in [
@@ -102,6 +104,9 @@ def _ensure_occ():
         ("BRepClass3d_SolidClassifier", BRepClass3d_SolidClassifier),
         ("Bnd_Box", Bnd_Box), ("brepbndlib", brepbndlib),
         ("GC_MakeArcOfCircle", GC_MakeArcOfCircle),
+        ("BRepAdaptor_Curve", BRepAdaptor_Curve),
+        ("GeomAbs_Circle", GeomAbs_Circle),
+        ("GeomAbs_Line", GeomAbs_Line),
     ]:
         g[name] = obj
     _OCC_LOADED = True
@@ -1621,6 +1626,41 @@ def create_cylinder_solid_along_y(center_xz, radius, height, y_offset=0) -> obje
             gp_Ax2(gp_Pnt(center_xz[0], y_offset, center_xz[1]), gp_Dir(0, 1, 0)),
             radius, height,
         ).Shape()
+    except Exception:
+        return None
+
+
+def create_half_cylinder_along_y(center_xz, radius, height, y_offset=0,
+                                 half_side=1) -> object:
+    """创建沿 Y 轴拉伸的半圆柱刀（v0.6.14）。
+
+    half_side=1 保留 x>cx 半圆（切 x<cx 侧）、-1 保留 x<cx 半圆。
+    用于孔口圆与轮廓弧同圆的轮廓边缘孔（bracket 叉尖 r12 孔：孔口
+    投影与拱形外环弧完全重合，全圆柱刀会把轮廓圆内的主体材料
+    一并挖空——孔壁实测只覆盖轮廓极值半侧 u[270,450]）。
+    """
+    try:
+        cx, cz = center_xz
+        cyl = BRepPrimAPI_MakeCylinder(
+            gp_Ax2(gp_Pnt(cx, y_offset, cz), gp_Dir(0, 1, 0)),
+            radius, height,
+        ).Shape()
+        big = max(abs(y_offset) + abs(height),
+                  abs(cx) + radius, abs(cz) + radius) + 100.0
+        if half_side > 0:
+            box = BRepPrimAPI_MakeBox(
+                gp_Pnt(-big, -big, -big), gp_Pnt(cx, big, big)).Shape()
+        else:
+            box = BRepPrimAPI_MakeBox(
+                gp_Pnt(cx, -big, -big), gp_Pnt(big, big, big)).Shape()
+        cut = BRepAlgoAPI_Cut(cyl, box)
+        if not cut.IsDone():
+            return None
+        sh = cut.Shape()
+        exp = TopExp_Explorer(sh, TopAbs_SOLID)
+        if not exp.More():
+            return None
+        return exp.Current()
     except Exception:
         return None
 
@@ -4862,6 +4902,13 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
     print(f"\n  CSG 求交: {len(prisms)} 个棱柱 → 交集"
           + (f" + {len(prisms_flange)} 个环带棱柱分体" if prisms_flange
              else ""))
+    # [DBG棱柱] 临时诊断：各棱柱 bbox（v0.6.14r5 定位主体 y 界收窄）
+    for _pv in prisms:
+        _pbb = Bnd_Box()
+        brepbndlib.Add(_pv, _pbb)
+        _pa, _pb, _pc, _pd, _pe, _pf = _pbb.Get()
+        print(f"  [DBG棱柱] bbox X[{_pa:.1f},{_pd:.1f}] "
+              f"Y[{_pb:.1f},{_pe:.1f}] Z[{_pc:.1f},{_pf:.1f}]")
     try:
         combined = _common_chain(prisms)
         if combined is None:
@@ -6436,26 +6483,11 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 except Exception:
                     pass
 
-        # v0.6.12: top 条带补丁（后期 Fuse）——联合轮廓填充时条边
-        # y=±1 右半未闭合进环致 y[±1] 窄带空洞，所有切割完成后
-        # 直接 Fuse 条带盒到 combined（棱柱级 Fuse 会被台阶收腰刀
-        # 切掉）。z 界 = 条段（条底 z=17 物理 → CSG −5；条顶 34
-        # 物理 = CSG 12，front R12 弧顶）——条底下方 z[10,17] 物理
-        # 段基准无条材料（凸台底 R12 弧面起于 10、条 y[±1] 起于
-        # 17），直盒填该段会成假条（+732 多余）。
-        try:
-            for v in views:
-                if v.get("_band_patch") is None:
-                    continue
-                _bx1, _bx2, _by1, _by2 = v["_band_patch"]
-                _band_box = BRepPrimAPI_MakeBox(
-                    gp_Pnt(_bx1 - 0.2, _by1 - 0.2, -5.0),
-                    gp_Pnt(_bx2 + 0.2, _by2 + 0.2, 12.0)).Shape()
-                _fu = BRepAlgoAPI_Fuse(combined, _band_box)
-                if _fu.IsDone():
-                    combined = _fu.Shape()
-        except Exception as _be:
-            print(f"  [WARN] 条带补丁异常: {_be}")
+        # v0.6.14: top 条带补丁延迟到 [5/6] 布尔减之后——v0.6.12 在
+        # 此处（P0 阶段）Fuse 条带盒，P2 半圆柱孔刀/径向缝刀在其后
+        # 生成，补丁与刀的重叠区（bracket 臂端 x[90,102] y±1）从未
+        # 被切 → 分离块实体2。延迟后补丁 Fuse 完再减全部孔刀，
+        # 重叠区被正确切除。
 
         # 信息论局限（bracket 凸台 z[22,24] 两侧槽 x[150.4,156.0]×
         # y[1,10]∪[−10,−1]）：槽壁竖线在 front 投影中被宽体 y[±7,
@@ -6740,6 +6772,11 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
 
     all_holes = []     # 从主体减去的特征
     all_bosses = []    # 添加到主体的特征
+    # v0.6.14r4: 深槽圆盘信号（叉尖 r12 孔组 = R12 半圆端竖槽的
+    # front 投影）与舌右端 x（深槽左壁 = 缝带右壁竖线）。P0 孔循环
+    # 记录，槽刀块消费——槽刀块在 P0 之后执行，顺序保证。
+    _r12_disk = None   # (cx, cz, r_outer, r_inner) CSG 系
+    _tongue_x2 = None  # 舌补丁 x 终点（= 深槽左壁 x）
 
     # ================================================================
     # CSG 模式：已完成主体构建，处理孔洞
@@ -6938,10 +6975,39 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                 # 圆柱挖空。真实竖直孔组最外层不在外环中（PF60K
                 # front φ42 孔口是内部圆），不受影响。top 视图不受
                 # 此限（法兰圆剔除后内孔仍真实，PF60K 依赖）。
-                if not is_top_view_feature and \
-                        any(abs(max(group["radii"]) - or_) < 0.5
-                            for or_ in outer_rs):
+                # v0.6.14: 双半径接近组（大半径−小半径<大半径/3）豁免
+                # ——孔口圆与轮廓弧同圆时（bracket 叉尖 r12 孔口投影
+                # 与外环弧完全重合），孔+倒角投影双圆是真实孔的
+                # 证据（r12 孔 + r3 倒角投影 r9，半径差 25%），
+                # 轮廓圆系内部同心圆是台阶/沉头（半径差 ≥1/3）。
+                _radii_gap = (group["radii"][0] - group["radii"][1]
+                              if len(group["radii"]) >= 2 else 1e9)
+                _on_contour = any(
+                    abs(max(group["radii"]) - or_) < 0.5
+                    for or_ in outer_rs)
+                if not is_top_view_feature \
+                        and _radii_gap >= group["radii"][0] / 3.0 \
+                        and _on_contour:
                     continue  # 跳过整组（front 轮廓圆系）
+                # v0.6.14: 孔口与轮廓同圆的倒角孔组——最大半径被
+                # 上方 _out_hit 外环弧过滤误剔（bracket 叉尖 r12
+                # 孔口投影与拱形外环弧同圆，r12 被剔只留 r9），
+                # 恢复最大半径（随后倒角组只切最大半径过滤）。
+                if not is_top_view_feature and _on_contour \
+                        and _radii_gap < group["radii"][0] / 3.0 \
+                        and outermost not in radii:
+                    radii = sorted([outermost] + radii, reverse=True)
+                # v0.6.14: 半圆柱刀朝向——豁免组（孔口与轮廓弧同圆）
+                # 只切轮廓极值侧半圆：全圆柱会挖掉轮廓圆内的主体
+                # 材料（bracket 叉尖 r12 孔 x[141,165] 与主体圆盘
+                # x≤147 重叠，左半圆柱刀会切穿圆盘）。+1 = 留 x>cx
+                # 半圆（切 x<cx 侧），−1 反之，0 = 全圆柱。
+                _half_side = 0
+                if not is_top_view_feature and _on_contour \
+                        and _radii_gap < group["radii"][0] / 3.0:
+                    _vbb = own_view["bbox"]
+                    _half_side = 1 if cx > (_vbb[0] + _vbb[2]) / 2.0 \
+                        else -1
 
                 if is_top_view_feature:
                     # 俯视图特征：DXF Y → 3D Y（减去视图中心基准），放在主体顶面
@@ -6982,6 +7048,14 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                     # 顶部台阶是内收结构（已包含在 CSG 外环中），
                     # 把最大半径当凸台加高会在主体顶面之上多出错误材料。
                     inner_radii = [r * sf for r in radii]
+                    # v0.6.14: 倒角投影组只切最大半径——小圆是孔口
+                    # 倒角投影（bracket 叉尖 r12 孔 + r3 倒角 → r9
+                    # 圆），小半径圆柱刀会把倒角斜面切成垂直台阶。
+                    # 半径差 ≥1/3 的组是沉头台阶孔，全半径照旧。
+                    if len(inner_radii) >= 2 and \
+                            inner_radii[0] - inner_radii[1] \
+                            < inner_radii[0] / 3.0:
+                        inner_radii = inner_radii[:1]
 
                     # 孔：深度由 front/side 投影推导，无匹配则贯穿
                     for hole_r in inner_radii:
@@ -7002,6 +7076,67 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                                     body_z + 20, bz1 - 5)
                                 print(f"  贯穿孔({feat_3d_x:.0f},{feat_3d_y:.0f}): "
                                       f"R={hole_r:.1f}")
+                            elif _half_side != 0:
+                                # v0.6.14: 轮廓边缘孔（孔口与轮廓弧
+                                # 同圆）→ 半圆柱刀，只切轮廓极值侧。
+                                # 孔轴沿 Y：y 范围（孔深）由 side 视图
+                                # 孔口倒角投影圆对推导——倒角半径 =
+                                # 组半径差（bracket r12 孔 + r3 倒角 →
+                                # r9 投影，Δ=3），side 视图 r3 圆对
+                                # x[300.4,314.4] 差 14 → 孔 y[-7,7]。
+                                # 用主体 y 全宽会把孔深外的臂材料误切
+                                # （臂端 y[-25,-7]∪[7,25] 应延伸到孔壁
+                                # x=101.54）。无信号回退全宽
+                                _hole_yhalf = None
+                                if len(radii) >= 2 and radii[0] - radii[1] < radii[0] / 3.0:
+                                    _grp_dr = radii[0] - radii[1]
+                                    _sv = next((_w for _w in views
+                                                if _w["view_type"] == "side"),
+                                               None)
+                                    if _sv is not None:
+                                        _sbbx = _sv["bbox"]
+                                        _svc = []
+                                        for _ck, _g in concentric_groups.items():
+                                            _gx, _gy = _ck
+                                            if not (_sbbx[0] <= _gx <= _sbbx[2]
+                                                    and _sbbx[1] <= _gy <= _sbbx[3]):
+                                                continue
+                                            _gr = max(_g["radii"])
+                                            if abs(_gr - _grp_dr) > max(0.5, 0.35 * _grp_dr):
+                                                continue
+                                            _svc.append(_gx)
+                                        for _ix in range(len(_svc)):
+                                            for _jx in range(_ix + 1, len(_svc)):
+                                                _d = abs(_svc[_jx] - _svc[_ix])
+                                                if 2.0 <= _d <= 30.0:
+                                                    _hole_yhalf = _d / 2 * sf
+                                                    break
+                                            if _hole_yhalf is not None:
+                                                break
+                                # v0.6.14r2: 半圆柱孔+孔口倒角刀删除——
+                                # 基准 yz/xz 切片实测此组不是沿 Y 半圆柱
+                                # 孔：贯穿孔 r15.7（已有贯穿孔刀）壁在
+                                # y[-1,1] 断开 + 缝带材料 y[-1,1]×
+                                # x[73.9,83.7] + 两侧空腔瓣 y[1,10]/
+                                # [-10,-1]×同 x + 水平贯通槽 z[-2.9,2.9]
+                                # ×y[-10,10]×x[83.7,101.7]。虚构半圆柱
+                                # 刀把空腔瓣位置挖成孔、缝带保留，形状
+                                # 与基准相反。此处仅保留 _hole_yhalf/
+                                # _grp_dr 信号（扩口位置 y±7 与扩口深
+                                # 3，side 视图圆对推导），供下方空腔瓣刀
+                                # 使用；不切任何孔。
+                                # v0.6.14r4: 但此组是深槽圆盘信号——
+                                # R12 半圆端竖槽（y[-1,1] 宽 2）的
+                                # front 投影：外圆 r12 = 深槽 z 半宽、
+                                # 内圆 r9（r12−r3 倒角投影）= 主槽 z
+                                # 半宽/扩口 z 半宽。记录 (cx, cz,
+                                # r_outer, r_inner) 供槽刀块构造深槽刀
+                                # 与扩口刀（基准 xz 切片实测 z 半宽沿 x
+                                # = sqrt(r²−(x−cx)²) 圆弧轮廓，cx≈89.04
+                                # 拟合 x=95→10.42/x=100→4.89 精确吻合）。
+                                _r12_disk = (feat_3d_x, feat_3d_z,
+                                             outermost * sf, radii[1] * sf)
+                                hole = None
                             else:
                                 # front/side 视图圆 → 沿 Y 贯穿
                                 hole = create_cylinder_solid_along_y(
@@ -7153,15 +7288,397 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                         _hx = (_hx1 + _hx2) / 2.0
                         _hy = (_hy1 + _hy2) / 2.0
                         _hr = (_hx2 - _hx1) / 2.0
-                        if _cx1 - 3 <= _hx <= _cx2 + 3 \
-                                and abs(_hy - _cyc) <= _chy + 3 \
-                                and _hr >= _chy - 2:
+                        if not (_cx1 - 3 <= _hx <= _cx2 + 3
+                                and abs(_hy - _cyc) <= _chy + 3):
+                            _kept.append(_h)
                             continue
-                        _kept.append(_h)
+                        # v0.6.14: 腔口圆系分层——腔端半圆刀（r≈腔
+                        # 半宽 ±2）是跑道槽端头圆弧，保留但 z 限制到
+                        # 腔 z 范围（原贯穿刀会把腔上方材料挖空，
+                        # bracket 小槽端头 r6 刀）
+                        if _hr <= _chy + 2:
+                            _tip = create_cylinder_solid(
+                                (_hx, _hy), _hr,
+                                (_cz2 - _cz1) + 3.0, _cz1 - 1.5)
+                            if _tip is not None:
+                                _kept.append(_tip)
+                                print(f"  腔端半圆刀({_hx:.0f},{_hy:.0f}): "
+                                      f"R={_hr:.1f}, Z[{_cz1:.0f}~{_cz2:.0f}]")
+                        # v0.6.14r6 修正：腔口大圆（r > 腔半宽+2）是
+                        # 叉臂 R20 端弧在 top 的投影，不是空腔上段
+                        # 端弧刀。基准 xy 截面（物理 z=25 = CSG 3）
+                        # 实测嵌套双跑道：R6 跑道（y±6 通孔，矩形腔
+                        # 刀 + 腔端半圆刀已覆盖）与 R20 跑道（y±20）
+                        # 同层共存——y[6,20] 环带是叉臂材料（V≈
+                        # 15,261 ≈ run33 缺失 16,105），主体棱柱的
+                        # top 外轮廓已含 R20 端弧。此前 r6 曾按
+                        # "上段空腔"构造 R20 端弧刀 + 直段盒，把叉臂
+                        # 整块误切（run33 叉臂消失根因）。
                     all_holes = _kept
                     all_holes.append(_cbox)
                     hole_count += 1
                     print(f"  矩形腔刀: 宽{_cw:.1f}")
+
+                # v0.6.14r2: 空腔瓣刀（原"径向缝刀"改造）——基准 xz
+                # 切片实测：贯穿孔 r15.7 壁在 y[-1,1] 断开（孔壁圆
+                # ang[4→356] 缺口），断开处 y[-1,1]×x[73.9,83.7] 是
+                # 缝带材料（保留），两侧 y[1,10]/[-10,-1]×同 x 是
+                # 空腔瓣（切空）——用户反馈"圆孔有一端完全断开"的
+                # 断开结构。旧缝刀把缝带材料误切（方向反了）。
+                # front 隐藏竖线窄带对（缝长 dx∈[3,15]）覆盖主体 z
+                # 全高、且一端与 top 孔壁相接 → 空腔瓣 x 范围；
+                # 瓣 y 到 ±(yhalf+dr)（扩口位置+扩口深，bracket 7+3
+                # =10 = 臂端）。无 _hole_yhalf 信号不切。
+                if front_center_x is not None and _hvs:
+                    _fv = next((_v for _v in views
+                                if _v["view_type"] == "front"), None)
+                    _ofc = _fv.get("_outer_face") or {}
+                    _vy1 = _ofc.get("y_min")
+                    _vy2 = _ofc.get("y_max")
+                    if _vy1 is not None and _vy2 is not None:
+                        _vh = _vy2 - _vy1
+                        # 隐藏竖线按 x 归带（槽缝壁被 HLR 碎成 5 段、
+                        # 单段最高 22 不过全高阈值，同 x 带合并）
+                        _bnds = []
+                        for _hx, _hylo, _hyhi in _hvs:
+                            if not (_vy1 - 2 <= _hylo
+                                    and _hyhi <= _vy2 + 2):
+                                continue
+                            for _b in _bnds:
+                                if _b[0] - 2.5 <= _hx <= _b[1] + 2.5 \
+                                        and _hylo <= _b[3] + 2.5 \
+                                        and _hyhi >= _b[2] - 2.5:
+                                    _b[0] = min(_b[0], _hx)
+                                    _b[1] = max(_b[1], _hx)
+                                    _b[2] = min(_b[2], _hylo)
+                                    _b[3] = max(_b[3], _hyhi)
+                                    break
+                            else:
+                                _bnds.append([_hx, _hx, _hylo, _hyhi])
+                        _sx = sorted(b[1] for b in _bnds
+                                     if b[3] - b[2] >= _vh * 0.8)
+                        _yhalf_sig = (_hole_yhalf
+                                      if "_hole_yhalf" in locals() else None)
+                        for _si in range(len(_sx) - 1):
+                            _sdx = _sx[_si + 1] - _sx[_si]
+                            if not 3 <= _sdx <= 15:
+                                continue
+                            _fx1 = _sx[_si] * sf - front_center_x
+                            _fx2 = _sx[_si + 1] * sf - front_center_x
+                            _match = False
+                            for _ck, _grp in concentric_groups.items():
+                                _gcx, _gcy = _ck
+                                if not (_tbb[1] - 5 <= _gcy <= _tbb[3] + 5
+                                        and _tbb[0] - 5 <= _gcx
+                                        <= _tbb[2] + 5):
+                                    continue
+                                _mirr = bool(_top_v and
+                                             _top_v.get("_x_mirrored"))
+                                _tctx = (top_center_x
+                                         if top_center_x is not None else 0)
+                                _tcy = (top_center_y
+                                        if top_center_y is not None else 0)
+                                if _mirr:
+                                    _hcx = _tctx - _gcx * sf
+                                else:
+                                    _hcx = _gcx * sf - _tctx
+                                _hcy = _gcy * sf - _tcy
+                                for _r in _grp["radii"]:
+                                    _hr2 = _r * sf
+                                    if _hr2 < 5:
+                                        continue
+                                    _slot_x = None
+                                    if abs(_fx1 - (_hcx + _hr2)) <= 3:
+                                        _slot_x = (_hcx + _hr2, _fx2)
+                                    elif abs(_fx2 - (_hcx - _hr2)) <= 3:
+                                        _slot_x = (_fx1, _hcx - _hr2)
+                                    if _slot_x is None:
+                                        continue
+                                    # 局部导入：函数尾部单视图分支的
+                                    # 局部 import 会遮蔽全局符号
+                                    from OCC.Core.BRepPrimAPI import \
+                                        BRepPrimAPI_MakeBox as _MakeBox
+                                    # v0.6.14r5: 基准 yz 截面实测（x=
+                                    # 76.35/84.35/94.35/100 四处）真实
+                                    # 结构：缝带 = 舌 z[-22,0] 实心 +
+                                    # 竖槽 z[0,22] 通顶空腔（孔壁断开
+                                    # 用户反馈 2）；深槽 = T 形截面
+                                    # y[-10,10] z[-9,12] ∪ y[-1,1]
+                                    # z[-12,12]，半圆端双圆柱 R12/R9
+                                    # 同心（扩口段 z 界走 R9 圆弧——
+                                    # 用户反馈"半圆端小孔"）。r3 的
+                                    # "浅槽 z[±2.7]"是 front 水平线对
+                                    # 信号误读（基准无此槽）；_zhalf/
+                                    # _zc0 保留仅作诊断打印。
+                                    _fvb = _fv.get("bbox")
+                                    _zhalf = None
+                                    _zc0 = 0.0
+                                    if _fvb is not None and _hhs:
+                                        _hbnds = []
+                                        for _hy, _hx1, _hx2 in _hhs:
+                                            if not (_fvb[0] - 2 <= _hx1
+                                                    and _hx2
+                                                    <= _fvb[2] + 2):
+                                                continue
+                                            for _b in _hbnds:
+                                                if abs(_b[0] - _hy) <= 1.5 \
+                                                        and _hx1 <= _b[2] + 3 \
+                                                        and _hx2 >= _b[1] - 3:
+                                                    _b[1] = min(_b[1], _hx1)
+                                                    _b[2] = max(_b[2], _hx2)
+                                                    _b[3] += 1
+                                                    break
+                                            else:
+                                                _hbnds.append(
+                                                    [_hy, _hx1, _hx2, 1])
+                                        _hys = sorted(_hbnds)
+                                        # 排除视图中心线带（y≈视图 y
+                                        # 中心 ±1.5）——中心线贯穿全宽
+                                        # 会被归带成带，混入槽壁对间距
+                                        # 判断（run23d 实测 21/25.5 槽壁
+                                        # 对与 y=24 中心线混并致 _zhalf
+                                        # None）
+                                        _vcy = (_fvb[1] + _fvb[3]) / 2
+                                        _hys = [b for b in _hys
+                                                if abs(b[0] - _vcy) > 1.5]
+                                        for _i in range(len(_hys) - 1):
+                                            _gdy = _hys[_i + 1][0] - _hys[_i][0]
+                                            if not 3 <= _gdy <= 7:
+                                                continue
+                                            # 槽壁残段短（正侧臂槽壁被
+                                            # HLR 消除，仅负侧残段在——
+                                            # bracket y=21.6/27.0 对 x 长
+                                            # 3/0.6），全宽长带（如叉臂顶
+                                            # 边 y=30 x 长 89）不是槽壁。
+                                            if _hys[_i][2] - _hys[_i][1] > 60 \
+                                                    or _hys[_i + 1][2] \
+                                                    - _hys[_i + 1][1] > 60:
+                                                continue
+                                            _zhalf = _gdy / 2 * sf
+                                            # z 中心 = 线对中心映射 CSG
+                                            #（front y 中心化：DXF y×sf
+                                            # − front_center_y；线对中心
+                                            # ≈ 视图中心 → CSG z 中心
+                                            # ≈ 0）
+                                            _zc0 = ((_hys[_i][0]
+                                                     + _hys[_i + 1][0])
+                                                    / 2 * sf
+                                                    - (front_center_y
+                                                       if front_center_y
+                                                       is not None else 0))
+                                            break
+                                    # v0.6.14r5: 缝带 = 舌（z[-22,0]
+                                    # 实心，舌补丁 Fuse 提供）+ 上方
+                                    # 竖槽（z[0,22] 通顶空腔）。基准
+                                    # yz 截面实测（x=76.35）：y=±1 竖
+                                    # 线分两段——z[0,22] 实心（舌）+
+                                    # z[22,44] 空腔壁（竖槽）。竖槽切
+                                    # 穿孔壁 r15.7 上半 → 用户"圆孔有
+                                    # 一端完全断开"。r4 的"浅槽刀"
+                                    # （z±2.7 y 全域）系对 front 水平
+                                    # 线对的错误解读——基准 x=76.35/
+                                    # 84.35/94.35/100 四处截面均无该
+                                    # 槽（主体连续实心），已删。
+                                    _tx1 = _slot_x[0] + 0.1
+                                    _tongue_x2 = _slot_x[1]
+                                    # v0.6.14r9: 深槽刀组按基准 STEP
+                                    # 圆柱面/圆形边/点分类实测重构。
+                                    # 证据（物理→CSG x−63.65 z−22）：
+                                    # R12 圆柱面 bbox y[1,7] x[89.55,
+                                    # 101.55] z[-12,12]（叉臂端面）；
+                                    # R9 圆 y=±10 与 R12 同心（外带端
+                                    # 面，R12−R9=3=Y 孔半径）；r3 孔
+                                    # 圆柱面轴 (_dcx,·,0) y[1,10] 双
+                                    # 侧（槽缝壁 y=±1 处开口——"圆孔
+                                    # 一端完全断开"）；点分类
+                                    # (160,0.5,24.5) OUT——槽缝空腔
+                                    # 直抵 R12 弧、无端帽材料（"小半
+                                    # 圆"=槽缝壁 R12 半圆壁，其上 r3
+                                    # 孔口）。
+                                    # 结构（r9 点分类全测）：槽缝
+                                    # y[-1,1] = 通槽 x[74,84]（底
+                                    # z=-22 平、顶 z 0→11.7 斜坡）+
+                                    # 平台段 x[84,_dcx] z[-12,12] +
+                                    # 弧端竖槽 x[_dcx,·] z[-12,22]
+                                    # 通顶（z=40 实测 OUT）；叉臂
+                                    # y[1,7] 材料 = R12 圆盘截面（由
+                                    # 主体棱柱右缘斜面 (101.65,0)→
+                                    # (83.83,22) 与盘交叠天然提供）；
+                                    # 外带 y[7,10] = R9 圆盘截面；
+                                    # Y 孔 r3 轴 (_dcx,·,0) 贯穿
+                                    # y[1,10] 双侧。
+                                    # r7/r8 错误件全删（run39 截面+
+                                    # 点分类铁证）：三带切盒（扩口带
+                                    # 把基准叉臂实心 y[1,9] z[13,31]
+                                    # 整块误切——叉臂仅 Y 孔无带
+                                    # 槽）、舌带保护、球头竖孔刀×4
+                                    # （r3 圆角误判为孔）、r8 的 R12
+                                    # 圆柱刀 y[-7.1,7.1]（把叉臂误
+                                    # 切且链式 Fuse compound Cut 静
+                                    # 默失效）、r8 的 R9 圆柱刀（切
+                                    # 盘内把外带材料误删、盘外角料
+                                    # 残留）。
+                                    if _r12_disk is not None:
+                                        _dcx, _dcz, _dr_o, _dr_i = \
+                                            _r12_disk
+                                        from OCC.Core.BRepPrimAPI import \
+                                            BRepPrimAPI_MakeWedge
+                                        _r8_yr = _dr_o - _dr_i
+                                        _n0 = len(all_holes)
+                                        # v0.6.14r9: 各部件独立 append
+                                        # 到 all_holes（run39 实证：
+                                        # 链式 Fuse 累积成 compound 后
+                                        # Cut 静默部分失效——Y 孔生效
+                                        # R12 失效）。槽缝壁留 0.05：
+                                        # 叉臂 y[1,7]/外带 y[7,10] 是
+                                        # 基准实心材料，壁处开口即用
+                                        # 户"断开"特征
+                                        _w = 1.05
+                                        # 通槽底盒（平底 z[-22.5,0]）
+                                        all_holes.append(_MakeBox(
+                                            gp_Pnt(_tx1, -_w, -22.5),
+                                            gp_Pnt(84.0, _w, 0.0)).Shape())
+                                        # 通槽顶楔：斜面 (74,0)→
+                                        # (84,11.7)（MakeWedge ltx=dx
+                                        # 使顶面缩为右端一条线，斜面
+                                        # 全跨度；实体在斜面下方=空腔）
+                                        _wmv = gp_Trsf()
+                                        _wmv.SetTranslation(
+                                            gp_Vec(74.0, -_w, 0.0))
+                                        all_holes.append(
+                                            BRepBuilderAPI_Transform(
+                                                BRepPrimAPI_MakeWedge(
+                                                    10.0, 2 * _w, 11.7,
+                                                    10.0).Shape(),
+                                                _wmv).Shape())
+                                        # 底过渡楔：斜面 (83,-22)→
+                                        # (86.8,-12)
+                                        _wmv2 = gp_Trsf()
+                                        _wmv2.SetTranslation(
+                                            gp_Vec(83.0, -_w, -22.0))
+                                        all_holes.append(
+                                            BRepBuilderAPI_Transform(
+                                                BRepPrimAPI_MakeWedge(
+                                                    3.8, 2 * _w, 10.0,
+                                                    3.8).Shape(),
+                                                _wmv2).Shape())
+                                        # 平台段（x 到圆心）
+                                        all_holes.append(_MakeBox(
+                                            gp_Pnt(84.0, -_w, -12.3),
+                                            gp_Pnt(_dcx + 0.1, _w,
+                                                   12.3)).Shape())
+                                        # 弧端竖槽盒：基准点分类实测
+                                        # z[10,44] 通顶空腔直抵叉臂
+                                        # R12 端面（r8 用 R12 圆柱刀
+                                        # y[-7.1,7.1] 全高把叉臂误切，
+                                        # 且把 R12/R9 圆柱面误当槽底）
+                                        all_holes.append(_MakeBox(
+                                            gp_Pnt(_dcx - 0.1, -_w,
+                                                   -12.3),
+                                            gp_Pnt(_dcx + _dr_o + 0.3,
+                                                   _w, 22.3)).Shape())
+                                        # 叉臂 R12 反刀（双侧
+                                        # y[1.05,7]/[-7,-1.05]）：切
+                                        # R12 圆盘外角料，叉臂材料
+                                        # （圆盘截面）由主体棱柱保留。
+                                        # box − 圆柱可产生多 solid，
+                                        # 逐 solid 独立 append
+                                        for _y0, _y1 in (
+                                                (1.05, 7.0),
+                                                (-7.0, -1.05)):
+                                            _cy12 = \
+                                                BRepPrimAPI_MakeCylinder(
+                                                    gp_Ax2(
+                                                        gp_Pnt(_dcx,
+                                                               _y0,
+                                                               _dcz),
+                                                        gp_Dir(0, 1,
+                                                               0)),
+                                                    _dr_o,
+                                                    _y1 - _y0).Shape()
+                                            _hb12 = _MakeBox(
+                                                gp_Pnt(_dcx - 0.3, _y0,
+                                                       -12.3),
+                                                gp_Pnt(_dcx + _dr_o
+                                                       + 0.3, _y1,
+                                                       22.3)).Shape()
+                                            _cut12 = BRepAlgoAPI_Cut(
+                                                _hb12, _cy12)
+                                            if _cut12.IsDone():
+                                                _e12 = TopExp_Explorer(
+                                                    _cut12.Shape(),
+                                                    TopAbs_SOLID)
+                                                while _e12.More():
+                                                    all_holes.append(
+                                                        _e12.Current())
+                                                    _e12.Next()
+                                        # 外带 R9 反刀（双侧
+                                        # y[7,10.8]/[-10.8,-7]）：切
+                                        # R9 圆盘外角料，外带材料
+                                        # （R9 圆盘截面）保留
+                                        for _y0, _y1 in (
+                                                (7.0, 10.8),
+                                                (-10.8, -7.0)):
+                                            _cy9 = \
+                                                BRepPrimAPI_MakeCylinder(
+                                                    gp_Ax2(
+                                                        gp_Pnt(_dcx,
+                                                               _y0,
+                                                               _dcz),
+                                                        gp_Dir(0, 1,
+                                                               0)),
+                                                    _dr_i,
+                                                    _y1 - _y0).Shape()
+                                            _hb9 = _MakeBox(
+                                                gp_Pnt(_dcx - 0.3, _y0,
+                                                       -12.3),
+                                                gp_Pnt(_dcx + _dr_o
+                                                       + 0.3, _y1,
+                                                       22.3)).Shape()
+                                            _cut9 = BRepAlgoAPI_Cut(
+                                                _hb9, _cy9)
+                                            if _cut9.IsDone():
+                                                _e9 = TopExp_Explorer(
+                                                    _cut9.Shape(),
+                                                    TopAbs_SOLID)
+                                                while _e9.More():
+                                                    all_holes.append(
+                                                        _e9.Current())
+                                                    _e9.Next()
+                                        # Y 孔刀：r = R12−R9（图纸
+                                        # R9 弧即 R12 端面减 Y 孔半径
+                                        # 的直接信号），轴 (_dcx,·,
+                                        # _dcz) 贯穿 y[1.05,10.8] 双侧
+                                        # ——槽缝壁 y=±1 开口（"一端
+                                        # 完全断开"），槽缝壁即 R12
+                                        # 半圆壁（"小半圆上小孔"）
+                                        if _r8_yr > 0.5:
+                                            for _y0, _y1 in (
+                                                    (1.05, 10.8),
+                                                    (-10.8, -1.05)):
+                                                all_holes.append(
+                                                    BRepPrimAPI_MakeCylinder(
+                                                        gp_Ax2(
+                                                            gp_Pnt(
+                                                                _dcx,
+                                                                _y0,
+                                                                _dcz),
+                                                            gp_Dir(
+                                                                0, 1,
+                                                                0)),
+                                                        _r8_yr,
+                                                        _y1
+                                                        - _y0).Shape())
+                                        hole_count += len(all_holes) - _n0
+                                        print(f"  深槽刀: 通槽+平台+竖槽 "
+                                              f"x[{_tx1:.1f},"
+                                              f"{_dcx + _dr_o:.1f}] "
+                                              f"R{_dr_o:.1f}/R{_dr_i:.1f} "
+                                              f"反刀×4 + r{_r8_yr:.1f} 断开孔")
+                                    _match = True
+                                    break
+                                if _match:
+                                    break
 
                 # v0.6.12: 台阶收腰刀 — 腔刀机制的 dy∈[6,30] 窗口把
                 # 叉臂宽对（dy=40）排掉，豁口空隙从未被切。独立机制：
@@ -7448,6 +7965,75 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
         except Exception as e:
             print(f"  [WARN] 切除{i+1}异常: {e}")
 
+    # v0.6.14: top 条带补丁延迟 Fuse（从 P0 移来）——联合轮廓填充
+    # 时条边 y=±1 右半未闭合进环致 y[±1] 窄带空洞，所有切割完成后
+    # 直接 Fuse 条带盒到 combined（棱柱级 Fuse 会被台阶收腰刀切掉）。
+    # v0.6.14r5: 条带盒 = 舌 x[缝带左壁,深槽左壁]×y[-1,1]×z[-22,0]
+    # （基准 x=76.35 截面实测；上方 z[0,22] 是竖槽空腔由竖槽刀切）。
+    # 顺序：条带盒先逐 solid 减全部孔刀（孔/缝重叠区切干净）→ 逐
+    # solid Fuse。v0.6.12 先 Fuse 再整体减刀：Fuse 后 combined 是
+    # 分离多实体 compound，BRepAlgoAPI_Cut 对 compound 参数不可靠 →
+    # bracket 臂端 x[90,102] 条带未被切 → 分离块实体2；run11 实证
+    # 条带盒与主体连通成单 solid 后 Cut（主体∪条带, 刀）同样失效，
+    # 故必须盒阶段先切。x 右端收 0.2：条边右端 101.65 超出半圆柱刀
+    # 极值 101.46（y=±1.4 处），留 0.2 余量会成半圆外悬空角料（分离
+    # 实体）。
+    _patch_fused = False
+    try:
+        for v in views:
+            if v.get("_band_patch") is None:
+                continue
+            _bx1, _bx2, _by1, _by2 = v["_band_patch"]
+            # 局部别名 import：convert_dxf_to_3d 函数作用域内 BRepPrimAPI_MakeBox
+            # 被 L7526 附近同名 import 遮蔽为局部变量，裸用会 UnboundLocalError
+            from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeBox as _MakeBox2
+            # v0.6.14r5: 舌 = x[缝带左壁, 深槽左壁]×y[-1,1]×z[-22,0]
+            # 实心（基准 x=76.35 截面实测 y=±1 竖线 z[0,22] 物理段；
+            # 上方 z[0,22] 是竖槽空腔——由竖槽刀切割，不在舌盒内）。
+            # x 终点收于深槽左壁（_tongue_x2）：其右是深槽空腔，不是
+            # 舌。孔壁断开（用户错误 2）= 舌穿入 r15.7 孔——舌左端
+            # 73.8 在孔壁内，由孔壁刀（减刀循环）切成圆弧轮廓。
+            if _tongue_x2 is not None:
+                _band_box = _MakeBox2(
+                    gp_Pnt(_bx1 - 0.2, _by1 - 0.2, -22.0),
+                    gp_Pnt(min(_bx2, _tongue_x2) - 0.2, _by2 + 0.2,
+                           0.0)).Shape()
+            else:
+                _band_box = _MakeBox2(
+                    gp_Pnt(_bx1 - 0.2, _by1 - 0.2, -5.0),
+                    gp_Pnt(_bx2 - 0.2, _by2 + 0.2, 11.98)).Shape()
+            # 条带盒逐 solid 减刀（盒被刀切成多 solid 后，后续刀必须
+            # 对每个 solid 单独 Cut——Cut(compound) 静默无效）
+            _band_solids = [_band_box]
+            for tool in all_holes:
+                _new = []
+                for _s in _band_solids:
+                    try:
+                        _cr = BRepAlgoAPI_Cut(_s, tool)
+                        if _cr.IsDone():
+                            _esh = _cr.Shape()
+                            _e2 = TopExp_Explorer(_esh, TopAbs_SOLID)
+                            while _e2.More():
+                                _new.append(_e2.Current())
+                                _e2.Next()
+                        else:
+                            _new.append(_s)
+                    except Exception:
+                        _new.append(_s)
+                _band_solids = _new
+                if not _band_solids:
+                    break
+            for _s in _band_solids:
+                _fu = BRepAlgoAPI_Fuse(combined, _s)
+                if _fu.IsDone():
+                    combined = _fu.Shape()
+                    _patch_fused = True
+            if _patch_fused:
+                print(f"  [v0.6.14] 条带补丁(延迟): x[{_bx1:.1f}~{_bx2:.1f}] "
+                      f"已融合({len(_band_solids)}块)")
+    except Exception as _be:
+        print(f"  [WARN] 条带补丁异常: {_be}")
+
     # 修复并检查结果
     try:
         fixer = ShapeFix_Shape()
@@ -7631,7 +8217,7 @@ def main():
         output_sldprt = str(input_dir / f"{input_stem}_{ts}.sldprt")
 
     print("=" * 60)
-    print("通用 DXF → 3D SolidWorks 转换器 v0.6.13")
+    print("通用 DXF → 3D SolidWorks 转换器 v0.6.14")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  STEP: {step_path}")

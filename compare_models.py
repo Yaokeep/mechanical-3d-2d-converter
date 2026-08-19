@@ -30,7 +30,8 @@ from OCC.Core.GProp import GProp_GProps
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
-from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Common
+from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Common, \
+    BRepAlgoAPI_Fuse
 from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeBox
 from OCC.Core.BRep import BRep_Builder
 from OCC.Core.TopoDS import TopoDS_Compound
@@ -56,6 +57,32 @@ def _solids(shape):
         out.append(exp.Current())
         exp.Next()
     return out
+
+
+def _fuse_all(shape):
+    """所有 solid 求并集（Fuse 链）。
+
+    重叠实体的 STEP（SW 导出同一模型拆成多个互相包含的 solid，bracket
+    基准 solid1 完全在 solid0 内）直接逐 solid 布尔会产生双计伪值：
+    Common 逐对总和可以大于单个输入的体积。并集是唯一真实的材料域。
+    """
+    ss = _solids(shape)
+    if len(ss) <= 1:
+        return shape
+    acc = ss[0]
+    for s in ss[1:]:
+        op = BRepAlgoAPI_Fuse(acc, s)
+        op.Build()
+        if not op.IsDone():
+            fx = ShapeFix_Shape(acc)
+            fx.Perform()
+            op = BRepAlgoAPI_Fuse(fx.Shape(), s)
+            op.Build()
+        if not op.IsDone():
+            print("  [警告] 基准并集 Fuse 失败，保留未融合形状")
+            return shape
+        acc = op.Shape()
+    return acc
 
 
 def _solid_vol(shape):
@@ -188,8 +215,18 @@ def main() -> int:
     if len(args) < 2:
         print(__doc__)
         return 1
-    base = _read(args[0])
-    recon = _read(args[1])
+    base_raw = _read(args[0])
+    recon_raw = _read(args[1])
+    # v0.6.14: 重叠实体并集归一——逐 solid 布尔对重叠基准双计
+    # （bracket 基准 3 solid 相互包含，Common 总和 > 重建体积）
+    base = _fuse_all(base_raw)
+    recon = _fuse_all(recon_raw)
+    _bn_raw = len(_solids(base_raw))
+    if _bn_raw > 1 and _bn_raw != len(_solids(base)):
+        print(f"[提示] 基准 {_bn_raw} 实体已并集归一（含重叠，逐 solid 布尔会双计）")
+    _rn_raw = len(_solids(recon_raw))
+    if _rn_raw > 1 and _rn_raw != len(_solids(recon)):
+        print(f"[提示] 重建 {_rn_raw} 实体已并集归一")
 
     bv, bb, braw, bn = _measure(base)
     rv, rb, rraw, rn = _measure(recon)

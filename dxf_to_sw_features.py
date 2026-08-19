@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → SolidWorks 原生特征模型转换器 v0.6.13
+"""通用 DXF 工程图 → SolidWorks 原生特征模型转换器 v0.6.14
 
 与 dxf_to_3d_general.py 的关系:
   - 复用其 CSG 重建结果（精确实体 combined，体积误差 ~1%）
@@ -958,7 +958,7 @@ def main():
         output_sldprt = str(input_dir / f"{input_stem}_features_{ts}.sldprt")
 
     print("=" * 60)
-    print("通用 DXF → SW 原生特征模型转换器 v0.6.13")
+    print("通用 DXF → SW 原生特征模型转换器 v0.6.14")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  输出: {output_sldprt}")
