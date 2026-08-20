@@ -337,8 +337,8 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git tag 为 `v0.6.15`，代码内三处（`app.py:15` / `main_window.py:28` / `main_window.py:535`）均为 `0.6.15`，已核对一致——提交新版本时务必同步更新这些位置。此外转换器脚本横幅（`dxf_to_3d_general.py` docstring/结尾 print、`dxf_to_sw_features.py` docstring/横幅 print）也含版本字符串。
-- **README.md 路线图**: 第五个需要同步的位置（路线图段 + "当前版本"行），v0.6.15 已补至最新。
+- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git tag 为 `v0.6.16`，代码内三处（`app.py:15` / `main_window.py:28` / `main_window.py:535`）均为 `0.6.16`，已核对一致——提交新版本时务必同步更新这些位置。此外转换器脚本横幅（`dxf_to_3d_general.py` docstring/结尾 print、`dxf_to_sw_features.py` docstring/横幅 print）也含版本字符串。
+- **README.md 路线图**: 第五个需要同步的位置（路线图段 + "当前版本"行），v0.6.16 已补至最新。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   ⚠️ 排除规则有缺口：**生成的 `.dxf`/`.diff` 和根目录版本备份 `.py` 都不在忽略列表里**（`git check-ignore` 验证为空），导致 `git status` 长期挂着未跟踪残留（当前 9 个：`_csg_HEAD_0613.py`、`CAD/temp_output/_bracket_run3*.dxf`、`_*.diff`）。约定：**迭代产物一律以 `_` 前缀命名**，并补 `CAD/temp_output/_*`、`_csg_*.py`、`*.diff` 三条规则，才能让 `git status` 干净到可作为提交前检查依据。
 
