@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.15
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.16
 
 核心算法链（详见 CLAUDE.md「dxf_to_3d_general.py」条目）:
   边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 /
@@ -7839,6 +7839,26 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                                     break
                             else:
                                 _bnds.append([_hx, _hx, _hylo, _hyhi])
+                        # v0.6.16: 二次归带——单遍归带会被相邻竖线
+                        # （|Δx|≤2.5）的段打散：剖面图纸 187.5 竖线碎
+                        # 3 段被 185.4 段分隔，各段 <0.8 视图高全滤 →
+                        # 深槽刀组失配（弧端方形 + Y 孔缺失）。先按
+                        # x 聚簇（窗口 ±2.5）再取簇内 y 并集；只加
+                        # 候选，下游 _slot_x 配对（间距 3~15 + 圆组
+                        # 边缘 ±3）门控不变。
+                        _bclus = []
+                        for _b in sorted(_bnds, key=lambda b: (b[0], b[2])):
+                            for _c in _bclus:
+                                if _b[0] - 2.5 <= _c[1] \
+                                        and _b[1] + 2.5 >= _c[0]:
+                                    _c[0] = min(_c[0], _b[0])
+                                    _c[1] = max(_c[1], _b[1])
+                                    _c[2] = min(_c[2], _b[2])
+                                    _c[3] = max(_c[3], _b[3])
+                                    break
+                            else:
+                                _bclus.append(list(_b))
+                        _bnds = _bclus
                         _sx = sorted(b[1] for b in _bnds
                                      if b[3] - b[2] >= _vh * 0.8)
                         _yhalf_sig = (_hole_yhalf
@@ -8701,7 +8721,7 @@ def main():
         output_sldprt = str(input_dir / f"{input_stem}_{ts}.sldprt")
 
     print("=" * 60)
-    print("通用 DXF → 3D SolidWorks 转换器 v0.6.15")
+    print("通用 DXF → 3D SolidWorks 转换器 v0.6.16")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  STEP: {step_path}")

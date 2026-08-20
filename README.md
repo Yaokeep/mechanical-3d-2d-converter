@@ -84,7 +84,7 @@ python main.py
 
 ## 开发路线图
 
-当前版本 **v0.6.15**（详细进度以 `CLAUDE.md` 和 git log 为准）：
+当前版本 **v0.6.16**（详细进度以 `CLAUDE.md` 和 git log 为准）：
 
 - [x] v0.1.0 — 项目脚手架（目录结构、GUI 骨架）
 - [x] v0.2.0~v0.5.9 — SolidWorks COM 自动化、DXF→SW 全流程建模、
@@ -103,6 +103,10 @@ python main.py
 - [x] v0.6.15 — 多视图 + 剖面图识别重建：剖面视图作为形状约束棱柱与
       标准棱柱求交（`_build_section_prism`），出图侧自动结构分析追加
       剖面图（`section_view.py` + `model_to_drawing.py` 完整图纸）
+- [x] v0.6.16 — 剖面图纸重建弧端方形 + Y 孔缺失修复：竖线带二次归带
+      （x 聚簇 ±2.5 + y 并集）修复融合投影拆散的竖线段被 0.8×视图高
+      过滤 → 深槽刀组（R12/R9 弧端反向刀 + Y 孔 r3）在剖面图纸失配；
+      剖面图纸重建 201,112 → 199,267（+4.75% → +3.79%）
 - [ ] GUI 内 PythonOCC 集成 — `src/gui/view3d`、`projection`、
       `reconstruction` 模块骨架已就绪，待接入（核心算法已在根目录
       独立脚本 `dxf_to_3d_general.py` 等中完整实现）

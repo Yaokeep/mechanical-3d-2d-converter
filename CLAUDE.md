@@ -93,8 +93,9 @@ $PY compare_models.py --dz 21.95 --split -5,0,56.5 基准.step 重建.step  # �
 # HLR 生成的图纸易把外环打成碎段，bracket 基线就是在该开关下取得的——
 # 与历史数值对比时必须同环境，否则重建结果不可比
 CSG_WELD=1 $PY dxf_to_3d_general.py CAD/temp_output/bracket_angker_三视图_v4.dxf
-# v0.6.15 起支持三视图+剖面混合图纸：剖面行自动识别为约束棱柱（201,112 / +4.75%，
-# 无剖面时 201,631 / +5.02%——融合投影丢交界线信号是天花板，见信息论局限表）
+# v0.6.15 起支持三视图+剖面混合图纸：剖面行自动识别为约束棱柱（v0.6.16 起
+# 199,267 / +3.79%，v0.6.15 时 201,112 / +4.75%，无剖面时 201,631 / +5.02%——
+# 融合投影丢交界线信号是天花板，见信息论局限表）
 CSG_WELD=1 $PY dxf_to_3d_general.py CAD/temp_output/bracket_angker_图纸_20260820_剖面图.dxf
 # 图纸侧（SW 工程图 → DXF 导出，生成带三视图的正式图纸）:
 python CAD/temp_output/generate_engineering_drawing.py   # SW COM 生成工程图并导出 DXF
@@ -194,7 +195,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 | 目录 | 用途 |
 |------|------|
-| `docs/` | `CHANGELOG.md` — v0.5.4~v0.6.15 逐版本根因叙事（自 CLAUDE.md 抽出，查"某阈值为何是 0.1"这类历史依据时看它） |
+| `docs/` | `CHANGELOG.md` — v0.5.4~v0.6.16 逐版本根因叙事（自 CLAUDE.md 抽出，查"某阈值为何是 0.1"这类历史依据时看它） |
 | `.claude/` | `settings.local.json` — 预授权的 Bash 权限列表；`skills/` — 项目级启用的技能符号链接 |
 | `.agents/skills/` | 4 个技能：`mechanical-engineer`、`solidworks-cad`（泵叶轮参数化）、`python-code-review`（含 5 个参考文件）、`python-packaging`；仅前两个经符号链接在项目级启用。根目录 `skills-lock.json` 锁定 `mechanical-engineer` 来源 |
 | `CAD/` | 52 个 VBA 宏（含 VerifySW2025_v33~v45 验证系列）、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`）、`temp_output/` 闭环验证链工作区（三视图 DXF 迭代样本——含 `bracket_angker_三视图*.dxf`、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf` 等新靶子、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例、`verify_log/` 宏迭代历史 |
@@ -221,9 +222,9 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.15（git tag 为准）。代码内三处版本字符串（`app.py:15` /
+版本 v0.6.16（git tag 为准）。代码内三处版本字符串（`app.py:15` /
 `main_window.py:28` / `main_window.py:535`）与 git 一致，已核对。
-**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.15 全文保留）——
+**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.16 全文保留）——
 本节只留仍在影响决策的部分。
 
 ### 当前精度断点
@@ -233,7 +234,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 | PF60K 法兰盘（CSG） | 261,726 / 261,935（−0.08%） | 收敛 |
 | PF60K 法兰盘（SW 特征模型，18 特征） | 261,875 / 261,935（−0.02%） | 收敛 |
 | bracket angker（三视图） | 净差 −389.77（−0.20%），多余 1,752 / 缺失 1,807 | 收敛，条带补丁待精化 |
-| bracket angker（三视图+剖面图纸，v0.6.15） | 201,112 / 191,988（+4.75%） | 剖面约束生效（无剖面时为 201,631 / +5.02%），融合投影丢交界线信号是天花板 |
+| bracket angker（三视图+剖面图纸，v0.6.16） | 199,267 / 191,988（+3.79%），多余 9,127 / 缺失 1,846 | 剖面约束 + 深槽刀组生效（v0.6.15 时 201,112 / +4.75%；无剖面时 201,631 / +5.02%），剩余为融合投影天花板 |
 | 简单模型回归套件 | 6/6 | 绿 |
 
 基准模型在 `三维/`（gitignored，用户私有数据）。bracket 与历史数值对比
