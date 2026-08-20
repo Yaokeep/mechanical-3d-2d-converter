@@ -80,6 +80,12 @@ CAD/temp_output/*.STL
 CAD/temp_output/*.x_t
 CAD/temp_output/*.jpg
 
+# 迭代产物约定：一律以 _ 前缀命名，便于整类忽略。
+# （此前生成的 .dxf/.diff 和根目录版本备份无规则覆盖，长期污染 git status）
+CAD/temp_output/_*
+/_*.py
+*.diff
+
 # 测试运行日志
 CAD/*_output.txt
 CAD/*_p1.txt

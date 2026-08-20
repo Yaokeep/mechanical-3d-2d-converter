@@ -149,17 +149,117 @@ def create_dxf(views, output_path: Path):
               f"隐藏 {len(v['hidden_lines'])}线 {len(v['hidden_circles'])}圆")
 
 
+def create_full_drawing(views, sections, output_path: Path, hatch_scale=2.0):
+    """完整图纸：三视图 + 剖面图 + 剖切线标记。
+
+    与 `create_dxf` 的三视图输出分开成两个文件，因为本文件含 HATCH 和
+    剖切线，而 dxf_to_3d_general 的闭环重建把 HATCH 当剖面材料信号
+    （P2b）、把多余视图簇当独立视图——混在一起会破坏重建。
+    """
+    import section_view as sv
+
+    doc = ezdxf.new()
+    sv.setup_layers(doc)
+    doc.header["$MEASUREMENT"] = 1
+    doc.header["$INSUNITS"] = 4
+    msp = doc.modelspace()
+
+    # 排版用准确 bbox：_bbox_all 对弧按整圆算，bracket top 视图会虚胖
+    # 6mm（见 section_view.bbox_2d 注释）。闭环链的 create_dxf 不动。
+    f_bb = sv.bbox_2d(views["front"])
+    t_bb = sv.bbox_2d(views["top"])
+    s_bb = sv.bbox_2d(views["side"])
+    fw, fh = f_bb[2] - f_bb[0], f_bb[3] - f_bb[1]
+    gap = max(VIEW_GAP_MIN, fw * 0.35)
+
+    FX, FY = 0.0, 0.0
+    TX = FX + (fw - (t_bb[2] - t_bb[0])) / 2
+    TY = FY + fh + gap
+    RX = FX + fw + gap
+    RY = FY + (fh - (s_bb[3] - s_bb[1])) / 2
+
+    def _off(bb, vx, vy):
+        return vx - bb[0], vy - bb[1]
+
+    f_off = _off(f_bb, FX, FY)
+    t_off = _off(t_bb, TX, TY)
+    s_off = _off(s_bb, RX, RY)
+    _draw_view_elements(msp, views["front"], *f_off)
+    _draw_view_elements(msp, views["top"], *t_off)
+    _draw_view_elements(msp, views["side"], *s_off)
+
+    sv.draw_label(msp, "主视图", FX + fw / 2, FY - 14)
+    sv.draw_label(msp, "俯视图", TX + (t_bb[2] - t_bb[0]) / 2, TY - 14)
+    sv.draw_label(msp, "左视图", RX + (s_bb[2] - s_bb[0]) / 2, RY - 14)
+
+    # --- 剖面图：主视图下方依次排开 ---
+    cur_y = FY - 60.0
+    n_hatch = 0
+    for sec in sections:
+        bb = sv.bbox_2d(sec["view"])
+        w, h = bb[2] - bb[0], bb[3] - bb[1]
+        ox, oy = FX - bb[0], cur_y - h - bb[1]
+        _draw_view_elements(msp, sec["view"], ox, oy)
+        n_hatch += sv.draw_hatch(msp, sec["hatch"], ox, oy, scale=hatch_scale)
+        sv.draw_label(msp, f"{sec['label']}  {sec['desc']}",
+                      FX + w / 2, cur_y - h - 16)
+        # 剖切线标在能看出剖切位置的父视图上（俯视图同时含 X 和 Y）
+        sv.draw_cut_marker(msp, sec["spec"], "top", t_off[0], t_off[1],
+                           t_bb, mirror_x=True)
+        cur_y -= h + 55.0
+
+    doc.saveas(str(output_path))
+    print(f"  图纸: {output_path}")
+    print(f"         三视图 3 个 + 剖面 {len(sections)} 个 + "
+          f"HATCH {n_hatch} 块")
+
+
 def main() -> int:
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    if not args:
         print(__doc__)
         return 1
-    step_path = Path(sys.argv[1])
-    out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else \
+
+    step_path = Path(args[0])
+    out_path = Path(args[1]) if len(args) > 1 else \
         CAD_TEMP / f"{step_path.stem}_三视图.dxf"
+    no_section = "--no-section" in flags
+
+    import section_view as sv
 
     shape = load_step(step_path)
+
+    # ---- 闭环链用的三视图：**不融合**，用原始 shape ----
+    # 融合会抹掉重叠实体的交界线，而那些线正是 CSG 重建的特征信号
+    # （隐藏竖线 = 孔壁/台阶壁，见 dxf_to_3d_general v0.6.8）。
+    # 实测 bracket（CSG_WELD=1，同环境对照）：
+    #   原始 shape 出图 → 重建 191,598.0（−389.8 / −0.20%），
+    #                     与 v0.6.14 记录基线 −389.77 逐位复现
+    #   融合后出图     → 重建 201,631.3（+9,643.5 / +5.02%），明显回归
     views = project_all_views(shape)
     create_dxf(views, out_path)
+
+    if no_section:
+        return 0
+
+    # ---- 图纸/剖面用的形状：**必须融合** ----
+    # 多实体 compound 直接做布尔会静默部分失败（CLAUDE.md v0.6.14 根因），
+    # 剖切结果会缺块；且重叠实体体积重复计数（bracket 275,548 vs 真实
+    # 191,988），截面自检也会失真。
+    fused, _ = sv.fuse_solids(shape)
+    info = sv.analyze_structure(fused)
+    if not info["has_internal"]:
+        print("  [剖面] 未检出内部结构，跳过剖面图")
+        return 0
+
+    specs = sv.suggest_sections(info)
+    sections = [sv.generate_section(fused, s) for s in specs]
+    # 图纸上的三视图也用融合形状：重叠体内部交界线在图纸上是不存在的
+    # 假线，读图时是干扰（闭环链另走上面未融合那份）
+    sheet_views = project_all_views(fused)
+    sec_path = out_path.with_name(out_path.stem + "_剖面图.dxf")
+    create_full_drawing(sheet_views, sections, sec_path)
     return 0
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.14
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.15
 
 核心算法链（详见 CLAUDE.md「dxf_to_3d_general.py」条目）:
   边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 /
@@ -13,6 +13,7 @@
 """
 
 import math
+import re
 import sys
 from pathlib import Path
 from collections import Counter, defaultdict
@@ -179,9 +180,11 @@ def _linetype_of(e, doc):
     return lt
 
 
-SKIP_LAYER_KEYWORDS = ("隐藏", "中心", "构造", "剖面", "标注", "文字",
-                       "图框", "CENTER", "HIDDEN", "DASHED", "CONSTRUCTION",
-                       "FRAME", "BORDER")
+# v0.6.15: 加"剖切"——"剖切线"层（切线段+箭头）不含"剖面"关键词，
+# 会漏进边图落在父视图行内制造假边（bracket 剖面图纸 12 条漏入实测）
+SKIP_LAYER_KEYWORDS = ("隐藏", "中心", "构造", "剖面", "剖切", "标注",
+                       "文字", "图框", "CENTER", "HIDDEN", "DASHED",
+                       "CONSTRUCTION", "FRAME", "BORDER")
 
 
 def _is_skip_entity(e, lt):
@@ -502,18 +505,36 @@ def extract_dxf_annotations(dxf_path: str) -> dict:
         hatch_edges = []
         try:
             for p in h.paths:
-                # EdgePath: 由边组成的边界
                 edge_segments = []
-                try:
-                    for edge in p.edges:
-                        try:
-                            sp = edge.start_point
-                            ep = edge.end_point
-                            edge_segments.append(((sp.x, sp.y), (ep.x, ep.y)))
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                # v0.6.15: PolylinePath 分支——本管线生成的 HATCH 全是
+                # add_polyline_path（section_view.draw_hatch），旧代码只读
+                # p.edges（仅 EdgePath 有），PolylinePath 全部静默丢失
+                # （bracket 剖面图纸 6 个 HATCH 实测 edges_n=0）。
+                if getattr(p, "path_type_flags", 0) & 2:  # BOUNDARY_PATH_POLYLINE
+                    try:
+                        # vertices 是 (x, y, z) 三元组序列（ezdxf 实测）
+                        verts = [(v[0], v[1]) for v in p.vertices]
+                    except Exception:
+                        verts = []
+                    if len(verts) > 1:
+                        edge_segments = [
+                            (verts[i], verts[i + 1])
+                            for i in range(len(verts) - 1)]
+                        # 闭合段：末点 → 首点
+                        edge_segments.append((verts[-1], verts[0]))
+                else:
+                    # EdgePath: 由边组成的边界
+                    try:
+                        for edge in p.edges:
+                            try:
+                                sp = edge.start_point
+                                ep = edge.end_point
+                                edge_segments.append(
+                                    ((sp.x, sp.y), (ep.x, ep.y)))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 if edge_segments:
                     hatch_edges.extend(edge_segments)
         except Exception:
@@ -587,11 +608,17 @@ def extract_dxf_annotations(dxf_path: str) -> dict:
             continue
 
         # 检测截面标签：单个大写字母或 "A-A" 形式
+        # v0.6.15: 连字符兼容 ASCII 与破折号——本管线生成图纸用
+        # U+2014 长破折号（"A—A"），旧正则只认 ASCII 连字符，
+        # section_markers 对自家图纸恒为空。
         if re.match(r'^[A-Z]$', txt):
             # 单字母截面标记
             section_labels.append({"label": txt, "x": x, "y": y})
-        elif re.match(r'^[A-Z]-[A-Z]$', txt):
-            section_labels.append({"label": txt.split("-")[0], "x": x, "y": y})
+        else:
+            _m = re.match(r'^([A-Z])[-—–]\1$', txt)
+            if _m:
+                section_labels.append({"label": _m.group(1),
+                                       "x": x, "y": y})
 
     # 按标签分组（同一字母的多个位置 = 同一截面平面的不同标记点）
     by_label = defaultdict(list)
@@ -2056,7 +2083,9 @@ def _hidden_cavity_boxes(views, top_bbox, hidden_vlines, sf, body_z,
     top 整圆保护——圆孔已走圆刀路径）。box 在本函数内创建：
     convert_dxf_to_3d 有局部 BRepPrimAPI_MakeBox import 遮蔽全局符号。
     """
-    fv = next((v for v in views if v["view_type"] == "front"), None)
+    fv = next((v for v in views
+               if v["view_type"] == "front" and not v.get("_is_section")),
+              None)
     if fv is None or not hidden_vlines or not hidden_hlines:
         return []
     ofc = fv.get("_outer_face") or {}
@@ -2105,7 +2134,9 @@ def _hidden_cavity_boxes(views, top_bbox, hidden_vlines, sf, body_z,
             ybands.append([ym, ym, xlo, xhi])
     ybands.sort(key=lambda b: b[0])
     # top 视图 x 镜像检测（环 x 方向与 front 相反时 top 系 X 取反号）
-    tv = next((v for v in views if v["view_type"] == "top"), None)
+    tv = next((v for v in views
+               if v["view_type"] == "top" and not v.get("_is_section")),
+              None)
     mirrored = bool(tv and tv.get("_x_mirrored"))
 
     fcx = ((vx1 + vx2) / 2 + (tb[0] + tb[2]) / 2) / 2  # front/top 中心平均
@@ -2212,8 +2243,12 @@ def _hidden_step_boxes(views, top_bbox, hidden_vlines, hidden_hlines, sf,
     不扩到视图右缘——塔盘右侧的 top 棱柱凸台投影会被误切。
     返回 [(box, w*sf)] CSG 系台阶刀。
     """
-    fv = next((v for v in views if v["view_type"] == "front"), None)
-    tv = next((v for v in views if v["view_type"] == "top"), None)
+    fv = next((v for v in views
+               if v["view_type"] == "front" and not v.get("_is_section")),
+              None)
+    tv = next((v for v in views
+               if v["view_type"] == "top" and not v.get("_is_section")),
+              None)
     if fv is None or tv is None or not hidden_vlines or not hidden_hlines:
         return []
     top_prism = tv.get("_body_prism")
@@ -2541,8 +2576,106 @@ def _build_inner_cut_tool(face_info, view_type, edges, edge_vertices,
     return tool
 
 
-def _separate_views_2d(faces_info, total_bbox):
+# v0.6.15: 剖面标签正则——兼容 ASCII 连字符与破折号（本管线生成图纸
+# 用 U+2014 长破折号 "A—A"）
+_SECTION_LABEL_RE = re.compile(r"^[A-Za-z0-9]+[-—–][A-Za-z0-9]+$")
+_SECTION_LETTER_RE = re.compile(r"^[A-Z]$")
+
+
+def _section_label_positions(texts):
+    """从图纸文字中提取剖面标签（"A—A"、"B-B"、单字母 "A"）位置。
+
+    texts: parse_dxf_texts() 返回的 [{"text", "x", "y", "type"}, ...]
+    返回: [{"letter": "A", "x": float, "y": float}, ...]
+
+    本管线生成的剖面描述文字是 "A—A 纵向全剖 y=0.00（中截面）"（标签 +
+    描述拼接，model_to_drawing.py:204），整串不匹配 _SECTION_LABEL_RE，
+    故补前缀匹配 ^"A—A"（后随任意描述）。
+
+    单字母歧义处理：剖切线端点标记成对出现（同一字母 ≥2 次，父视图
+    剖切线两端），剖面行描述字母只出现一次。成对单字母一律剔除，
+    否则 top 视图下缘 8 单位处的切段标记会把 top 视图误判为剖面行。
+    """
+    out = []
+    singles = []
+    for t in texts or []:
+        txt = (t.get("text") or "").strip()
+        m = _SECTION_LABEL_RE.match(txt)
+        if m:
+            out.append({"letter": txt[0].upper(), "x": t["x"], "y": t["y"]})
+            continue
+        m = re.match(r"^([A-Za-z0-9])[-—–]\1", txt)  # "A—A 纵向全剖..."
+        if m:
+            out.append({"letter": m.group(1).upper(), "x": t["x"], "y": t["y"]})
+            continue
+        if _SECTION_LETTER_RE.match(txt):
+            singles.append({"letter": txt, "x": t["x"], "y": t["y"]})
+    scnt = Counter(s["letter"] for s in singles)
+    out.extend(s for s in singles if scnt[s["letter"]] == 1)
+    return out
+
+
+def _match_section_parent(sec_bbox, principal_views):
+    """剖面视图 bbox → 父标准视图类型（按共享轴尺寸拟合匹配）。
+
+    剖面视图是父视图在剖切面处的**部分截面**：沿父投影方向看，
+    两个共享维度的尺寸 ≤ 父视图对应维度（材料不必横贯全宽——bracket
+    的 B—B 截面 Y 向 41 vs 侧视 51、C—C 仅 26×28），但至少一维
+    接近父视图全尺寸。逐维容差 +15%、取偏差和最小者；两个候选
+    近似（差 <0.15）时判模糊放弃。无匹配返回 None（该剖面被丢弃，
+    不干扰标准重建）。
+    """
+    w, h = sec_bbox[2] - sec_bbox[0], sec_bbox[3] - sec_bbox[1]
+    if w <= 0 or h <= 0:
+        return None
+    best_type, best_score, second = None, 1e9, 1e9
+    for v in principal_views:
+        pw, ph = v["bbox"][2] - v["bbox"][0], v["bbox"][3] - v["bbox"][1]
+        if pw <= 0 or ph <= 0:
+            continue
+        # 部分截面：尺寸不能显著超过父视图，且至少一维 ≥ 60% 父尺寸
+        if w > pw * 1.15 or h > ph * 1.15:
+            continue
+        if not (w >= pw * 0.6 or h >= ph * 0.6):
+            continue
+        score = abs(w - pw) / pw + abs(h - ph) / ph
+        if score < best_score:
+            second, best_score, best_type = best_score, score, v["view_type"]
+        elif score < second:
+            second = score
+    if best_type is None:
+        return None
+    # 弱匹配（偏差和 ≥0.3）且两个候选近似 → 模糊，放弃
+    if best_score >= 0.3 and second - best_score < 0.15:
+        return None
+    return best_type
+
+
+def _section_parent_from_markers(letter, labels):
+    """剖切线端点标记 → 父视图类型（本管线约定: 横切线→front、竖切线→side）。
+
+    draw_cut_marker 在父视图上画剖切线：法向 Y → 横线（端点标记同 y
+    异 x）；法向 X → 竖线（同 x 异 y）。标记成对出现，配对判别。
+    """
+    ms = [lb for lb in labels or [] if lb["letter"] == letter]
+    for i in range(len(ms)):
+        for j in range(i + 1, len(ms)):
+            dx = abs(ms[i]["x"] - ms[j]["x"])
+            dy = abs(ms[i]["y"] - ms[j]["y"])
+            if dy < 5.0 and dx > 5.0:
+                return "front"  # 横剖切线 → 纵向全剖 → front 投影方向
+            if dx < 5.0 and dy > 5.0:
+                return "side"   # 竖剖切线 → side 投影方向
+    return None
+
+
+def _separate_views_2d(faces_info, total_bbox, texts=None):
     """从 2D 图纸中分离视图（基于 Y 间隙 + X 间隙）。
+
+    texts: parse_dxf_texts() 返回的文字列表（v0.6.15，剖面行识别用）。
+    剖面行（下方有 "A—A" 标签的视图行）从标准视图类型识别中隔离，
+    追加在结果尾部并打标 "_is_section"，类型由 _match_section_parent
+    按尺寸匹配到父标准视图。
 
     返回: list of {name, faces, view_type, bbox}
     """
@@ -2661,17 +2794,127 @@ def _separate_views_2d(faces_info, total_bbox):
         if best_view is not None and best_overlap > 0:
             best_view.append(sf)
 
+    # ================================================================
+    # v0.6.15: 剖面行识别（必须早于碎片过滤与类型识别）
+    #
+    # 剖面图排在主视图下方（model_to_drawing.create_full_drawing 布局），
+    # 其描述文字 "A—A 纵向全剖..." 位于视图下边约 18 单位、水平居中。
+    # 剖面行是标准视图类型识别的污染源：与 top 视图 X 重叠 >50% 会被
+    # 强制改判 "front"，csg_reconstruct 按簇顺序取第一个 front 时拿到的
+    # 是剖面簇而非真主视图（bracket 剖面图纸重建 −27% 的直接根因）。
+    # 处理：识别 → 同行簇合并（B—B 行两个 hatch 岛间 X 间隙 >30 会拆簇）
+    # → 从类型识别中隔离 → 追加在结果尾部打标 _is_section。
+    # ================================================================
+    cluster_bboxes = []
+    for mv in all_views:
+        cx_min = min(f["x_min"] for f in mv)
+        cx_max = max(f["x_max"] for f in mv)
+        cy_min = min(f["y_min"] for f in mv)
+        cy_max = max(f["y_max"] for f in mv)
+        cluster_bboxes.append((cx_min, cy_min, cx_max, cy_max))
+
+    labels = _section_label_positions(texts)
+    section_row_of = {}   # 簇索引 → 行 id（section_row_idx）
+    section_rows = []     # [{bbox, labels(letters), clusters:[簇索引]}]
+    used_letters = set()
+    for ci, cb in enumerate(cluster_bboxes):
+        cw = cb[2] - cb[0]
+        for lb in labels:
+            # 标签位于簇下边**下方** 3~30 单位内（本管线布局 16，
+            # 描述文字在视图底边之下）、水平在簇范围内
+            if not (cb[1] - 30.0 < lb["y"] < cb[1] - 3.0):
+                continue
+            if not (cb[0] - cw * 0.25 <= lb["x"] <= cb[2] + cw * 0.25):
+                continue
+            if lb["letter"] in used_letters:
+                continue
+            # 该簇属于剖面行：合并同 Y 行的所有簇（Y 重叠 >50%）
+            members = []
+            for cj, bj in enumerate(cluster_bboxes):
+                ov = min(bj[3], cb[3]) - max(bj[1], cb[1])
+                if ov > 0 and (ov > (cb[3] - cb[1]) * 0.5
+                               or ov > (bj[3] - bj[1]) * 0.5):
+                    members.append(cj)
+            row_id = len(section_rows)
+            for cj in members:
+                section_row_of[cj] = row_id
+            section_rows.append({
+                "row_id": row_id,
+                "letter": lb["letter"],
+                "clusters": members,
+            })
+            used_letters.add(lb["letter"])
+            break
+
+    # 碎片过滤前重组：剖面行 → 单一剖面视图（bbox/faces 取并集）
+    section_views = []
+    principal_views = []
+    merged_section_clusters = set()
+    if __import__("os").environ.get("DBG_SECTION"):
+        print(f"  [DBG剖面] 簇数={len(cluster_bboxes)}")
+        for _ci, _cb in enumerate(cluster_bboxes):
+            print(f"    cl{_ci}: X[{_cb[0]:.0f}~{_cb[2]:.0f}] "
+                  f"Y[{_cb[1]:.0f}~{_cb[3]:.0f}]")
+        for _r in section_rows:
+            print(f"  [DBG剖面] 行{_r['row_id']} 字母={_r['letter']} "
+                  f"簇={_r['clusters']}")
+    for row in section_rows:
+        fcs = []
+        for cj in row["clusters"]:
+            fcs.extend(all_views[cj])
+            merged_section_clusters.add(cj)
+        if not fcs:
+            continue
+        section_views.append({
+            "letter": row["letter"],
+            "faces": fcs,
+            "bbox": (min(f["x_min"] for f in fcs),
+                     min(f["y_min"] for f in fcs),
+                     max(f["x_max"] for f in fcs),
+                     max(f["y_max"] for f in fcs)),
+        })
+    # 其余簇（标准视图候选）保持原顺序——类型识别的输入
+    other_views = [mv for ci, mv in enumerate(all_views)
+                   if ci not in merged_section_clusters]
+
     # --- 过滤图框边缘的碎片簇（标题栏格、边框残余）---
     # 视图簇不会紧贴图框边（有 G=45 布局间距 + 标注带），贴边且
     # 面积占比 <5% 或簇厚度 <15% 图幅的簇是标题栏/边框碎片，
     # 会破坏视图类型识别（标题栏横贯全图宽, 一旦误标 top 会把
     # 所有视图拉成 front）。
-    frame_w = total_bbox[2] - total_bbox[0]
-    frame_h = total_bbox[3] - total_bbox[1]
+    # v0.6.15: 有剖面行时"图幅"基准改用标准视图簇 bbox（不含剖面行）——
+    # 剖面行把总图幅撑高后，15% 高度阈值会把合法视图误当碎片
+    # （bracket 剖面图纸图幅 385 → 阈值 58 > top 行高 51 / side 高 44，
+    # top/side 全被贴边过滤丢弃——现状重建 Y 塌 51→44 的直接根因）。
+    # 无剖面行时保持旧参照 total_bbox（含图框面：法兰练习的标题栏格
+    # 贴图框底边内侧，参照图框边判"不贴边"被保留；改用簇并集后
+    # 被判贴边过滤 → 视图 2→1 → 单视图回退图框拉伸灾难，实测回归）。
+    if section_rows and other_views:
+        _fx = [c for mv in other_views
+               for c in (min(f["x_min"] for f in mv),
+                         max(f["x_max"] for f in mv))]
+        _fy = [c for mv in other_views
+               for c in (min(f["y_min"] for f in mv),
+                         max(f["y_max"] for f in mv))]
+        frame_bbox = (min(_fx), min(_fy), max(_fx), max(_fy))
+        # 真实工程图（有剖面行+图框）：图框面（spanning、>50% 图幅
+        # 不回填）纳入参照——图框内标题栏格贴边判据应参照图框边
+        _tot_area = ((total_bbox[2] - total_bbox[0])
+                     * (total_bbox[3] - total_bbox[1]))
+        for _sf in spanning_faces:
+            if _sf["area"] > _tot_area * 0.5:
+                frame_bbox = (min(frame_bbox[0], _sf["x_min"]),
+                              min(frame_bbox[1], _sf["y_min"]),
+                              max(frame_bbox[2], _sf["x_max"]),
+                              max(frame_bbox[3], _sf["y_max"]))
+    else:
+        frame_bbox = total_bbox
+    frame_w = frame_bbox[2] - frame_bbox[0]
+    frame_h = frame_bbox[3] - frame_bbox[1]
     frame_area = frame_w * frame_h
     edge_margin = frame_h * 0.18
     kept_views = []
-    for mv in all_views:
+    for mv in other_views:
         cy_min = min(f["y_min"] for f in mv)
         cy_max = max(f["y_max"] for f in mv)
         cx_min = min(f["x_min"] for f in mv)
@@ -2679,10 +2922,10 @@ def _separate_views_2d(faces_info, total_bbox):
         area_sum = sum(f["area"] for f in mv)
         cluster_h = cy_max - cy_min
         cluster_w = cx_max - cx_min
-        near_bottom = cy_max < total_bbox[1] + edge_margin
-        near_top = cy_min > total_bbox[3] - edge_margin
-        near_left = cx_max < total_bbox[0] + edge_margin
-        near_right = cx_min > total_bbox[2] - edge_margin
+        near_bottom = cy_max < frame_bbox[1] + edge_margin
+        near_top = cy_min > frame_bbox[3] - edge_margin
+        near_left = cx_max < frame_bbox[0] + edge_margin
+        near_right = cx_min > frame_bbox[2] - edge_margin
         is_fragment = (area_sum < frame_area * 0.05
                        or cluster_h < frame_h * 0.15
                        or cluster_w < frame_w * 0.15)
@@ -2690,7 +2933,7 @@ def _separate_views_2d(faces_info, total_bbox):
                 and is_fragment:
             continue
         kept_views.append(mv)
-    all_views = kept_views
+    all_views = kept_views  # 仅标准视图簇，剖面行不参与类型识别
 
     # --- 识别视图类型（位置排名法，不受簇数量影响） ---
     result = []
@@ -2795,6 +3038,28 @@ def _separate_views_2d(faces_info, total_bbox):
             "faces": vfaces,
             "view_type": vtype,
             "bbox": bbox,
+        })
+
+    # v0.6.15: 剖面视图追加在标准视图之后，打标 _is_section。
+    # view_type = 与父视图（同一投影方向）尺寸匹配的类型；匹配失败
+    # （偏差 ≥15%）说明不是本管线的剖面布局 → 剔除，绝不干扰标准重建。
+    for sv in section_views:
+        parent_type = _match_section_parent(sv["bbox"], result)
+        if parent_type is None:
+            parent_type = _section_parent_from_markers(sv["letter"], labels)
+        if __import__("os").environ.get("DBG_SECTION"):
+            print(f"  [DBG剖面] 视图 {sv['letter']}: bbox "
+                  f"X[{sv['bbox'][0]:.0f}~{sv['bbox'][2]:.0f}] "
+                  f"Y[{sv['bbox'][1]:.0f}~{sv['bbox'][3]:.0f}] "
+                  f"父匹配={parent_type}")
+        if parent_type is None:
+            continue
+        result.append({
+            "name": f"sec_{sv['letter']}",
+            "faces": sv["faces"],
+            "view_type": parent_type,
+            "bbox": sv["bbox"],
+            "_is_section": True,
         })
 
     return result
@@ -3013,8 +3278,13 @@ def extract_outer_rings_no_merge(edges, views):
     return result
 
 
-def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv):
-    """extract_outer_rings_no_merge 的单遍实现（不焊接/已焊接边图各跑一遍）。"""
+def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv,
+                        keep_all=False):
+    """extract_outer_rings_no_merge 的单遍实现（不焊接/已焊接边图各跑一遍）。
+
+    keep_all=True（v0.6.15，剖面全环提取）: 每视图收集全部环（列表），
+    不再只留最大环；跳过方∩圆增强块（该块按 dict 结构消费且会追加合成边）。
+    """
     from collections import defaultdict
 
     adj = build_adjacency(vertex_pos, edge_vertices, edges, nv)
@@ -3556,7 +3826,7 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv):
             continue
         pts = [vertex_pos[f] for _, f, _ in ring]
         area = ring_area_pts(pts)
-        if area < 10:
+        if area < (2.0 if keep_all else 10.0):
             continue
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
@@ -3564,18 +3834,25 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv):
         vname = assign_view(bbox)
         if vname is None:
             continue
-        # 同视图多环取面积大者
-        if vname not in result or area > result[vname]["area"]:
-            result[vname] = {
-                "ring": ring,
-                "vertex_pos": vertex_pos,
-                "area": area,
-                "bbox": bbox,
-                # v0.6.12: 几何 bbox（含弧顶）——外轮廓面 dict 与
-                # P2 特征映射中心用此值；顶点 bbox 保留给方∩圆增强
-                # 的弧端点落边判据（几何 bbox 会把弦端点推到界外）
-                "geom_bbox": _ring_geom_bbox(ring, edges),
-            }
+        # 同视图多环取面积大者（keep_all: 全收集，外环/内环分类在
+        # _extract_view_rings_all 做）
+        rdata = {
+            "ring": ring,
+            "vertex_pos": vertex_pos,
+            "area": area,
+            "bbox": bbox,
+            # v0.6.12: 几何 bbox（含弧顶）——外轮廓面 dict 与
+            # P2 特征映射中心用此值；顶点 bbox 保留给方∩圆增强
+            # 的弧端点落边判据（几何 bbox 会把弦端点推到界外）
+            "geom_bbox": _ring_geom_bbox(ring, edges),
+        }
+        if keep_all:
+            result.setdefault(vname, []).append(rdata)
+        elif vname not in result or area > result[vname]["area"]:
+            result[vname] = rdata
+
+    if keep_all:
+        return result  # 跳过方∩圆增强（按 dict 结构消费 + 追加合成边）
 
     # ---- v0.6.3: 方∩圆叶片角外环增强 ----
     # 方形 bbox 环 + 同心圆（半径 ∈ (半宽, 半宽√2]，弧端点落在 bbox
@@ -3743,6 +4020,188 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv):
             result[vname] = dict(rdata, ring=new_ring, area=na,
                                  bbox=(min(xs), min(ys), max(xs), max(ys)))
     return result
+
+
+def _extract_view_rings_all(edges, views):
+    """v0.6.15: 各视图全环提取（外环 + 内环），供剖面棱柱材料截面。
+
+    extract_outer_rings_no_merge 每视图只留最大环、内环（孔洞）全丢；
+    剖面截面 face 需要 外环 − 内环。本函数用 _extract_rings_impl 的
+    keep_all 模式收集每视图全部环，再分类：外环 = 面积最大者，内环 =
+    bbox 落在外环内且顶点采样全在外环多边形内的其余环（去重按几何
+    签名 (面积, bbox)——焊接两遍提取会得到同一环的副本）。
+    返回结构与 extract_outer_rings_no_merge 一致，另加 "inners" 键
+    （原函数返回结构不变——csg 主循环等多处消费 no_merge_rings）。
+    """
+    vertex_pos, edge_vertices, nv = build_vertex_map(edges)
+    weld_vp = weld_ev = None
+    if _micro_chain_lengths(edges) and \
+            __import__("os").environ.get("CSG_WELD"):
+        weld_vp = dict(vertex_pos)
+        weld_ev = weld_chain_ends(edges, weld_vp, edge_vertices)
+    collected = _extract_rings_impl(edges, views, vertex_pos, edge_vertices,
+                                    nv, keep_all=True)
+    if weld_ev is not None:
+        collected2 = _extract_rings_impl(edges, views, weld_vp, weld_ev,
+                                         nv, keep_all=True)
+        for name, rings in collected2.items():
+            if name in collected:
+                collected[name].extend(rings)
+            else:
+                collected[name] = rings
+    out = {}
+    for name, rings in collected.items():
+        if not rings:
+            continue
+        # 环去重（两遍提取/往返副本的几何签名）
+        dedup = {}
+        for rd in rings:
+            key = (round(rd["area"], 1), round(rd["bbox"][0], 1),
+                   round(rd["bbox"][1], 1), round(rd["bbox"][2], 1),
+                   round(rd["bbox"][3], 1))
+            if key not in dedup or rd["area"] > dedup[key]["area"]:
+                dedup[key] = rd
+        rings = sorted(dedup.values(), key=lambda rd: -rd["area"])
+        outer = dict(rings[0])
+        outer["inners"] = []
+        if len(rings) > 1:
+            ox1, oy1, ox2, oy2 = outer["bbox"]
+            outer_pts = [vertex_pos[f] for _, f, _ in outer["ring"]]
+            for rd in rings[1:]:
+                x1, y1, x2, y2 = rd["bbox"]
+                if not (ox1 - 1 <= x1 and x2 <= ox2 + 1
+                        and oy1 - 1 <= y1 and y2 <= oy2 + 1):
+                    continue
+                # 顶点采样全在外环多边形内（bbox 在内但可能属嵌套区域）
+                pts = [vertex_pos[f] for _, f, _ in rd["ring"]]
+                if pts and all(_point_in_polygon_2d(px, py, outer_pts)
+                               for px, py in pts):
+                    outer["inners"].append(dict(rd))
+        out[name] = outer
+    return out
+
+
+def _section_face_from_rings(rdata, edges, scale_factor, dx=0.0, dy=0.0):
+    """剖面截面 face = 外环面 − 内环面（平面布尔切，逐孔相减）。
+
+    rdata: {"ring": [(eid,f,t)...], "vertex_pos": {vid:(x,y)}, "inners": [...]}
+    dx/dy: 中心对齐 2D 平移（剖面行排版常数偏移消除）——vertex_pos
+    逐环整体平移后再建 wire。
+    内环（孔洞）相减沿用 top 分体环带面先例（BRepAlgoAPI_Cut，见
+    csg_reconstruct P3.1）——MakeFace 双 wire 重载在 pythonocc 中不可用。
+    内环失败只跳过该孔（退化回外环面，等效父视图棱柱补强，无害）。
+    """
+
+    def _shifted(r):
+        pos = {vid: (x + dx, y + dy)
+               for vid, (x, y) in r["vertex_pos"].items()}
+        return dict(r, vertex_pos=pos)
+
+    rdata = _shifted(rdata)
+    outer_wire = build_wire_from_directed_ring(rdata["ring"],
+                                               rdata["vertex_pos"],
+                                               edges, scale_factor)
+    if outer_wire is None:
+        return None
+    face = build_occ_face(outer_wire)
+    if face is None:
+        return None
+    for inner in rdata.get("inners", []):
+        inner = _shifted(inner)
+        iw = build_wire_from_directed_ring(inner["ring"],
+                                           inner["vertex_pos"],
+                                           edges, scale_factor)
+        if iw is None:
+            continue
+        iface = build_occ_face(iw)
+        if iface is None:
+            continue
+        try:
+            _cut = BRepAlgoAPI_Cut(face, iface)
+            if _cut.IsDone():
+                face = _cut.Shape()
+        except Exception:
+            pass
+    return face
+
+
+def _build_section_prism(v, views, all_rings, edges, scale_factor,
+                         extrude_dist):
+    """v0.6.15: 剖面视图棱柱——父视图在剖切面处的材料截面沿父轴拉伸。
+
+    剖面视图与父视图同一投影帧（section_view.py 用原始 3D 投影坐标
+    出图，行排版只是常数平移），剖面棱柱与标准棱柱求交只会删掉
+    三视图制造的假材料、不会造新材料。
+
+    全尺寸剖面（双维 ≥98% 父外轮廓 bbox）用「截面中心 → 父外轮廓
+    中心」2D 平移对齐；部分剖面（B—B/C—C 一类）截面在父帧内的
+    偏移无法从 bbox 唯一确定，宁缺毋滥跳过（父棱柱兜底）。
+    变换链与父视图完全一致：视图变换 → top 镜像 → Z 对齐复用父
+    偏移（截面与父同帧，父偏移使截面落在同一高度基准）→ 父居中
+    向量（同一投影方向的两个视图必须用同一居中基准）。
+    """
+    rdata = (all_rings or {}).get(v["name"])
+    if rdata is None:
+        print(f"  [剖面] '{v['name']}' 截面环提取失败，跳过")
+        return None
+    ptype = v.get("view_type")
+    parent = next((pv for pv in views
+                   if not pv.get("_is_section")
+                   and pv["view_type"] == ptype), None)
+    if parent is None or parent.get("_outer_face") is None:
+        print(f"  [剖面] '{v['name']}' 父视图（{ptype}）缺失，跳过")
+        return None
+    pof = parent["_outer_face"]
+    pw = pof["x_max"] - pof["x_min"]
+    ph = pof["y_max"] - pof["y_min"]
+    sb = rdata.get("geom_bbox") or rdata["bbox"]
+    sw, sh = sb[2] - sb[0], sb[3] - sb[1]
+    if pw <= 0 or ph <= 0 \
+            or sw < pw * 0.98 or sh < ph * 0.98 \
+            or sw > pw * 1.15 or sh > ph * 1.15:
+        print(f"  [剖面] '{v['name']}' 截面 {sw:.0f}×{sh:.0f} vs "
+              f"父 {pw:.0f}×{ph:.0f} 非全尺寸，跳过（父棱柱兜底）")
+        return None
+    dx = (pof["x_min"] + pof["x_max"]) / 2 - (sb[0] + sb[2]) / 2
+    dy = (pof["y_min"] + pof["y_max"]) / 2 - (sb[1] + sb[3]) / 2
+    face = _section_face_from_rings(rdata, edges, scale_factor, dx, dy)
+    if face is None:
+        print(f"  [剖面] '{v['name']}' Face 构建失败，跳过")
+        return None
+    if not BRepCheck_Analyzer(face).IsValid():
+        # 截面环复杂度低于标准视图（融合体投影无往返副本），
+        # ShapeFix 失败即放弃——父棱柱兜底
+        _fx = ShapeFix_Shape(face)
+        _fx.Perform()
+        _fxd = _fx.Shape()
+        if BRepCheck_Analyzer(_fxd).IsValid():
+            face = _fxd
+        else:
+            print(f"  [剖面] '{v['name']}' Face 无效，跳过")
+            return None
+    _, extrude_axis = _get_view_transform(ptype)
+    face = _apply_view_transform(face, ptype)
+    if ptype == "top" and parent.get("_x_mirrored"):
+        trsf_mir = gp_Trsf()
+        trsf_mir.SetMirror(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)))
+        face = BRepBuilderAPI_Transform(face, trsf_mir).Shape()
+    if ptype != "front" and parent.get("_z_align_offset") is not None:
+        trsf_align = gp_Trsf()
+        trsf_align.SetTranslation(
+            gp_Vec(0, 0, -parent["_z_align_offset"]))
+        face = BRepBuilderAPI_Transform(face, trsf_align).Shape()
+    prism = _extrude_face_dual(face, extrude_axis, extrude_dist)
+    if prism is None:
+        print(f"  [剖面] '{v['name']}' 拉伸失败，跳过")
+        return None
+    _ctr = parent.get("_ctr")
+    if _ctr is not None:
+        trsf_ctr = gp_Trsf()
+        trsf_ctr.SetTranslation(_ctr)
+        prism = BRepBuilderAPI_Transform(prism, trsf_ctr).Shape()
+    print(f"  剖面 '{v['name']}'({ptype}): 截面 {sw:.0f}×{sh:.0f}mm, "
+          f"对齐偏移 ({dx:.1f}, {dy:.1f})")
+    return prism
 
 
 def _micro_chain_lengths(edges):
@@ -4338,7 +4797,20 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
     z_cone = None  # v0.6.4: 锥面顶（CSG 系），无信号时 None
     z_cone_bot = None  # v0.6.4: 锥面底
 
+    # v0.6.15: 剖面视图全环提取（外环+内环）——剖面棱柱材料截面。
+    # 无剖面图纸（回归路径）不触发，零开销。
+    all_rings = _extract_view_rings_all(edges, views) \
+        if any(v.get("_is_section") for v in views) else None
+
     for v in views:
+        # v0.6.15: 剖面视图走专有棱柱路径（截面沿父视图轴拉伸，
+        # 变换/居中全部复用父视图），不参与外轮廓提取与 P0 特征
+        if v.get("_is_section"):
+            _sprism = _build_section_prism(v, views, all_rings, edges,
+                                           scale_factor, extrude_dist)
+            if _sprism is not None:
+                prisms.append(_sprism)
+            continue
         ring_data = no_merge_rings.get(v["name"])
         # v0.6.11: 外轮廓合理性校验——无合并边图上有局部断点
         # （端点间隙 > SNAP_TOL 0.01）时，最右转遍历会退回视图内部的
@@ -4762,6 +5234,9 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 pcx = _sgn * (v["bbox"][0] + v["bbox"][2]) / 2 * scale_factor
             pcy = (py1 + py2) / 2
             pcz = (pz1 + pz2) / 2
+            # v0.6.15: 保存居中向量——剖面棱柱复用父视图居中基准
+            # （同一投影方向的两个视图必须用同一居中量）
+            v["_ctr"] = gp_Vec(-pcx, -pcy, -pcz)
             if abs(pcx) > 0.01 or abs(pcy) > 0.01 or abs(pcz) > 0.01:
                 trsf_ctr = gp_Trsf()
                 trsf_ctr.SetTranslation(gp_Vec(-pcx, -pcy, -pcz))
@@ -5112,6 +5587,8 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
     # 导致期望值虚高误报（block_3view: 期望 X=145 vs 实际 100）
     expected = {"X": None, "Y": None, "Z": None}
     for v in views:
+        if v.get("_is_section"):
+            continue  # 剖面视图不参与 P1 期望尺寸（无 _outer_face）
         vt = v["view_type"]
         ofc = v.get("_outer_face") or {}
         if ofc.get("x_min") is not None:
@@ -5187,7 +5664,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 # 映射到 3D: 需要知道此中心线属于哪个视图
                 # 遍历视图找到包含此 X 的前视图
                 for v in views:
-                    if v["view_type"] != "front":
+                    if v["view_type"] != "front" or v.get("_is_section"):
                         continue
                     v_bbox = v["bbox"]
                     # 中心线归属判定 + 视图中心均用外轮廓自身范围
@@ -5258,7 +5735,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 sf = scale_factor
                 # 找到此 hatch 对应的视图
                 for v in views:
-                    if v["view_type"] != "front":
+                    if v["view_type"] != "front" or v.get("_is_section"):
                         continue
                     v_bbox = v["bbox"]
                     # 检查 hatch 是否在此视图中
@@ -5333,7 +5810,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         profiles_vis_by_view = {}
         applied_cuts = set()  # v0.6.3: 已应用刀具去重键
         for v in views:
-            if v["view_type"] != "top":
+            if v["view_type"] != "top" and not v.get("_is_section"):
                 profiles_by_view[id(v)] = _vertical_hole_profiles(v, edges, hidden_vlines)
                 profiles_vis_by_view[id(v)] = _vertical_hole_profiles(v, edges)
 
@@ -5341,7 +5818,9 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         # front 投影丢失 Y、side 丢失 X，旧代码把刀固定在 0 轴切错位置）。
         # 外环自身与主体台阶圆（r > 外环 70%，如 φ60 圆柱顶圆）排除。
         top_hole_circles = []
-        _topv = next((v for v in views if v["view_type"] == "top"), None)
+        _topv = next((v for v in views
+                      if v["view_type"] == "top" and not v.get("_is_section")),
+                     None)
         if _topv is not None and _topv.get("_outer_face"):
             _tofc = _topv["_outer_face"]
             _tcx = (_tofc["x_min"] + _tofc["x_max"]) / 2
@@ -5388,7 +5867,7 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
                 profs = profiles_by_view
             cands = []
             for v in views:
-                if v["view_type"] == "top":
+                if v["view_type"] == "top" or v.get("_is_section"):
                     continue
                 ofc = v.get("_outer_face") or {}
                 y_span = ofc.get("y_max", 0) - ofc.get("y_min", 0)
@@ -5449,8 +5928,12 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             信息，取标准键槽（DIN 6885: 宽 4 → 孔心距底 7.8）。
             """
             # front/side 视图竖线收集（y 与孔段重叠）
-            fv = next((v for v in views if v["view_type"] == "front"), None)
-            sv = next((v for v in views if v["view_type"] == "side"), None)
+            fv = next((v for v in views
+                       if v["view_type"] == "front" and not v.get("_is_section")),
+                      None)
+            sv = next((v for v in views
+                       if v["view_type"] == "side" and not v.get("_is_section")),
+                      None)
             if fv is None or sv is None:
                 return None
             _kx_side = None  # side 视图孔心 x
@@ -6716,7 +7199,8 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
     # ---- Step 3.5: CSG 多视图体积求交 ----
     # 尝试分离视图并构建 3D 实体
     views = _separate_views_2d(valid_faces, (bbox_min[0], bbox_min[1],
-                                              bbox_max[0], bbox_max[1]))
+                                              bbox_max[0], bbox_max[1]),
+                               texts=texts)
     print(f"\n[3.5/6] 视图分离: {len(views)} 个区域")
     for v in views:
         print(f"    {v['name']}: {len(v['faces'])}面, "
@@ -6854,7 +7338,7 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                     return None
                 best_cand = None  # (|pr-r|, z_top, z_bot)
                 for v in views:
-                    if v["view_type"] == "top":
+                    if v["view_type"] == "top" or v.get("_is_section"):
                         continue
                     ofc = v.get("_outer_face") or {}
                     y_span = ofc.get("y_max", 0) - ofc.get("y_min", 0)
@@ -6906,7 +7390,7 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                 own_view = None
                 for vtype in ("top", "front", "side"):
                     for v in views:
-                        if v["view_type"] != vtype:
+                        if v["view_type"] != vtype or v.get("_is_section"):
                             continue
                         tb = v["bbox"]
                         if tb[1] - 5 <= cy <= tb[3] + 5 and \
@@ -8217,7 +8701,7 @@ def main():
         output_sldprt = str(input_dir / f"{input_stem}_{ts}.sldprt")
 
     print("=" * 60)
-    print("通用 DXF → 3D SolidWorks 转换器 v0.6.14")
+    print("通用 DXF → 3D SolidWorks 转换器 v0.6.15")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  STEP: {step_path}")
