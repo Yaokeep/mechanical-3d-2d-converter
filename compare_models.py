@@ -193,12 +193,13 @@ def _bool_shape(a, b, cut, label):
 
 
 def main() -> int:
-    # 参数: [--dz <毫米>] [--dx <毫米>] [--dy <毫米>] [--split <z1,z2,...>] 基准.step 重建.step
+    # 参数: [--dz <毫米>] [--dx <毫米>] [--dy <毫米>] [--split <z1,z2,...>] [--split-axis x|y|z] 基准.step 重建.step
     args = sys.argv[1:]
     dz = 0.0
     dx = 0.0
     dy = 0.0
     split_zs = None
+    split_axis = "z"
     while args and args[0].startswith("--"):
         flag = args.pop(0)
         if flag == "--dz":
@@ -209,6 +210,8 @@ def main() -> int:
             dy = float(args.pop(0))
         elif flag == "--split":
             split_zs = [float(v) for v in args.pop(0).split(",")]
+        elif flag == "--split-axis":
+            split_axis = args.pop(0)
         else:
             print(__doc__)
             return 1
@@ -261,21 +264,31 @@ def main() -> int:
     print(f"  缺失材料(基准-重建) = {mv:.2f}")
     print(f"  交集体积 = {cv:.2f} (交集/基准 = {cv / bv * 100:.1f}%)")
 
-    # 按 z 段拆分多余/缺失材料（z 为基准系坐标）
+    # 按段拆分多余/缺失材料（默认 z，--split-axis x|y 切换；基准系坐标）
     if split_zs:
         bx = bb if bb is not None else braw
         x1, y1, z1, x2, y2, z2 = bx.Get()
-        print("\n逐段对比 (z 基准系):")
-        edges = [z1] + sorted(split_zs) + [z2]
+        print(f"\n逐段对比 ({split_axis} 基准系):")
+        ax1 = {"x": x1, "y": y1, "z": z1}[split_axis]
+        ax2 = {"x": x2, "y": y2, "z": z2}[split_axis]
+        edges = [ax1] + sorted(split_zs) + [ax2]
         for i in range(len(edges) - 1):
-            box = BRepPrimAPI_MakeBox(
-                gp_Pnt(x1 - 1, y1 - 1, edges[i]),
-                gp_Pnt(x2 + 1, y2 + 1, edges[i + 1]),
-            ).Shape()
+            if split_axis == "x":
+                p0, p1 = gp_Pnt(edges[i], y1 - 1, z1 - 1), \
+                    gp_Pnt(edges[i + 1], y2 + 1, z2 + 1)
+                box_vol = (edges[i + 1] - edges[i]) * (y2 - y1 + 2) * (z2 - z1 + 2)
+            elif split_axis == "y":
+                p0, p1 = gp_Pnt(x1 - 1, edges[i], z1 - 1), \
+                    gp_Pnt(x2 + 1, edges[i + 1], z2 + 1)
+                box_vol = (x2 - x1 + 2) * (edges[i + 1] - edges[i]) * (z2 - z1 + 2)
+            else:
+                p0, p1 = gp_Pnt(x1 - 1, y1 - 1, edges[i]), \
+                    gp_Pnt(x2 + 1, y2 + 1, edges[i + 1])
+                box_vol = (x2 - x1 + 2) * (y2 - y1 + 2) * (edges[i + 1] - edges[i])
+            box = BRepPrimAPI_MakeBox(p0, p1).Shape()
             # 逐 solid 求交：Common 对含退化子形状的复合体可能失败
             # 并原样返回 box（体积 = box 全域）——IsDone 校验 +
             # 体积上限兜底归零；失败个体经 ShapeFix 重试一次
-            box_vol = (x2 - x1 + 2) * (y2 - y1 + 2) * (edges[i + 1] - edges[i])
 
             def _seg_vol(shape):
                 if shape.IsNull():
@@ -297,7 +310,7 @@ def main() -> int:
 
             ev2 = _seg_vol(extra)
             mv2 = _seg_vol(missing)
-            print(f"  z[{edges[i]:8.2f}, {edges[i + 1]:8.2f}]: 多余={ev2:+9.1f}  缺失={mv2:+9.1f}  净={ev2 - mv2:+9.1f}")
+            print(f"  {split_axis}[{edges[i]:8.2f}, {edges[i + 1]:8.2f}]: 多余={ev2:+9.1f}  缺失={mv2:+9.1f}  净={ev2 - mv2:+9.1f}")
     return 0
 
 

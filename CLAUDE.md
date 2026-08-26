@@ -222,10 +222,10 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.16（git tag 为准）。代码内三处版本字符串（`app.py:15` /
+版本 v0.6.17（git tag 为准）。代码内三处版本字符串（`app.py:15` /
 `main_window.py:28` / `main_window.py:535`）与 git 一致，已核对。
-**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.16 全文保留）——
-本节只留仍在影响决策的部分。
+**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.16 全文保留，
+v0.6.17 起续写）——本节只留仍在影响决策的部分。
 
 ### 当前精度断点
 
@@ -233,8 +233,8 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 |------|-------------|------|
 | PF60K 法兰盘（CSG） | 261,726 / 261,935（−0.08%） | 收敛 |
 | PF60K 法兰盘（SW 特征模型，18 特征） | 261,875 / 261,935（−0.02%） | 收敛 |
-| bracket angker（三视图） | 净差 −389.77（−0.20%），多余 1,752 / 缺失 1,807 | 收敛，条带补丁待精化 |
-| bracket angker（三视图+剖面图纸，v0.6.16） | 199,267 / 191,988（+3.79%），多余 9,127 / 缺失 1,846 | 剖面约束 + 深槽刀组生效（v0.6.15 时 201,112 / +4.75%；无剖面时 201,631 / +5.02%），剩余为融合投影天花板 |
+| bracket angker（三视图） | 净差 −519.82（−0.27%），多余 1,499 / 缺失 1,989 | 收敛；v0.6.17 刀组按剖面路径调参（挖深挖全）连带多挖 ~130（v0.6.16 时 −389.77/−0.20%） |
+| bracket angker（三视图+剖面图纸，v0.6.17） | 净差 +7,105（+3.70%），多余 8,836 / 缺失 1,730（v0.6.16 时 199,267 / +3.79%） | 用户两缺陷已修复：臂端槽口方形（weld 微段链保护，x[165,166]/[167,168] 与基准 0/0 一致）+ 右圆孔断开（刀组 r2 按基准截面实测重构）；剩余为融合投影天花板 |
 | 简单模型回归套件 | 6/6 | 绿 |
 
 基准模型在 `三维/`（gitignored，用户私有数据）。bracket 与历史数值对比
@@ -314,7 +314,7 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**（发版时全部要改，当前均为 `0.6.16`，已核对一致）:
+- **版本号同步**（发版时全部要改，当前均为 `0.6.17`，已核对一致）:
   `app.py:15` `APP_VERSION` / `main_window.py:28` `setWindowTitle` /
   `main_window.py:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
   + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
@@ -330,4 +330,4 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
 - **Co-Authored-By**: 每次 commit 末尾添加 `Co-Authored-By: Claude <noreply@anthropic.com>`
 - **自动推送**: 每次本地 commit 后自动 `git push`（用户偏好设置）
 - **每次建模使用新文件名**: SW 模型不能覆盖已有文件（防止 SW 进程占用导致保存失败），使用时间戳确保文件名唯一
-- **SW 建模后关闭文档**: 每次 SW COM 建模/导出完成后必须关闭旧模型文档（`CloseDoc`）再断开——SW 进程内模型堆积过多会导致 SolidWorks 崩溃。已实现：`sw_driver.py` 的 `disconnect()` 自动先关活动文档（覆盖 dxf_to_3d_general / dxf_to_sw_features / dxf_to_sldprt / GUI）；`sw2025_create_shaft.py` 独立封装同样处理；`sw_export_step.py` 已有 CloseDoc。新增 SW 脚本时收尾必须带文档关闭
+- **SW 同时只保留一个模型**: 建模/导入完成后**不要立即关闭**（模型留在 SW 里给用户查看）；下一次重建前先关掉上一个再建新的——防 SW 进程内模型堆积崩溃，同时保住可查看性。⚠️ **代码尚未落地（用户要求先不动）**：`sw_driver.py` 的 `disconnect()` 目前仍是收尾自动关活动文档（会把刚建好的模型也关掉），落地需改收尾逻辑为只关非本次构建的旧文档
