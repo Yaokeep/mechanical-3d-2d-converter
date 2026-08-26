@@ -23,34 +23,30 @@ ruff format src/           # 无 pyproject.toml，全部走 ruff 默认规则
 pytest tests/
 
 # ---- 根目录独立脚本（不通过 main.py，直接命令行运行） ----
+# 凡 import OCC 的脚本都必须用 $PY（cad-occt 环境），下同
+PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 
-# DXF 阶梯轴 → SolidWorks .sldprt 原生文件
-python dxf_to_sldprt.py CAD/20160112-181116-09933.dxf
-python dxf_to_sldprt.py input.dxf output.sldprt
+# DXF 阶梯轴 → SolidWorks .sldprt 原生文件（纯 DXF+COM，默认 python 即可）
+python dxf_to_sldprt.py CAD/20160112-181116-09933.dxf [output.sldprt]
 
 # 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，不限阶梯轴）
-# 需要在 cad-occt conda 环境中运行（依赖 PythonOCC）
 # 输入 .dwg 时自动调用 tools/libredwg/dwg2dxf.exe 转换
-/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe dxf_to_3d_general.py CAD/reducer.dxf
-/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe dxf_to_3d_general.py input.dxf output.sldprt
+$PY dxf_to_3d_general.py CAD/reducer.dxf [output.sldprt]
 
-# DXF/DWG 阶梯轴 → 3D STEP 模型（使用 PythonOCC）
-# 需在 cad-occt 环境运行：DXF 解析可脱离 OCC（懒加载），但 STEP 导出必须 OCC
-/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe convert_dwg_to_3d.py CAD/20160112-181116-09933.dxf output.step
+# DXF/DWG 阶梯轴 → 3D STEP（DXF 解析可脱离 OCC 懒加载，但 STEP 导出必须 OCC）
+$PY convert_dwg_to_3d.py CAD/20160112-181116-09933.dxf output.step
 
 # DXF 工程图 → SW 原生特征模型 .sldprt（Boss/Cut 可编辑特征树，非 STEP 哑几何）
-# 需 cad-occt 环境 + SolidWorks 2025 已启动；输出时间戳 sldprt + 中间 CSG STEP
-/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe dxf_to_sw_features.py CAD/reducer.dxf
-/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe dxf_to_sw_features.py input.dxf output.sldprt --no-step
+# 需 SolidWorks 2025 已启动；输出时间戳 sldprt + 中间 CSG STEP
+$PY dxf_to_sw_features.py CAD/reducer.dxf [output.sldprt] [--no-step]
 
 # 简单模型回归套件 — 6 个已验证用例（体积精确匹配 + 逐轴 bbox + 实体数）
 # 报告输出 CAD/temp_output/regression_report.txt；--sw 附加 SW 时间戳模型生成
-/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe run_simple_regression.py
-/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe run_simple_regression.py --sw
+$PY run_simple_regression.py [--sw]
 
 # 跑单个用例：套件无用例过滤开关（只认 --sw）。单用例直接调 convert_dxf_to_3d，
 # 绕开 CLI 的 SW 导入；黄金值（体积/逐轴 bbox）见 run_simple_regression.py:38 的 CASES 表
-/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe -c "
+$PY -c "
 import dxf_to_3d_general as d, run_simple_regression as r
 d.convert_dxf_to_3d('CAD/test_simple/block_3view.dxf', 'CAD/temp_output/_one.step')
 print(r.analyze_step(__import__('pathlib').Path('CAD/temp_output/_one.step')))"
@@ -69,16 +65,15 @@ python gen_vba_test.py
 python keyway_combine_macro.py
 
 # 调试小工具
-python debug_dxf_views.py CAD/xxx.dxf                          # 按布局区域打印三视图边/圆分布（仅 ezdxf）
-/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe debug_measure_step.py a.step b.step  # STEP 体积/bbox/实体数/面类型（需 OCC）
-# 注：根目录另有针对特定靶子模型的一次性 debug_*.py（如 debug_top_*.py / debug_bracket_*.py），
-# 不入库（untracked），调试完即弃；正式修复应落在 dxf_to_3d_general.py 等主脚本
+python debug_dxf_views.py CAD/xxx.dxf          # 按布局区域打印三视图边/圆分布（仅 ezdxf）
+$PY debug_measure_step.py a.step b.step        # STEP 体积/bbox/实体数/面类型（需 OCC）
+# 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性探针脚本
+# 一律用 `_` 前缀（现存 _probe_circles.py / _render_dxf.py / _sheet_strip.py /
+# _verify_drawing.py / _csg_*.py 版本备份），由 .gitignore 的 `/_*.py` 排除，
+# 调试完即弃；正式修复应落在 dxf_to_3d_general.py 等主脚本
 
 # ---- 闭环验证链（真实模型 → 图纸 → 重建 → 定量对比） ----
-# 解释器不能混用：sw_export_step.py 只需 SW COM（默认 python 即可），
-# model_to_drawing.py / compare_models.py 都 import OCC，必须用 cad-occt（下方 $PY）
-PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
-python sw_export_step.py 三维/xxx.SLDPRT [out.step]      # SLDPRT → STEP 基准（SW COM）
+python sw_export_step.py 三维/xxx.SLDPRT [out.step]      # SLDPRT → STEP 基准（只需 SW COM）
 $PY model_to_drawing.py input.step [out.dxf]             # STEP → 三视图 DXF（HLR 投影）
 # ↑ 同时自动输出 <out>_剖面图.dxf：三视图 + 自动选位剖面 + HATCH + 剖切线标记。
 #   两个文件分开是必须的——闭环重建把 HATCH 当剖面材料信号、把多余视图簇
@@ -158,7 +153,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 根目录独立脚本（不通过 main.py 调用，直接命令行运行）:
   dxf_to_sldprt.py       — DXF 阶梯轴 → SW .sldprt 原生文件（DXF 解析 + SW COM）
-  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，8736 行）
+  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，8756 行）
                            核心链: 边图构建→封闭环检测→视图分离(Y+X 间隙，v0.6.15 起含剖面行识别)
                            →CSG 体积求交 / 单视图轮廓拉伸
                            CSG: 各视图外轮廓拉伸为棱柱→布尔交集→内部特征布尔减(P0)→投影验证(P1)
@@ -198,27 +193,32 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 | `docs/` | `CHANGELOG.md` — v0.5.4~v0.6.16 逐版本根因叙事（自 CLAUDE.md 抽出，查"某阈值为何是 0.1"这类历史依据时看它） |
 | `.claude/` | `settings.local.json` — 预授权的 Bash 权限列表；`skills/` — 项目级启用的技能符号链接 |
 | `.agents/skills/` | 4 个技能：`mechanical-engineer`、`solidworks-cad`（泵叶轮参数化）、`python-code-review`（含 5 个参考文件）、`python-packaging`；仅前两个经符号链接在项目级启用。根目录 `skills-lock.json` 锁定 `mechanical-engineer` 来源 |
-| `CAD/` | 52 个 VBA 宏（含 VerifySW2025_v33~v45 验证系列）、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`）、`temp_output/` 闭环验证链工作区（三视图 DXF 迭代样本——含 `bracket_angker_三视图*.dxf`、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf` 等新靶子、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例、`verify_log/` 宏迭代历史 |
+| `CAD/` | 55 个 VBA 宏 `.bas`（根目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代 + `soldwork/` 4），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`）、`temp_output/` 闭环验证链工作区（三视图 DXF 迭代样本——含 `bracket_angker_三视图*.dxf`、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf` 等新靶子、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例、`verify_log/` 宏迭代历史 |
 | `PDF/` | 空目录（预留放参考 PDF 文档） |
 | `三维/` | 闭环验证参考模型（gitignored）：`麒浚传动_PF60K-14-50-70-M4-L2-12.SLDPRT`、`bracket angker.stp`、`spoon.SLDPRT` / `spoon.STEP`、`勺子/`（勺子参考图 + STEP/STL 副本） |
-| `soldwork/` | SW VBA 宏工作区（`.swp` 工程文件 + `.bas` 测试宏） |
+| `soldwork/` | SW VBA 宏工作区：`.bas` 测试宏（入库）+ `.swp` 工程文件（**未入库**，被 `.gitignore` 的 vim-swap 规则误伤，见下方"路径与平台注意事项"） |
 | `tools/libredwg/` | LibreDWG Windows 完整发行版 — `dwg2dxf.exe` 等命令行工具 + Python 绑定；`dxf_to_3d_general.py` 遇 .dwg 输入时自动调用转换 |
 
 ### 关键设计约定
 
-1. **数据流**: 所有 CAD 数据通过 `Document` 模型承载，`Document` 是顶层容器，管理 `ShapeNode` 树。`ShapeNode` 封装 `TopoDS_Shape`（OpenCASCADE 核心类型）以及可选的 `metadata` 字典存放非几何信息。
+**验证准则（最重要）**: 转换/修复的验收以实际生成的模型为准——每次修改转换
+代码后运行完整 CLI（生成 STEP + SW 时间戳 .sldprt），**不以代码或日志数值吻合
+作为成功标准**。判断几何正确性可加载 STEP 用 `GProp_GProps` 体积 /
+`BRepAdaptor_Surface` 面类型做定量核对（体积与理论值精确吻合才是真通过）。
 
-2. **导入器模式**: `src/core/io/` 中所有格式导入器继承 `BaseImporter`，通过 `FormatRegistry` 注册。导入器返回 `Document` 对象。`src/core/io/__init__.py` 在模块加载时自动注册所有内置格式。
+以下是 `src/` 侧的设计意图，GUI 接线时遵循（当前均为骨架）：
 
-3. **3D 视图回退**: `MainWindow._setup_central_widget()` 在 PythonOCC 导入失败时优雅降级为占位标签，不阻塞应用启动。
-
-4. **配置文件**: 用户配置存储在 `~/.cad_converter_config.json`，使用 `AppConfig` dataclass 管理，支持 JSON 序列化。
-
-5. **后台线程模式**: 所有耗时操作（文件 I/O、COM 调用、HLR 计算）使用 `ThreadWorker` 封装，通过 `progress`/`finished`/`error` 信号与 GUI 主线程通信。参考 `sw_dialog.py` 中的 `_sw_build_shaft()` 函数——它在 `QThread` 中运行，`ThreadWorker` 负责线程生命周期管理。
-
-6. **MainWindow 信号连接模式**: 所有菜单/工具栏动作的信号槽连接集中在 `_connect_signals()` 方法中，槽函数命名遵循 `_on_<action>` 约定。
-
-7. **验证准则**: 转换/修复的验收以实际生成的模型为准——每次修改转换代码后运行完整 CLI（生成 STEP + SW 时间戳 .sldprt），不以代码或日志数值吻合作为成功标准。判断几何正确性可加载 STEP 用 `GProp_GProps` 体积 / `BRepAdaptor_Surface` 面类型做定量核对（体积与理论值精确吻合才是真通过）。
+- **数据流**: CAD 数据统一由 `Document`（顶层容器，管理 `ShapeNode` 树）承载；
+  `ShapeNode` 封装 `TopoDS_Shape` + 可选 `metadata` 字典存非几何信息
+- **导入器模式**: `core/io/` 各导入器继承 `BaseImporter`、经 `FormatRegistry` 注册、
+  返回 `Document`；`io/__init__.py` 在模块加载时自动注册所有内置格式
+- **3D 视图回退**: `MainWindow._setup_central_widget()` 在 PythonOCC 导入失败时
+  降级为占位标签，不阻塞启动
+- **后台线程**: 耗时操作（文件 I/O、COM 调用、HLR 计算）一律用 `ThreadWorker` 封装，
+  经 `progress`/`finished`/`error` 信号与主线程通信；范例见 `sw_dialog.py`
+  的 `_sw_build_shaft()`
+- **信号连接**: 菜单/工具栏信号槽集中在 `_connect_signals()`，槽命名 `_on_<action>`
+- **配置文件**: `~/.cad_converter_config.json`，`AppConfig` dataclass + JSON 序列化
 
 ## 项目当前状态
 
@@ -256,37 +256,26 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 碰到落在这张表里的偏差不要继续"修"——先确认图纸是否真的携带该信息，
 否则会像 v0.6.10 那样造出体积对得上、结构却错的模型。
 
-### ✅ 已完成实现
+### 实现状态
 
-- **GUI 骨架**：菜单栏/工具栏/Dock 面板，2D 视口（QGraphicsView 多视图布局框架），亮色/暗色主题
-- **SolidWorks 2025 COM 集成**：`sw_driver.py`（901 行）— 连接/断开/新建零件/草图/特征/倒角/圆角/键槽/保存，7/7 API 全部调通
-- **DXF→SW 全流程建模**：`sw_shaft_builder.py`（1063 行）— 所有 6 个特征全部正确创建：
-  - 旋转基体 (Revolve-ShaftBody)
-  - 端面倒角 (Chamfer-LeftEnd / Chamfer-RightEnd) — 按 DXF 检测尺寸
-  - 阶跃过渡圆角 (Fillet-Transitions) — 按 DXF 检测半径
-  - 键槽切除 (Keyway-N) — Python COM FeatureCut3(26参数)
-- **`dxf_to_sldprt.py`**：完整 — 命令行参数支持、DXF 几何参数自动检测、时间戳输出文件（防 SW 占用）
-- **`convert_dwg_to_3d.py`**：完整 — 使用 PythonOCC 进行 DXF→STEP 3D 实体建模（旋转体 + 键槽布尔减运算），OCC 懒加载设计使 DXF 解析可独立使用
-- **`dxf_to_3d_general.py`**（8736 行）：通用 DXF 工程图 → 3D STEP + SW .sldprt。核心算法链：边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 / 单视图轮廓拉伸。
-  - 算法演进 v0.5.4~v0.6.10（CSG 求交 → P0 内部特征 → P1 投影验证 → P2 注解驱动 → P3 复杂图纸健壮性 → PF60K 精度收敛）见 `docs/CHANGELOG.md`
-  - v0.6.15 剖面图识别：剖面行按标签打标 `_is_section`、父视图匹配、全环枚举（外环−内环）建带孔截面 face → 沿父轴向拉伸为剖面棱柱与标准棱柱求交（只删假材料）；P0/注解消费端全部加 `_is_section` 守卫。剖面图纸重建 201,112（无剖面 201,631，+5.02%→+4.75%）
-  - 单视图回退模式保留（轮廓拉伸+内孔减除）。命令行: --single-view / --multi-view；以上新功能全部自动执行、无新增 CLI 开关
-- **`dxf_to_sw_features.py`**（1040 行）：DXF 工程图 → SW 原生特征模型（可编辑特征树：Boss-Extrude/Cut-Extrude/Revolve）。核心链：复用 `dxf_to_3d_general.convert_dxf_to_3d` CSG 重建 → z 切片环提取（圆/线/弧分类）→ 环轨迹跟踪分段 → 段分类（const 拉伸 / cone 旋转 / vary 细分）→ SW COM 特征建模（凸台序列自底向上 + 孔切除 + 材料岛 + 锥面旋转凸台）。验收（PF60K 法兰盘，18 特征）：体积 261,875 vs CSG 261,726（+0.06%）/ SW 基准 261,935（-0.02%）
-  - v0.6.6/v0.6.7 修复（方∩圆法兰轮廓误合成整圆、通孔切穿 0.1mm 留皮）见 `docs/CHANGELOG.md`
-  - SetAddToDB 行为限制（实测 SW2025）：孔切除草图用 `_sketch_loop(no_snap=True)`（SetAddToDB 绕过草图推理捕捉，键槽矩形角部距截面圆边 0.04mm 会被吸附畸变致 FeatureCut3 None）；**boss 草图必须 no_snap=False**（SetAddToDB 模式线端点不自动合并，多线环开环拉伸失败，八边环实测）
-- **阶梯轴建模对话框**：`sw_dialog.py`（509 行）— 后台线程建模、进度反馈、参数编辑
-- **数据模型**：`Document`、`ShapeNode`、`ProjectionData` 完整实现
+**根目录独立脚本 = 全部完整可用**（各脚本职责与算法链见上方"分层结构"）。
+`src/core/sw_automation/` 与数据模型（`Document`/`ShapeNode`/`ProjectionData`）
+同样完整：SW 7/7 API 调通，阶梯轴 6 特征（旋转基体 + 左右端面倒角 +
+阶跃过渡圆角 + 键槽切除）全部按 DXF 检测尺寸正确创建。
 
-### ⚠️ 骨架存在（待集成 PythonOCC）
+**`src/` 内 GUI 与算法模块仍是骨架**——类结构和接口定义完整，核心算法标注
+`# TODO`，OCC API 调用已注释在代码中，待集成：
 
-以下模块有完整的类结构和接口定义，但核心算法标注为 `# TODO`，需集成 PythonOCC 后实现：
+- `gui/view3d/`（`display_shape`/`erase_all`/`fit_all` 已定义，等 `OCC.Display.qtDisplay`）
+- `core/projection/`（`HLRProjector`/`Orthographic`/`Axonometric`/`SectionView`，等 `HlrAlgo_Projector`）
+- `core/reconstruction/`（`WireMaker`/`FaceBuilder`/`ExtrudeBuilder`/`RevolveBuilder`）
+- `core/io/`（8 个导入/导出器；`FormatRegistry` 已完整，GUI 导入菜单已接
+  `DxfImporter` 但当前返回空 Document）
+- `core/annotation/`（`AutoDimension`）
 
-- **3D 视图** (`view3d_widget.py`)：已定义 `display_shape()`/`erase_all()`/`fit_all()` 等接口，等待 `OCC.Display.qtDisplay` 集成
-- **3D→2D 投影** (`projection/`)：`HLRProjector`、`OrthographicProjector`、`AxonometricProjector`、`SectionView`—所有类结构完整，投影方向/视图标签已定义，等待 `HlrAlgo_Projector` 集成
-- **2D→3D 重建** (`reconstruction/`)：`WireMaker`、`FaceBuilder`、`ExtrudeBuilder`、`RevolveBuilder`—流程骨架完整（线框→面→拉伸/旋转），OCC API 调用已注释在代码中
-- **文件 I/O** (`io/`)：8 个导入/导出器骨架完整，OCC 调用已注释在代码中；`FormatRegistry` 注册表已完整实现，GUI 导入菜单已接入 `DxfImporter`（当前返回空 Document）
-- **自动标注** (`annotation/`)：`AutoDimension` 类结构完整，算法逻辑待实现
-- **测试目录**：仅 `__init__.py`（v0.5.6 提交的"测试用例 DXF"指 `CAD/` 下的 `法兰练习`/`图形练习` 样本，非 pytest 用例）
+⚠️ **GUI 骨架与根目录脚本是两套独立实现**：三视图投影、2D→3D 重建这些能力
+在根目录脚本里已生产可用，`src/` 里的同名模块是尚未接线的另一份。改算法请
+落在根目录脚本，不要误以为 `src/core/projection/` 是现役代码。
 
 ### SolidWorks 自动化模块 (`src/core/sw_automation/`)
 
@@ -307,28 +296,16 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - **VBScript 编码**: 必须使用 **GBK** (cscript 使用系统 ANSI 代码页 CP936)，UTF-8-BOM 会导致编译错误
 - **混合架构**: 旋转基体（Python COM）+ 倒角/圆角（VBScript 直接 COM）+ 键槽（Python COM FeatureCut3），各自使用最可靠的接口
 - **COM None 编组**: 需要 IDispatch* 参数处使用 `NULL_DISPATCH` / `_null_dispatch()` 而非 Python `None`
+- **SetAddToDB 两面性**（`dxf_to_sw_features.py` 实测，两个方向都会静默失败）:
+  孔切除草图必须 `_sketch_loop(no_snap=True)`——SetAddToDB 绕过草图推理捕捉，
+  否则键槽矩形角部距截面圆边 0.04mm 会被吸附畸变，致 `FeatureCut3` 返回 None；
+  **但 boss 草图必须 `no_snap=False`**——SetAddToDB 模式下线端点不自动合并，
+  多线环开环导致拉伸失败（八边环实测）
 
-### 已移除的功能
+### 已移除的功能（v0.3.0 起不再维护）
 
-以下功能已于 v0.3.0 移除，不再维护：
-- `convert_pdf.py` — 基于 Zhang-Suen 骨架化的 PDF→DWG 转换脚本
-- `src/core/vectorization/` — 光栅→矢量矢量化引擎
-- `src/core/io/pdf_importer.py` — PDF 导入器
-- `src/core/io/image_importer.py` — 图像矢量化导入器
-
-## 依赖关系
-
-| 包 | 用途 | 安装方式 |
-|---|---|---|
-| PyQt6 | GUI 框架 | pip |
-| pythonocc-core | CAD 内核（OpenCASCADE 封装） | **必须通过 conda-forge 安装** |
-| pywin32 | SolidWorks COM 驱动（Windows only，可选） | pip |
-| ezdxf | DXF 读写 | pip |
-| numpy | 数值计算 | pip |
-| pyyaml | YAML 配置文件解析 | pip |
-| loguru | 结构化日志 | pip |
-| ruff | 代码检查（开发依赖） | pip |
-| pytest / pytest-qt | 测试框架（开发依赖） | pip |
+PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG）、
+`src/core/vectorization/`、`io/pdf_importer.py`、`io/image_importer.py`。
 
 ## 路径与平台注意事项
 
@@ -337,10 +314,15 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**: `src/app.py`（`APP_VERSION`）、`src/gui/main_window.py`（`setWindowTitle` 1 处 + 关于对话框 `main_window.py:535` 1 处，共 2 处）、`CLAUDE.md` 和 git tag 四处版本号需同步。当前 git tag 为 `v0.6.16`，代码内三处（`app.py:15` / `main_window.py:28` / `main_window.py:535`）均为 `0.6.16`，已核对一致——提交新版本时务必同步更新这些位置。此外转换器脚本横幅（`dxf_to_3d_general.py` docstring/结尾 print、`dxf_to_sw_features.py` docstring/横幅 print）也含版本字符串。
-- **README.md 路线图**: 第五个需要同步的位置（路线图段 + "当前版本"行），v0.6.16 已补至最新。
+- **版本号同步**（发版时全部要改，当前均为 `0.6.16`，已核对一致）:
+  `app.py:15` `APP_VERSION` / `main_window.py:28` `setWindowTitle` /
+  `main_window.py:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
+  + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
+  `dxf_to_sw_features.py` 的 docstring 与结尾 print）。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
-  ⚠️ 排除规则有缺口：**生成的 `.dxf`/`.diff` 和根目录版本备份 `.py` 都不在忽略列表里**（`git check-ignore` 验证为空），导致 `git status` 长期挂着未跟踪残留（当前 9 个：`_csg_HEAD_0613.py`、`CAD/temp_output/_bracket_run3*.dxf`、`_*.diff`）。约定：**迭代产物一律以 `_` 前缀命名**，并补 `CAD/temp_output/_*`、`_csg_*.py`、`*.diff` 三条规则，才能让 `git status` 干净到可作为提交前检查依据。
+  **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
+  ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。
+  ⚠️ **`.gitignore:20` 的 `*.swp`（本意是 vim swap）与 SolidWorks 宏工程文件扩展名撞车**，`soldwork/Macro1.swp`、`Macro2.swp`、`test.swp` 三个 SW 宏工程被静默排除、从未入库。要保留某个 `.swp` 宏工程需显式 `git add -f`，或把该规则收窄为 `.*.swp`。
 
 ## Git 约定
 
