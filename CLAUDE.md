@@ -67,6 +67,13 @@ python keyway_combine_macro.py
 # 调试小工具
 python debug_dxf_views.py CAD/xxx.dxf          # 按布局区域打印三视图边/圆分布（仅 ezdxf）
 $PY debug_measure_step.py a.step b.step        # STEP 体积/bbox/实体数/面类型（需 OCC）
+python _render_dxf.py <in.dxf> <out.png> [dpi] [x0 x1 y0 y1]  # DXF → PNG 看图（默认 python）
+                                               # 末尾四个参数可局部放大某个视图
+# ⚠️ 看图必踩的坑：ezdxf 按 DXF 里存的背景色（本项目图纸是深色 #212830）解析
+#   ACI 颜色，而可见轮廓与 HATCH 都带 ACI 7（随背景反转的黑/白）→ 解析成白线；
+#   若再自己设白底，主体轮廓就在白底上整体隐形，只剩蓝色隐藏线——会得出
+#   "图纸有问题"的错误结论。_render_dxf.py 已用 LayoutProperties.set_colors
+#   覆盖成白底黑线配色，别绕开它直接调 Frontend
 $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/bracket_viewer.html：
                                                # 基准/重建叠加，点选弹框、坐标=基准系 mm——
                                                # 用户目视标记缺陷的入口（v0.6.18 三缺陷即由此而来）。
