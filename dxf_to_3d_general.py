@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.17
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.18
 
 核心算法链（详见 CLAUDE.md「dxf_to_3d_general.py」条目）:
   边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 /
@@ -7745,6 +7745,10 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
             # 大圆保护），矩形内腔必须矩形刀；top 有对应整圆（圆孔已
             # 走圆刀路径）时跳过。
             if _top_v is not None and body_solid is not None:
+                # v0.6.18: 局部 import 会遮蔽全局符号（本函数内 8441
+                # 有未别名 import），用新别名 _MakeBoxC 避免遮蔽陷阱
+                from OCC.Core.BRepPrimAPI import \
+                    BRepPrimAPI_MakeBox as _MakeBoxC
                 _tbb = _top_v["bbox"]
                 _hvs = metadata.get("_hidden_vlines") or []
                 _hhs = metadata.get("_hidden_hlines") or []
@@ -7781,6 +7785,7 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                     _cyc = (_cy1 + _cy2) / 2.0
                     _chy = (_cy2 - _cy1) / 2.0
                     _kept = []
+                    _tips = []
                     for _h in all_holes:
                         _hbb = Bnd_Box()
                         brepbndlib.Add(_h, _hbb)
@@ -7802,6 +7807,7 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                                 (_cz2 - _cz1) + 3.0, _cz1 - 1.5)
                             if _tip is not None:
                                 _kept.append(_tip)
+                                _tips.append((_hx, _hy, _hr))
                                 print(f"  腔端半圆刀({_hx:.0f},{_hy:.0f}): "
                                       f"R={_hr:.1f}, Z[{_cz1:.0f}~{_cz2:.0f}]")
                         # v0.6.14r6 修正：腔口大圆（r > 腔半宽+2）是
@@ -7814,6 +7820,24 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                         # top 外轮廓已含 R20 端弧。此前 r6 曾按
                         # "上段空腔"构造 R20 端弧刀 + 直段盒，把叉臂
                         # 整块误切（run33 叉臂消失根因）。
+                    # v0.6.18: 跑道槽圆头修复——两端都有腔端半圆刀
+                    # 时，腔盒方角把槽端切方（基准 xz 截面实测槽端
+                    # 全弧 r6，重建为方角）。收窄腔盒 x 到两端半圆刀
+                    # 圆心：盒∪两圆刀 = 真跑道（直段 y=±6 仅在圆刀
+                    # 圆心之间，端头纯圆弧）。判据：两刀圆心分别贴近
+                    # 盒两端面（|cx−端| ≤ r+1），且为不同刀。
+                    if len(_tips) >= 2:
+                        _tl = min(_tips, key=lambda _t: abs(_t[0] - _cx1))
+                        _tr2 = min(_tips, key=lambda _t: abs(_t[0] - _cx2))
+                        if (_tl is not _tr2
+                                and abs(_tl[0] - _cx1) <= _tl[2] + 1
+                                and abs(_tr2[0] - _cx2) <= _tr2[2] + 1):
+                            _xa, _xb = sorted((_tl[0], _tr2[0]))
+                            _cbox = _MakeBoxC(
+                                gp_Pnt(_xa, _cy1, _cz1),
+                                gp_Pnt(_xb, _cy2, _cz2)).Shape()
+                            print(f"  跑道槽端头: 腔盒 x 收窄到 "
+                                  f"[{_xa:.0f},{_xb:.0f}]")
                     all_holes = _kept
                     all_holes.append(_cbox)
                     hole_count += 1
@@ -7999,7 +8023,11 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                                     # 线对的错误解读——基准 x=76.35/
                                     # 84.35/94.35/100 四处截面均无该
                                     # 槽（主体连续实心），已删。
-                                    _tx1 = _slot_x[0] + 0.1
+                                    # v0.6.18: 左界 −0.1（原 +0.1 在
+                                    # 槽壁内侧留 0.1mm 残壁——用户
+                                    # "薄壁未完全分开"缺陷 #3，重建
+                                    # CSG x≈74.05 全高残片，基准无）
+                                    _tx1 = _slot_x[0] - 0.1
                                     _tongue_x2 = _slot_x[1]
                                     # v0.6.16r2: 深槽刀组按基准 STEP
                                     # yz 截面实测重构（x=156/160 截面
@@ -8133,61 +8161,178 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                                                     all_holes.append(
                                                         _e12.Current())
                                                     _e12.Next()
-                                        # 外带锥台反刀（双侧
-                                        # y[7,10.8]/[-10.8,-7]）：外带
-                                        # = 锥台 R12@y7 → R9@y10（截
-                                        # 面实测铁证），切锥台外角料。
-                                        # MakeCone(R1,R2,H) 轴 +Z、R1
-                                        # 在 z=0 面；绕 X 方向轴转
-                                        # ±90° 使 +Z→±Y，z=0 面落 y=±7
-                                        # 处（R12），z=H 面落 y=±10 处
-                                        # （R9）。旋转轴点必须取轴上
-                                        # 距锥心最近的点 (_dcx,0,_dcz)
-                                        # ——v0.6.16r2 旧码轴点 y=±7
-                                        # 使锥心偏置的 y 分量转入 z，
-                                        # 锥体落到 x∈[-12,12] z∈[-5,19]
-                                        # 与盒零重叠，Common 空 → 刀具
-                                        # = 整盒，外带整块误挖（截面
-                                        # 铁证：带 y[7,10] 全无）；改
-                                        # 为绕 (_dcx,0,_dcz) 旋转后再
-                                        # 平移 (_dcx,±7,_dcz)
+                                        # 外带反刀（双侧 y[7,10.8]/
+                                        # [-10.8,-7]）——v0.6.18 按基准
+                                        # yz 截面逐层实测重构（y=7/8/9/
+                                        # 9.4/10/10.5 六层铁证）：
+                                        # 外带 = 臂环实心圆盘 r(y)=9+
+                                        # √(9-(y-7)²)（环半径 9 管半径 3
+                                        # 的外轮廓，y∈[4,10]，填充到轴
+                                        # 心，非环形）+ 球台 r3@(84.66,
+                                        # ±7,9)（圆盘左端球头）+ 顶弦/
+                                        # 底弦凸棱（z=±(9+√(9-(y-7)²))，
+                                        # x∈[84.66,89.54]，球台到轴心的
+                                        # 平顶/平底，圆盘圆顶与弦之间
+                                        # 的角料）+ 下腹板（凸台面到球
+                                        # 台左切线的腹板，y=10.5 仍残
+                                        # x∈[81.48,81.87] z∈[-9.87,-1.56]
+                                        # 窄舌）。旧锥台（线性 R12→R9）
+                                        # 中段比真弧细 0.83~1.2，且盒
+                                        # 左面定死 83.72 > 凸台面 81.7~
+                                        # 82.76 → 留全高棱（用户"奇怪
+                                        # 的棱"）；球台整个缺失。盒左
+                                        # 面移 81.3，凸台/球/圆盘/弦/
+                                        # 腹板五保护体逐一切除。
+                                        from OCC.Core.BRepPrimAPI import \
+                                            BRepPrimAPI_MakeSphere as _MakeSphere
+                                        # 臂环实心圆盘：剖面 (r,y)——
+                                        # 轴线 r=0 y∈[-10,10] + 顶边
+                                        # r∈[0,9]@y10 + 顶弧（圆心(9,7)
+                                        # r3，θ∈[π/2,3π/2] 经 (6,7)）+
+                                        # 直段 (9,4)→(9,-4) + 底弧（圆心
+                                        # (9,-7) r3，θ∈[π/2,3π/2] 经
+                                        # (6,-7)）+ 底边 r∈[9,0]@y-10，
+                                        # 绕 Y 轴（经 (_dcx,0,_dcz)）整
+                                        # 圈旋转——一次覆盖 ±y 双侧
+                                        _prf_w = BRepBuilderAPI_MakeWire()
+                                        _prf_w.Add(BRepBuilderAPI_MakeEdge(
+                                            gp_Pnt(_dcx, -10.0, _dcz),
+                                            gp_Pnt(_dcx, 10.0, _dcz)
+                                        ).Edge())
+                                        _prf_w.Add(BRepBuilderAPI_MakeEdge(
+                                            gp_Pnt(_dcx, 10.0, _dcz),
+                                            gp_Pnt(_dcx + 9.0, 10.0,
+                                                   _dcz)).Edge())
+                                        _prf_w.Add(BRepBuilderAPI_MakeEdge(
+                                            gp_Circ(gp_Ax2(
+                                                gp_Pnt(_dcx + 9.0,
+                                                       7.0, _dcz),
+                                                gp_Dir(0, 0, 1)),
+                                                3.0),
+                                            math.pi / 2,
+                                            3 * math.pi / 2).Edge())
+                                        _prf_w.Add(BRepBuilderAPI_MakeEdge(
+                                            gp_Pnt(_dcx + 9.0, 4.0,
+                                                   _dcz),
+                                            gp_Pnt(_dcx + 9.0, -4.0,
+                                                   _dcz)).Edge())
+                                        _prf_w.Add(BRepBuilderAPI_MakeEdge(
+                                            gp_Circ(gp_Ax2(
+                                                gp_Pnt(_dcx + 9.0,
+                                                       -7.0, _dcz),
+                                                gp_Dir(0, 0, 1)),
+                                                3.0),
+                                            math.pi / 2,
+                                            3 * math.pi / 2).Edge())
+                                        _prf_w.Add(BRepBuilderAPI_MakeEdge(
+                                            gp_Pnt(_dcx + 9.0, -10.0,
+                                                   _dcz),
+                                            gp_Pnt(_dcx, -10.0,
+                                                   _dcz)).Edge())
+                                        _tor9 = BRepPrimAPI_MakeRevol(
+                                            BRepBuilderAPI_MakeFace(
+                                                _prf_w.Wire(), True).Face(),
+                                            gp_Ax1(gp_Pnt(_dcx, 0.0,
+                                                           _dcz),
+                                                   gp_Dir(0, 1, 0)),
+                                            2 * math.pi, True).Shape()
+                                        # 凸台圆柱保护（r25.5@(58.22,0)，
+                                        # 实测各 y 层凸台面 82.76/82.45/
+                                        # 82.1/81.95/81.7 = 真圆 25.5）
+                                        _bos9 = BRepPrimAPI_MakeCylinder(
+                                            gp_Ax2(gp_Pnt(_bx1 - 25.5,
+                                                           0.0, -12.3),
+                                                   gp_Dir(0, 0, 1)),
+                                            25.5, 34.6).Shape()
                                         for _y0, _y1, _sgn in (
                                                 (7.0, 10.8, 1.0),
                                                 (-10.8, -7.0, -1.0)):
-                                            _cone9 = BRepPrimAPI_MakeCone(
-                                                _dr_o, _dr_i,
-                                                _dr_o - _dr_i).Shape()
-                                            _tc9r = gp_Trsf()
-                                            _tc9r.SetRotation(
-                                                gp_Ax1(
-                                                    gp_Pnt(_dcx, 0.0,
-                                                           _dcz),
-                                                    gp_Dir(1, 0, 0)),
-                                                -_sgn * math.pi / 2)
-                                            _tc9t = gp_Trsf()
-                                            _tc9t.SetTranslation(
-                                                gp_Vec(_dcx,
-                                                       _sgn * 7.0,
-                                                       _dcz))
-                                            _tc9 = _tc9t * _tc9r
-                                            _cy9 = BRepBuilderAPI_Transform(
-                                                _cone9, _tc9).Shape()
                                             _hb9 = _MakeBox(
-                                                gp_Pnt(_bx1, _y0,
+                                                gp_Pnt(81.3, _y0,
                                                        -12.3),
                                                 gp_Pnt(_dcx + _dr_o
                                                        + 0.3, _y1,
                                                        22.3)).Shape()
-                                            # 锥台伸出盒左面时同样先
-                                            # Common 裁剪再 Cut
-                                            _cyc9 = BRepAlgoAPI_Common(
-                                                _cy9, _hb9)
-                                            if _cyc9.IsDone():
+                                            # 球台 r3@(84.66,±7,9)
+                                            _sph9 = _MakeSphere(
+                                                gp_Pnt(_dcx - 4.88,
+                                                       _sgn * 7.0,
+                                                       _dcz + _dr_o
+                                                       - _r8_yr),
+                                                _r8_yr).Shape()
+                                            # 顶/底弦凸棱：y-z 剖面
+                                            # （顶半圆 (y−7)²+(z−9)²=9
+                                            # + 底半圆 (y−7)²+(z+9)²=9
+                                            # + 端竖段 y=±10/±4 相连）
+                                            # 沿 +x 扫 4.88 → x∈[84.66,
+                                            # 89.54]（球台到轴心）
+                                            # 圆弧在 x=84.66 的 y-z 平面
+                                            # 内 → 轴 +X（绕 X 的圆，非
+                                            # 绕 Z——绕 Z 会落在 x-y 平
+                                            # 面）。绕 +X 时 OCC 默认
+                                            # XDirection 在 z 向、参数 θ=0
+                                            # 落在 z 轴端——参数重载不可
+                                            # 控，用 GC_MakeArcOfCircle 三
+                                            # 点弧（P2 中间点显式定方向）
+                                            _lob_w = BRepBuilderAPI_MakeWire()
+                                            _lob_w.Add(BRepBuilderAPI_MakeEdge(
+                                                GC_MakeArcOfCircle(
+                                                    gp_Pnt(84.66,
+                                                           _sgn * 10.0,
+                                                           9.0),
+                                                    gp_Pnt(84.66,
+                                                           _sgn * 7.0,
+                                                           12.0),
+                                                    gp_Pnt(84.66,
+                                                           _sgn * 4.0,
+                                                           9.0)).Value()).Edge())
+                                            _lob_w.Add(BRepBuilderAPI_MakeEdge(
+                                                gp_Pnt(84.66, _sgn * 4.0,
+                                                       9.0),
+                                                gp_Pnt(84.66, _sgn * 4.0,
+                                                       -9.0)).Edge())
+                                            _lob_w.Add(BRepBuilderAPI_MakeEdge(
+                                                GC_MakeArcOfCircle(
+                                                    gp_Pnt(84.66,
+                                                           _sgn * 4.0,
+                                                           -9.0),
+                                                    gp_Pnt(84.66,
+                                                           _sgn * 7.0,
+                                                           -12.0),
+                                                    gp_Pnt(84.66,
+                                                           _sgn * 10.0,
+                                                           -9.0)).Value()).Edge())
+                                            _lob_w.Add(BRepBuilderAPI_MakeEdge(
+                                                gp_Pnt(84.66, _sgn * 10.0,
+                                                       -9.0),
+                                                gp_Pnt(84.66, _sgn * 10.0,
+                                                       9.0)).Edge())
+                                            _lob9 = BRepPrimAPI_MakePrism(
+                                                BRepBuilderAPI_MakeFace(
+                                                    _lob_w.Wire(),
+                                                    True).Face(),
+                                                gp_Vec(4.88, 0.0,
+                                                       0.0)).Shape()
+                                            # 下腹板盒：y 到 10.05 截止
+                                            # （10~10.8 只残 x≤81.87 窄舌
+                                            # 且凸台圆柱已覆盖 x≤81.5），
+                                            # z 上界 9.51（其上由球台/弦
+                                            # 棱覆盖），x 到 84.71（弦棱
+                                            # 左端）
+                                            _web9 = _MakeBox(
+                                                gp_Pnt(81.3, _y0,
+                                                       -12.3),
+                                                gp_Pnt(84.71,
+                                                       min(_y1, 10.05),
+                                                       9.51)).Shape()
+                                            _cut9 = BRepAlgoAPI_Cut(
+                                                _hb9, _tor9)
+                                            for _prot9 in (_sph9, _bos9,
+                                                           _lob9, _web9):
+                                                if not _cut9.IsDone():
+                                                    break
                                                 _cut9 = BRepAlgoAPI_Cut(
-                                                    _hb9,
-                                                    _cyc9.Shape())
-                                            else:
-                                                _cut9 = _cyc9
+                                                    _cut9.Shape(), _prot9)
                                             if _cut9.IsDone():
                                                 _e9 = TopExp_Explorer(
                                                     _cut9.Shape(),
@@ -8225,7 +8370,7 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                                               f"x[{_tx1:.1f},"
                                               f"{_dcx + _dr_o:.1f}] "
                                               f"R{_dr_o:.1f} 臂反刀×2 + "
-                                              f"锥台 R{_dr_o:.1f}→R{_dr_i:.1f} "
+                                              f"臂环盘+球台+弦棱+腹板 "
                                               f"带反刀×2 + r{_r8_yr:.1f} 断开孔")
                                     _match = True
                                     _skip_unify = True
@@ -8777,7 +8922,7 @@ def main():
         output_sldprt = str(input_dir / f"{input_stem}_{ts}.sldprt")
 
     print("=" * 60)
-    print("通用 DXF → 3D SolidWorks 转换器 v0.6.17")
+    print("通用 DXF → 3D SolidWorks 转换器 v0.6.18")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  STEP: {step_path}")

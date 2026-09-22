@@ -153,7 +153,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 根目录独立脚本（不通过 main.py 调用，直接命令行运行）:
   dxf_to_sldprt.py       — DXF 阶梯轴 → SW .sldprt 原生文件（DXF 解析 + SW COM）
-  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，8756 行）
+  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，8812 行）
                            核心链: 边图构建→封闭环检测→视图分离(Y+X 间隙，v0.6.15 起含剖面行识别)
                            →CSG 体积求交 / 单视图轮廓拉伸
                            CSG: 各视图外轮廓拉伸为棱柱→布尔交集→内部特征布尔减(P0)→投影验证(P1)
@@ -222,7 +222,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.17（git tag 为准）。代码内三处版本字符串（`app.py:15` /
+版本 v0.6.18（git tag 为准）。代码内三处版本字符串（`app.py:15` /
 `main_window.py:28` / `main_window.py:535`）与 git 一致，已核对。
 **逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.16 全文保留，
 v0.6.17 起续写）——本节只留仍在影响决策的部分。
@@ -234,7 +234,7 @@ v0.6.17 起续写）——本节只留仍在影响决策的部分。
 | PF60K 法兰盘（CSG） | 261,726 / 261,935（−0.08%） | 收敛 |
 | PF60K 法兰盘（SW 特征模型，18 特征） | 261,875 / 261,935（−0.02%） | 收敛 |
 | bracket angker（三视图） | 净差 −519.82（−0.27%），多余 1,499 / 缺失 1,989 | 收敛；v0.6.17 刀组按剖面路径调参（挖深挖全）连带多挖 ~130（v0.6.16 时 −389.77/−0.20%） |
-| bracket angker（三视图+剖面图纸，v0.6.17） | 净差 +7,105（+3.70%），多余 8,836 / 缺失 1,730（v0.6.16 时 199,267 / +3.79%） | 用户两缺陷已修复：臂端槽口方形（weld 微段链保护，x[165,166]/[167,168] 与基准 0/0 一致）+ 右圆孔断开（刀组 r2 按基准截面实测重构）；剩余为融合投影天花板 |
+| bracket angker（三视图+剖面图纸，v0.6.18） | 净差 +7,307.69（+3.81%），多余 118,396.50 / 111,088.01 缺失（全量口径；v0.6.17 时 +7,105/+3.70%） | 用户三缺陷已修复：跑道槽端头弧恢复（腔盒 x 收窄 [−82,−32]，z=16.47 截面 R6 圆与基准吻合）+ 侧边薄壁切断（_tx1 −0.1）+ 挂耳怪棱去除（臂环盘+球台+弦棱+腹板五保护体，y 截面逐层吻合）；净差 +202.7 = 修复净加材料效应非回归（旧代码×新图纸 +7,104.99 与历史基线一致）；剩余为融合投影天花板 |
 | 简单模型回归套件 | 6/6 | 绿 |
 
 基准模型在 `三维/`（gitignored，用户私有数据）。bracket 与历史数值对比
@@ -314,7 +314,7 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**（发版时全部要改，当前均为 `0.6.17`，已核对一致）:
+- **版本号同步**（发版时全部要改，当前均为 `0.6.18`，已核对一致）:
   `app.py:15` `APP_VERSION` / `main_window.py:28` `setWindowTitle` /
   `main_window.py:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
   + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
