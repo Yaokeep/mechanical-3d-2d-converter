@@ -67,10 +67,15 @@ python keyway_combine_macro.py
 # 调试小工具
 python debug_dxf_views.py CAD/xxx.dxf          # 按布局区域打印三视图边/圆分布（仅 ezdxf）
 $PY debug_measure_step.py a.step b.step        # STEP 体积/bbox/实体数/面类型（需 OCC）
-# 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性探针脚本
-# 一律用 `_` 前缀（现存 _probe_circles.py / _render_dxf.py / _sheet_strip.py /
-# _verify_drawing.py / _csg_*.py 版本备份），由 .gitignore 的 `/_*.py` 排除，
-# 调试完即弃；正式修复应落在 dxf_to_3d_general.py 等主脚本
+$PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/bracket_viewer.html：
+                                               # 基准/重建叠加，点选弹框、坐标=基准系 mm——
+                                               # 用户目视标记缺陷的入口（v0.6.18 三缺陷即由此而来）。
+                                               # 脚本内路径写死 bracket：换重建结果改 main() 里 read_step 的 _3d.step 路径
+# 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性脚本一律用 `_` 前缀，
+# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；现存 30+ 个分四类：
+# `_probe_*.py` 几何探针（_probe_ysec 逐 y 层截面 / _probe_zsec 水平截面 / _probe_y0 /
+# _probe_slot）、`_diag_*.py` 根因诊断、`_csg_*.py` 代码版本备份、`_make_viewer.py`。
+# 正式修复应落在 dxf_to_3d_general.py 等主脚本
 
 # ---- 闭环验证链（真实模型 → 图纸 → 重建 → 定量对比） ----
 python sw_export_step.py 三维/xxx.SLDPRT [out.step]      # SLDPRT → STEP 基准（只需 SW COM）
@@ -83,15 +88,17 @@ $PY dxf_to_3d_general.py out.dxf                         # DXF → 重建 STEP�
 $PY compare_models.py 基准.step 重建.step                # 体积/bbox/布尔差定量对比
 $PY compare_models.py --dz 21.95 基准.step 重建.step     # 平移对齐（--dx/--dy/--dz，重建系→基准系）
 $PY compare_models.py --dz 21.95 --split -5,0,56.5 基准.step 重建.step  # 逐段拆分多余/缺失
+$PY compare_models.py --dz 21.95 --split -5,0,56.5 --split-axis x 基准.step 重建.step  # 分段轴换 x/y
 
-# CSG_WELD=1：微边链端点焊接 + 两遍环提取取面积大者（dxf_to_3d_general.py:2942 环境变量门控）。
+# CSG_WELD=1：微边链端点焊接 + 两遍环提取取面积大者（门控写成 `os.environ.get("CSG_WELD")`，
+# 分别在 weld_chain_ends 调用处与 _extract_rings_impl 的两遍调用处）。
 # HLR 生成的图纸易把外环打成碎段，bracket 基线就是在该开关下取得的——
 # 与历史数值对比时必须同环境，否则重建结果不可比
 CSG_WELD=1 $PY dxf_to_3d_general.py CAD/temp_output/bracket_angker_三视图_v4.dxf
-# v0.6.15 起支持三视图+剖面混合图纸：剖面行自动识别为约束棱柱（v0.6.16 起
-# 199,267 / +3.79%，v0.6.15 时 201,112 / +4.75%，无剖面时 201,631 / +5.02%——
-# 融合投影丢交界线信号是天花板，见信息论局限表）
-CSG_WELD=1 $PY dxf_to_3d_general.py CAD/temp_output/bracket_angker_图纸_20260820_剖面图.dxf
+# v0.6.15 起支持三视图+剖面混合图纸：剖面行自动识别为约束棱柱。同一基准下
+# 有剖面 +3.81% / 无剖面 +5.02%——剖面棱柱只能按真实截面裁假材料，
+# 融合投影丢掉的交界线信号补不回来，见信息论局限表
+CSG_WELD=1 $PY dxf_to_3d_general.py CAD/temp_output/bracket_angker_图纸_20260922_剖面图.dxf
 # 图纸侧（SW 工程图 → DXF 导出，生成带三视图的正式图纸）:
 python CAD/temp_output/generate_engineering_drawing.py   # SW COM 生成工程图并导出 DXF
 ```
@@ -110,7 +117,7 @@ conda install -c conda-forge pythonocc-core=7.7.2
 pip install -r requirements.txt
 ```
 
-实际存在的三个解释器（2026-08-20 实测，选错解释器是最常见的时间浪费）：
+实际存在的三个解释器（2026-09-22 复测，PyQt6/pytest 仍三者皆无；选错解释器是最常见的时间浪费）：
 
 | 解释器 | OCC | ezdxf | pywin32 | PyQt6 | ruff | pytest | 用途 |
 |--------|-----|-------|---------|-------|------|--------|------|
@@ -153,7 +160,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 根目录独立脚本（不通过 main.py 调用，直接命令行运行）:
   dxf_to_sldprt.py       — DXF 阶梯轴 → SW .sldprt 原生文件（DXF 解析 + SW COM）
-  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，8812 行）
+  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，8957 行）
                            核心链: 边图构建→封闭环检测→视图分离(Y+X 间隙，v0.6.15 起含剖面行识别)
                            →CSG 体积求交 / 单视图轮廓拉伸
                            CSG: 各视图外轮廓拉伸为棱柱→布尔交集→内部特征布尔减(P0)→投影验证(P1)
@@ -190,10 +197,10 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 | 目录 | 用途 |
 |------|------|
-| `docs/` | `CHANGELOG.md` — v0.5.4~v0.6.16 逐版本根因叙事（自 CLAUDE.md 抽出，查"某阈值为何是 0.1"这类历史依据时看它） |
+| `docs/` | `CHANGELOG.md` — v0.5.4~v0.6.18 逐版本根因叙事，三段倒序（主线 v0.6.11~v0.6.18 / dxf_to_3d_general 精度收敛链 v0.5.4~v0.6.10 / dxf_to_sw_features v0.6.6~v0.6.7）。查"某阈值为何是 0.1"这类历史依据时看它 |
 | `.claude/` | `settings.local.json` — 预授权的 Bash 权限列表；`skills/` — 项目级启用的技能符号链接 |
 | `.agents/skills/` | 4 个技能：`mechanical-engineer`、`solidworks-cad`（泵叶轮参数化）、`python-code-review`（含 5 个参考文件）、`python-packaging`；仅前两个经符号链接在项目级启用。根目录 `skills-lock.json` 锁定 `mechanical-engineer` 来源 |
-| `CAD/` | 55 个 VBA 宏 `.bas`（根目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代 + `soldwork/` 4），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`）、`temp_output/` 闭环验证链工作区（三视图 DXF 迭代样本——含 `bracket_angker_三视图*.dxf`、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf` 等新靶子、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例、`verify_log/` 宏迭代历史 |
+| `CAD/` | 51 个 VBA 宏 `.bas`（本目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代；另 4 个在仓库根 `soldwork/`），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`）、`temp_output/` 闭环验证链工作区（图纸 DXF 迭代样本——`bracket_angker_三视图_v4.dxf` 与 `bracket_angker_图纸_20260922_剖面图.dxf` 是当前两个 bracket 基线、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf`、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例 |
 | `PDF/` | 空目录（预留放参考 PDF 文档） |
 | `三维/` | 闭环验证参考模型（gitignored）：`麒浚传动_PF60K-14-50-70-M4-L2-12.SLDPRT`、`bracket angker.stp`、`spoon.SLDPRT` / `spoon.STEP`、`勺子/`（勺子参考图 + STEP/STL 副本） |
 | `soldwork/` | SW VBA 宏工作区：`.bas` 测试宏（入库）+ `.swp` 工程文件（**未入库**，被 `.gitignore` 的 vim-swap 规则误伤，见下方"路径与平台注意事项"） |
@@ -205,6 +212,12 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 代码后运行完整 CLI（生成 STEP + SW 时间戳 .sldprt），**不以代码或日志数值吻合
 作为成功标准**。判断几何正确性可加载 STEP 用 `GProp_GProps` 体积 /
 `BRepAdaptor_Surface` 面类型做定量核对（体积与理论值精确吻合才是真通过）。
+
+**变更归因**: 图纸与代码同时变过时（典型是"重建数值变了，是修复的效果还是
+出图版本的效果"），先 `git stash` 回退代码跑**旧代码 × 新图纸**——与历史基线
+一致即证明差异来自图纸，否则才是代码回归。v0.6.18 用此法把净 +202.7 定性为
+修复的净加材料效应而非回归。改动刀组这类被多条路径共用的代码后，三视图与
+剖面图纸两条基线都要重测——v0.6.18 正是顺带把三视图从 −0.27% 改善到 −0.14%。
 
 以下是 `src/` 侧的设计意图，GUI 接线时遵循（当前均为骨架）：
 
@@ -224,8 +237,8 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 版本 v0.6.18（git tag 为准）。代码内三处版本字符串（`app.py:15` /
 `main_window.py:28` / `main_window.py:535`）与 git 一致，已核对。
-**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.16 全文保留，
-v0.6.17 起续写）——本节只留仍在影响决策的部分。
+**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.18）——
+本节只留仍在影响决策的部分。
 
 ### 当前精度断点
 
@@ -233,12 +246,15 @@ v0.6.17 起续写）——本节只留仍在影响决策的部分。
 |------|-------------|------|
 | PF60K 法兰盘（CSG） | 261,726 / 261,935（−0.08%） | 收敛 |
 | PF60K 法兰盘（SW 特征模型，18 特征） | 261,875 / 261,935（−0.02%） | 收敛 |
-| bracket angker（三视图） | 净差 −519.82（−0.27%），多余 1,499 / 缺失 1,989 | 收敛；v0.6.17 刀组按剖面路径调参（挖深挖全）连带多挖 ~130（v0.6.16 时 −389.77/−0.20%） |
-| bracket angker（三视图+剖面图纸，v0.6.18） | 净差 +7,307.69（+3.81%），多余 118,396.50 / 111,088.01 缺失（全量口径；v0.6.17 时 +7,105/+3.70%） | 用户三缺陷已修复：跑道槽端头弧恢复（腔盒 x 收窄 [−82,−32]，z=16.47 截面 R6 圆与基准吻合）+ 侧边薄壁切断（_tx1 −0.1）+ 挂耳怪棱去除（臂环盘+球台+弦棱+腹板五保护体，y 截面逐层吻合）；净差 +202.7 = 修复净加材料效应非回归（旧代码×新图纸 +7,104.99 与历史基线一致）；剩余为融合投影天花板 |
+| bracket angker（三视图） | 净差 −267.38（−0.14%） | 收敛；v0.6.18 刀组修复连带改善（恢复被多切的弧端/球台/弦棱 → 比 v0.6.17 多留 252；v0.6.17 时 −519.82/−0.27%，v0.6.16 时 −389.77/−0.20%） |
+| bracket angker（三视图+剖面图纸） | 净差 +7,307.69（+3.81%） | 用户三缺陷已修复：跑道槽端头弧恢复（腔盒 x 收窄 [−82,−32]，z=16.47 截面 R6 圆与基准吻合）+ 侧边薄壁切断（_tx1 −0.1）+ 挂耳怪棱去除（臂环盘+球台+弦棱+腹板五保护体，y 截面逐层吻合）；净差 +202.7 = 修复净加材料效应非回归（旧代码×新图纸 +7,104.99 与历史基线一致）；剩余为融合投影天花板 |
 | 简单模型回归套件 | 6/6 | 绿 |
 
 基准模型在 `三维/`（gitignored，用户私有数据）。bracket 与历史数值对比
-必须在 `CSG_WELD=1` 下进行，否则不可比。
+必须在 `CSG_WELD=1` 下进行，否则不可比。**跨版本可比的只有"净差"一列**——
+早期记录里的"多余 8,836 / 缺失 1,730"是 `--split` 逐段拆分口径，全量布尔差
+口径下同一模型是 11 万级（三视图 112,507.67 / 112,774.01，剖面图纸
+118,396.50 / 111,088.01），两者不可直接比较。
 
 ### 信息论局限（图纸里没有这个信息，不可修复；代码已就地注释）
 
@@ -248,9 +264,9 @@ v0.6.17 起续写）——本节只留仍在影响决策的部分。
 - **φ3.3/φ5.5 孔位 0.1mm 差**：画图精度（DXF 17.2 → ±24.8 vs 基准 ±24.7）
 - **顶段角凸**：16 边棱柱近似 R40 真弧，系统差 −156（z[66,68] 板 4,288 vs 4,444）
 - **bracket 凸台 z[22,24] 两侧槽**：两视图均无信号
-- **剖面图纸的三视图是融合投影**：融合抹掉 CSG 交界线信号（−0.20% → +5.02%）。
-  剖面棱柱只按剖切面真实截面裁假材料（裁回 519，201,631→201,112），
-  融合投影本身丢失的信息剖面图补不回来——这不是剖面识别能修的，是
+- **剖面图纸的三视图是融合投影**：融合抹掉 CSG 交界线信号（同一模型，
+  未融合三视图 −0.14% → 融合三视图 +5.02%）。剖面棱柱只能按剖切面真实截面
+  裁假材料，融合投影本身丢失的信息补不回来——这不是剖面识别能修的，是
   图纸侧出图方式的选择（闭环链三视图必须用未融合 shape 出图）
 
 碰到落在这张表里的偏差不要继续"修"——先确认图纸是否真的携带该信息，
