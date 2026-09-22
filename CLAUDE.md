@@ -77,6 +77,15 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
 # _probe_slot）、`_diag_*.py` 根因诊断、`_csg_*.py` 代码版本备份、`_make_viewer.py`。
 # 正式修复应落在 dxf_to_3d_general.py 等主脚本
 
+# 截面叠加图（"图形识别"排查链，两段式——cad-occt 无 matplotlib，默认 python 无 OCC）
+$PY _dump_sections.py <step> <tag> [dx,dy,dz]     # OCC 侧：若干截面 → JSON（基准系坐标）
+python _draw_sections.py <base.json> <reb.json> <名>   # matplotlib 侧：蓝=基准 红=重建 紫=重合
+# ↑ 输出 CAD/temp_output/_viz/<名>_总览.png + 逐个截面大图。PLANES 表写死 bracket 的
+#   12 个位置（z5/16.47/30/40、y0/7/9.4、x−18.11/121.89/145/153.19/160），换零件改它。
+#   ⚠️ 截面正好切在平面上时，该平面的轮廓会整片出现在截面上 → 看图得出的结论
+#   必须用盒探针在实体上复核，否则会把退化伪影当成真差异
+$PY _probe_boxes.py [重建step]                    # 盒探针：逐区域量基准/重建的材料体积差
+
 # ---- 闭环验证链（真实模型 → 图纸 → 重建 → 定量对比） ----
 python sw_export_step.py 三维/xxx.SLDPRT [out.step]      # SLDPRT → STEP 基准（只需 SW COM）
 $PY model_to_drawing.py input.step [out.dxf]             # STEP → 三视图 DXF（HLR 投影）
@@ -101,6 +110,10 @@ CSG_WELD=1 $PY dxf_to_3d_general.py CAD/temp_output/bracket_angker_三视图_v4.
 CSG_WELD=1 $PY dxf_to_3d_general.py CAD/temp_output/bracket_angker_图纸_20260922_剖面图.dxf
 # 图纸侧（SW 工程图 → DXF 导出，生成带三视图的正式图纸）:
 python CAD/temp_output/generate_engineering_drawing.py   # SW COM 生成工程图并导出 DXF
+# ⚠️ 出图侧已知缺陷（2026-09-22 复核）：图纸里 12 处中文标注（"俯视图"/"A—A 剖视
+#   全剖 y=0.00"…）用的都是唯一文字样式 `Standard`，其 font='txt'（txt.shx，无 CJK
+#   字形）、无 bigfont → 在任何 CAD 里都渲染成方框；标注里的破折号 U+2014 同理。
+#   修法：给该样式补 bigfont='gbcbig.shx'（AutoCAD 经典组合），或改用中文 TTF
 ```
 
 ## 开发环境
@@ -247,7 +260,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 | PF60K 法兰盘（CSG） | 261,726 / 261,935（−0.08%） | 收敛 |
 | PF60K 法兰盘（SW 特征模型，18 特征） | 261,875 / 261,935（−0.02%） | 收敛 |
 | bracket angker（三视图） | 净差 −267.38（−0.14%） | 收敛；v0.6.18 刀组修复连带改善（恢复被多切的弧端/球台/弦棱 → 比 v0.6.17 多留 252；v0.6.17 时 −519.82/−0.27%，v0.6.16 时 −389.77/−0.20%） |
-| bracket angker（三视图+剖面图纸） | 净差 +7,307.69（+3.81%） | 用户三缺陷已修复：跑道槽端头弧恢复（腔盒 x 收窄 [−82,−32]，z=16.47 截面 R6 圆与基准吻合）+ 侧边薄壁切断（_tx1 −0.1）+ 挂耳怪棱去除（臂环盘+球台+弦棱+腹板五保护体，y 截面逐层吻合）；净差 +202.7 = 修复净加材料效应非回归（旧代码×新图纸 +7,104.99 与历史基线一致）；剩余为融合投影天花板 |
+| bracket angker（三视图+剖面图纸） | 净差 +7,307.69（+3.81%） | 用户三缺陷已修复（端头弧/薄壁/挂耳五保护体；净 +202.7 = 修复净加材料效应非回归）。**剩余误差已定位成一块**（2026-09-22 截面叠加图 + 盒探针）：臂区方块 x[96,162]×y[±25] z>27 存活——探针 z[27,33] 重建 2,382.3 vs 基准 1,772.7、z[38,42] 1,588.2 vs 1,181.8，而同区域三视图路径 1,770.1 / 1,180.1 精确；本可把它裁成 R25.5 圆柱的 `sec_B` 棱柱因"10×44 vs 父 51×44 非全尺寸"被跳过、`sec_C` 剖面环提取失败，实际只有 `sec_A`(y=0) 生效 |
 | 简单模型回归套件 | 6/6 | 绿 |
 
 基准模型在 `三维/`（gitignored，用户私有数据）。bracket 与历史数值对比
@@ -267,7 +280,8 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 - **剖面图纸的三视图是融合投影**：融合抹掉 CSG 交界线信号（同一模型，
   未融合三视图 −0.14% → 融合三视图 +5.02%）。剖面棱柱只能按剖切面真实截面
   裁假材料，融合投影本身丢失的信息补不回来——这不是剖面识别能修的，是
-  图纸侧出图方式的选择（闭环链三视图必须用未融合 shape 出图）
+  图纸侧出图方式的选择（闭环链三视图必须用未融合 shape 出图）。
+  这份误差的**具体落点**已查明，见精度断点表该行（臂区方块 + 剖面棱柱门控）
 
 碰到落在这张表里的偏差不要继续"修"——先确认图纸是否真的携带该信息，
 否则会像 v0.6.10 那样造出体积对得上、结构却错的模型。
