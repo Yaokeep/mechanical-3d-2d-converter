@@ -8385,22 +8385,30 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                                         # 腹板五保护体逐一切除。
                                         from OCC.Core.BRepPrimAPI import \
                                             BRepPrimAPI_MakeSphere as _MakeSphere
-                                        # 臂环实心圆盘：剖面 (r,y)——
-                                        # 轴线 r=0 y∈[-10,10] + 顶边
-                                        # r∈[0,9]@y10 + 顶弧（圆心(9,7)
-                                        # r3，θ∈[π/2,3π/2] 经 (6,7)）+
-                                        # 直段 (9,4)→(9,-4) + 底弧（圆心
-                                        # (9,-7) r3，θ∈[π/2,3π/2] 经
-                                        # (6,-7)）+ 底边 r∈[9,0]@y-10，
-                                        # 绕 Y 轴（经 (_dcx,0,_dcz)）整
-                                        # 圈旋转——一次覆盖 ±y 双侧
+                                        # 臂环实心圆盘：剖面 (r,y)——外轮廓
+                                        # r(|y|≤7)=12 圆柱段 + torus 外圈
+                                        # r(|y|∈[7,10])=9+√(9-(|y|-7)²)。
+                                        # 2026-09-23 用户挂耳间隙缺陷修正：
+                                        # 旧 wire 三错——①轴边画在旋转轴上
+                                        # MakeRevol 退化生成空心壳（实测体积
+                                        # 只 53.7%：顶底圆盘丢、torus 外圈丢，
+                                        # 刀=盒−残壳把正体臂环盘芯挖空+外圈
+                                        # 切光，即用户两处 2~3.6mm 间隙）；
+                                        # ②直段画在管心 r9 应为外轮廓 r12；
+                                        # ③弧 θ∈[π/2,3π/2] 经 (6,7) 是内轮廓，
+                                        # 外轮廓应 θ∈[0,π/2] 经 (12,7)。ε 离轴
+                                        # 边（剖面不含轴，实心 100.00%，ε 孔
+                                        # 被 R3 Y 孔覆盖）
+                                        _eps9 = 0.001
                                         _prf_w = BRepBuilderAPI_MakeWire()
                                         _prf_w.Add(BRepBuilderAPI_MakeEdge(
-                                            gp_Pnt(_dcx, -10.0, _dcz),
-                                            gp_Pnt(_dcx, 10.0, _dcz)
-                                        ).Edge())
+                                            gp_Pnt(_dcx + _eps9, -10.0,
+                                                   _dcz),
+                                            gp_Pnt(_dcx + _eps9, 10.0,
+                                                   _dcz)).Edge())
                                         _prf_w.Add(BRepBuilderAPI_MakeEdge(
-                                            gp_Pnt(_dcx, 10.0, _dcz),
+                                            gp_Pnt(_dcx + _eps9, 10.0,
+                                                   _dcz),
                                             gp_Pnt(_dcx + 9.0, 10.0,
                                                    _dcz)).Edge())
                                         _prf_w.Add(BRepBuilderAPI_MakeEdge(
@@ -8409,12 +8417,12 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                                                        7.0, _dcz),
                                                 gp_Dir(0, 0, 1)),
                                                 3.0),
-                                            math.pi / 2,
-                                            3 * math.pi / 2).Edge())
+                                            0.0,
+                                            math.pi / 2).Edge())
                                         _prf_w.Add(BRepBuilderAPI_MakeEdge(
-                                            gp_Pnt(_dcx + 9.0, 4.0,
+                                            gp_Pnt(_dcx + _dr_o, 7.0,
                                                    _dcz),
-                                            gp_Pnt(_dcx + 9.0, -4.0,
+                                            gp_Pnt(_dcx + _dr_o, -7.0,
                                                    _dcz)).Edge())
                                         _prf_w.Add(BRepBuilderAPI_MakeEdge(
                                             gp_Circ(gp_Ax2(
@@ -8422,12 +8430,12 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
                                                        -7.0, _dcz),
                                                 gp_Dir(0, 0, 1)),
                                                 3.0),
-                                            math.pi / 2,
-                                            3 * math.pi / 2).Edge())
+                                            -math.pi / 2,
+                                            0.0).Edge())
                                         _prf_w.Add(BRepBuilderAPI_MakeEdge(
                                             gp_Pnt(_dcx + 9.0, -10.0,
                                                    _dcz),
-                                            gp_Pnt(_dcx, -10.0,
+                                            gp_Pnt(_dcx + _eps9, -10.0,
                                                    _dcz)).Edge())
                                         _tor9 = BRepPrimAPI_MakeRevol(
                                             BRepBuilderAPI_MakeFace(
