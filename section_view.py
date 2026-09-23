@@ -416,7 +416,12 @@ def project_section_poly(shape, view_dir, up, deflection=0.05):
     from OCC.Core.gp import gp_Ax2
     from OCC.Core.TopAbs import TopAbs_EDGE
 
-    BRepMesh_IncrementalMesh(shape, deflection, False, 0.5, True)
+    # v0.6.18: 角度容差 0.5→0.05 rad——0.5 rad(28.6°) 把圆离散成
+    # 13 段，隐藏线消除后可见半圆只剩 ~6 段（bracket sec_B 截面
+    # 51 宽的圆投影成 41.2 宽六边形、sec_C 40 宽圆变 26 宽阶梯），
+    # 重建侧截面 bbox 丢失 10~14mm、过不了全尺寸门控。0.05 rad 下
+    # 可见半圆 63 段，弦高 ~0.008mm，肉眼与真圆无异。
+    BRepMesh_IncrementalMesh(shape, deflection, False, 0.05, True)
     dz = gp_Dir(*view_dir)
     dxd, _ = _proj_axes(view_dir, up)
     proj = HLRAlgo_Projector(gp_Ax2(gp_Pnt(0, 0, 0), dz, dxd))

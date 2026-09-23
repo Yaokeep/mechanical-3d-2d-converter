@@ -4022,6 +4022,38 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv,
     return result
 
 
+def _extract_section_rings_cropped(sv, views, edges, tol=2.0):
+    """v0.6.18: 剖面视图 bbox±tol 裁剪子图提环——剖切线延伸劫持修复。
+
+    父视图剖切线在剖面行的弯折引线（"可见轮廓线"层的长直线，沿
+    y=-296/y=-268 从 x=2 连到截面左缘）与截面上下边共线相连，把边图
+    分量拉到视图 bbox 之外；环遍历（最右转/face）沿引线走成左侧
+    窄条伪环（bracket sec_C 14×28 面积 392 被"无归属视图"丢弃、
+    sec_B 9.8×44 面积 431 顶替了 41×44 真截面）。裁剪掉 bbox 外的
+    边后伪环不闭合，正确截面环胜出。容差 2mm 保留 HLR 碎段略超
+    bbox 的真实轮廓。
+    """
+    x1, y1, x2, y2 = sv["bbox"]
+    sub = [e for e in edges
+           if x1 - tol <= e.start[0] <= x2 + tol
+           and x1 - tol <= e.end[0] <= x2 + tol
+           and y1 - tol <= e.start[1] <= y2 + tol
+           and y1 - tol <= e.end[1] <= y2 + tol]
+    vp, ev, n2 = build_vertex_map(sub)
+    weld_ev = None
+    if _micro_chain_lengths(sub) and \
+            __import__("os").environ.get("CSG_WELD"):
+        weld_ev = weld_chain_ends(sub, dict(vp), ev)
+    out = []
+    _runs = [(dict(vp), ev)]
+    if weld_ev is not None:
+        _runs.append((dict(vp), weld_ev))
+    for _vp, _ev in _runs:
+        rings = _extract_rings_impl(sub, views, _vp, _ev, n2, keep_all=True)
+        out.extend(rings.get(sv["name"], []))
+    return out
+
+
 def _extract_view_rings_all(edges, views):
     """v0.6.15: 各视图全环提取（外环 + 内环），供剖面棱柱材料截面。
 
@@ -4049,6 +4081,15 @@ def _extract_view_rings_all(edges, views):
                 collected[name].extend(rings)
             else:
                 collected[name] = rings
+    # v0.6.18: 剖面视图补裁剪子图提环（剖切线延伸劫持修复），
+    # 与全局提环取面积大者——sec_A 全尺寸剖面全局提环已正确，不受影响
+    for sv in (v for v in views if v.get("_is_section")):
+        _srings = _extract_section_rings_cropped(sv, views, edges)
+        _old_best = max((rd["area"] for rd in collected.get(sv["name"], [])),
+                        default=0)
+        _new_best = max((rd["area"] for rd in _srings), default=0)
+        if _new_best > _old_best:
+            collected[sv["name"]] = _srings
     out = {}
     for name, rings in collected.items():
         if not rings:
@@ -4125,60 +4166,41 @@ def _section_face_from_rings(rdata, edges, scale_factor, dx=0.0, dy=0.0):
     return face
 
 
-def _build_section_prism(v, views, all_rings, edges, scale_factor,
-                         extrude_dist):
-    """v0.6.15: 剖面视图棱柱——父视图在剖切面处的材料截面沿父轴拉伸。
+def _hatch_block_face(blk, dx, dy, scale_factor):
+    """HATCH 块边界段序列 → 平移后的 OCC face。
 
-    剖面视图与父视图同一投影帧（section_view.py 用原始 3D 投影坐标
-    出图，行排版只是常数平移），剖面棱柱与标准棱柱求交只会删掉
-    三视图制造的假材料、不会造新材料。
-
-    全尺寸剖面（双维 ≥98% 父外轮廓 bbox）用「截面中心 → 父外轮廓
-    中心」2D 平移对齐；部分剖面（B—B/C—C 一类）截面在父帧内的
-    偏移无法从 bbox 唯一确定，宁缺毋滥跳过（父棱柱兜底）。
-    变换链与父视图完全一致：视图变换 → top 镜像 → Z 对齐复用父
-    偏移（截面与父同帧，父偏移使截面落在同一高度基准）→ 父居中
-    向量（同一投影方向的两个视图必须用同一居中基准）。
+    blk["edges"] 是段序列 (p0,p1),(p1,p2),...,(pn,p0)（闭合段在末尾），
+    段首点序列即完整顶点循环。提取代码只收外环（PolylinePath 且
+    EXTERNAL 位），内环（DEFAULT 位）不进 edges——带孔截面走兜底会
+    丢孔（当前 sec_C 两块 14×28 无孔，不受影响；将来若要支持带孔
+    截面需在 extract_dxf_annotations 里区分内外环）。
     """
-    rdata = (all_rings or {}).get(v["name"])
-    if rdata is None:
-        print(f"  [剖面] '{v['name']}' 截面环提取失败，跳过")
+    verts = [seg[0] for seg in blk["edges"]]
+    # 去相邻重复点（MakePolygon 对零长段抛异常）
+    dedup = []
+    for p in verts:
+        if not dedup or abs(p[0] - dedup[-1][0]) > 1e-6 \
+                or abs(p[1] - dedup[-1][1]) > 1e-6:
+            dedup.append(p)
+    if len(dedup) < 3:
         return None
-    ptype = v.get("view_type")
-    parent = next((pv for pv in views
-                   if not pv.get("_is_section")
-                   and pv["view_type"] == ptype), None)
-    if parent is None or parent.get("_outer_face") is None:
-        print(f"  [剖面] '{v['name']}' 父视图（{ptype}）缺失，跳过")
+    poly = BRepBuilderAPI_MakePolygon()
+    try:
+        for x, y in dedup:
+            poly.Add(gp_Pnt((x + dx) * scale_factor,
+                            (y + dy) * scale_factor, 0))
+        poly.Close()
+        wire = poly.Wire()
+    except Exception:
         return None
-    pof = parent["_outer_face"]
-    pw = pof["x_max"] - pof["x_min"]
-    ph = pof["y_max"] - pof["y_min"]
-    sb = rdata.get("geom_bbox") or rdata["bbox"]
-    sw, sh = sb[2] - sb[0], sb[3] - sb[1]
-    if pw <= 0 or ph <= 0 \
-            or sw < pw * 0.98 or sh < ph * 0.98 \
-            or sw > pw * 1.15 or sh > ph * 1.15:
-        print(f"  [剖面] '{v['name']}' 截面 {sw:.0f}×{sh:.0f} vs "
-              f"父 {pw:.0f}×{ph:.0f} 非全尺寸，跳过（父棱柱兜底）")
-        return None
-    dx = (pof["x_min"] + pof["x_max"]) / 2 - (sb[0] + sb[2]) / 2
-    dy = (pof["y_min"] + pof["y_max"]) / 2 - (sb[1] + sb[3]) / 2
-    face = _section_face_from_rings(rdata, edges, scale_factor, dx, dy)
-    if face is None:
-        print(f"  [剖面] '{v['name']}' Face 构建失败，跳过")
-        return None
-    if not BRepCheck_Analyzer(face).IsValid():
-        # 截面环复杂度低于标准视图（融合体投影无往返副本），
-        # ShapeFix 失败即放弃——父棱柱兜底
-        _fx = ShapeFix_Shape(face)
-        _fx.Perform()
-        _fxd = _fx.Shape()
-        if BRepCheck_Analyzer(_fxd).IsValid():
-            face = _fxd
-        else:
-            print(f"  [剖面] '{v['name']}' Face 无效，跳过")
-            return None
+    return build_occ_face(wire)
+
+
+def _section_face_to_prism(face, ptype, parent, extrude_dist):
+    """剖面 face 共用变换链 → 棱柱：视图变换 → top 镜像 → Z 对齐 →
+    拉伸 → 父居中。截面与父同帧，父偏移/居中使两者落在同一基准
+    （v0.6.18 从 _build_section_prism 抽出，HATCH 兜底路径共用）。
+    """
     _, extrude_axis = _get_view_transform(ptype)
     face = _apply_view_transform(face, ptype)
     if ptype == "top" and parent.get("_x_mirrored"):
@@ -4192,16 +4214,186 @@ def _build_section_prism(v, views, all_rings, edges, scale_factor,
         face = BRepBuilderAPI_Transform(face, trsf_align).Shape()
     prism = _extrude_face_dual(face, extrude_axis, extrude_dist)
     if prism is None:
-        print(f"  [剖面] '{v['name']}' 拉伸失败，跳过")
         return None
     _ctr = parent.get("_ctr")
     if _ctr is not None:
         trsf_ctr = gp_Trsf()
         trsf_ctr.SetTranslation(_ctr)
         prism = BRepBuilderAPI_Transform(prism, trsf_ctr).Shape()
-    print(f"  剖面 '{v['name']}'({ptype}): 截面 {sw:.0f}×{sh:.0f}mm, "
-          f"对齐偏移 ({dx:.1f}, {dy:.1f})")
     return prism
+
+
+def _section_prisms_from_hatch(v, views, hatch_regions, scale_factor,
+                               extrude_dist):
+    """v0.6.18: 剖面截面 HATCH 兜底——可见轮廓非全尺寸时用 HATCH
+    边界建截面棱柱。
+
+    剖面视图的 HATCH 边界是出图侧真实截面 face 的外环（section_view
+    自检 2D 面积与 OCC 实测一致），比 HLR 投影轮廓可靠——bracket
+    sec_C 的可见轮廓只有 26 宽（HLR 把两侧壁轮廓整条丢弃），HATCH
+    两块 14×28 拼出 40×28 完整截面。
+
+    多块截面（剖切面穿过空腔，材料分离）各自建 face 成棱柱。
+    对齐（部分剖面，截面小于父视图时）：
+      x 向中心对齐——截面在父帧中部对称的假设；对齐后截面 bbox
+      必须落在父外轮廓 bbox 内（±2），越界放弃（宁缺毋滥）。
+      y 向底对齐——截面底与父视图底同为模型底（z=0），非全高
+      截面必须底对齐而非中心对齐（中心对齐会整体上移 8mm）。
+    """
+    if not hatch_regions:
+        return []
+    ptype = v.get("view_type")
+    parent = next((pv for pv in views
+                   if not pv.get("_is_section")
+                   and pv["view_type"] == ptype), None)
+    if parent is None or parent.get("_outer_face") is None:
+        print(f"  [剖面] '{v['name']}' 父视图（{ptype}）缺失，HATCH 兜底跳过")
+        return []
+    pof = parent["_outer_face"]
+    pw = pof["x_max"] - pof["x_min"]
+    ph = pof["y_max"] - pof["y_min"]
+    # 行归属：块中心 y 落在剖面视图行内（行间间隙 >15 无歧义）
+    vy1, vy2 = v["bbox"][1], v["bbox"][3]
+    blocks = [h for h in hatch_regions
+              if vy1 <= (h["bbox"][1] + h["bbox"][3]) / 2 <= vy2]
+    if not blocks:
+        print(f"  [剖面] '{v['name']}' 无 HATCH 块归属该行，兜底跳过")
+        return []
+    # v0.6.18: 部分剖面截面（材料面积 < 90% 父外轮廓 bbox 面积）不建
+    # 棱柱——剖面只携带剖切位置处的零厚度截面信息，沿父轴全长拉伸
+    # 需要"截面沿轴不变"的窗口假设；而图纸不含窗口信号（剖切线只有
+    # 箭头、无贯通线），任何窗口都必然误裁窗口外渐变段的真材料
+    # （bracket sec_B 腔在 x[96,106] 实心条、x[128,144] 渐实心段
+    # 有真材料；实测全长拉伸 Fuse 合并后净差 −68.93%）。跳过由父
+    # 棱柱兜底。只有接近全尺寸的实心截面才建棱柱（此时棱柱与父
+    # 外框几乎重合，是无约束 no-op，无害）。
+    blk_area = sum(h.get("area", 0.0) for h in blocks)
+    if pw > 0 and ph > 0 and blk_area < 0.9 * pw * ph:
+        print(f"  [剖面] '{v['name']}' HATCH 面积 {blk_area:.0f} vs 父 bbox "
+              f"{pw * ph:.0f}（{blk_area / (pw * ph) * 100:.0f}%）"
+              f"部分截面无窗口信息，跳过")
+        return []
+    xs = [h["bbox"][0] for h in blocks] + [h["bbox"][2] for h in blocks]
+    ys = [h["bbox"][1] for h in blocks] + [h["bbox"][3] for h in blocks]
+    sb = [min(xs), min(ys), max(xs), max(ys)]
+    sw, sh = sb[2] - sb[0], sb[3] - sb[1]
+    if pw <= 0 or ph <= 0:
+        return []
+    # x：中心对齐；y：全高截面中心对齐，部分截面底对齐
+    dx = (pof["x_min"] + pof["x_max"]) / 2 - (sb[0] + sb[2]) / 2
+    if sh >= ph * 0.98:
+        dy = (pof["y_min"] + pof["y_max"]) / 2 - (sb[1] + sb[3]) / 2
+    else:
+        dy = pof["y_min"] - sb[1]
+    # 落界校验——中心对齐假设错误（截面不在父帧中部）时放弃，
+    # 父棱柱兜底；宁缺毋滥防止错位截面裁掉真材料
+    if sb[0] + dx < pof["x_min"] - 2 or sb[2] + dx > pof["x_max"] + 2 \
+            or sb[1] + dy < pof["y_min"] - 2 or sb[3] + dy > pof["y_max"] + 2:
+        print(f"  [剖面] '{v['name']}' HATCH 截面 {sw:.0f}×{sh:.0f} "
+              f"对齐后越出父轮廓，放弃")
+        return []
+    out = []
+    for blk in blocks:
+        face = _hatch_block_face(blk, dx, dy, scale_factor)
+        if face is None:
+            print(f"  [剖面] '{v['name']}' HATCH 块建面失败，跳过该块")
+            continue
+        if not BRepCheck_Analyzer(face).IsValid():
+            _fx = ShapeFix_Shape(face)
+            _fx.Perform()
+            _fxd = _fx.Shape()
+            if BRepCheck_Analyzer(_fxd).IsValid():
+                face = _fxd
+            else:
+                print(f"  [剖面] '{v['name']}' HATCH 块面无效，跳过该块")
+                continue
+        prism = _section_face_to_prism(face, ptype, parent, extrude_dist)
+        if prism is None:
+            print(f"  [剖面] '{v['name']}' HATCH 块拉伸失败，跳过该块")
+            continue
+        out.append(prism)
+    if out:
+        print(f"  [剖面] '{v['name']}' HATCH 兜底: {len(out)} 块截面 "
+              f"{sw:.0f}×{sh:.0f}mm, 对齐偏移 ({dx:.1f}, {dy:.1f})")
+    # 多块截面（剖切面穿过空腔，材料分离）必须 Fuse 成单形状——
+    # 顺序求交 c∩块1∩块2 在分离块上必为空集（c 已被块1 裁窄）
+    if len(out) > 1:
+        _merged = out[0]
+        for _p in out[1:]:
+            _f = BRepAlgoAPI_Fuse(_merged, _p)
+            if _f.IsDone():
+                _merged = _f.Shape()
+        out = [_merged]
+    return out
+
+
+def _build_section_prism(v, views, all_rings, edges, scale_factor,
+                         extrude_dist, hatch_regions=None):
+    """v0.6.15: 剖面视图棱柱——父视图在剖切面处的材料截面沿父轴拉伸。
+
+    剖面视图与父视图同一投影帧（section_view.py 用原始 3D 投影坐标
+    出图，行排版只是常数平移），剖面棱柱与标准棱柱求交只会删掉
+    三视图制造的假材料、不会造新材料。
+
+    全尺寸剖面（双维 ≥98% 父外轮廓 bbox）用「截面中心 → 父外轮廓
+    中心」2D 平移对齐；部分剖面（B—B/C—C 一类）截面在父帧内的
+    偏移无法从 bbox 唯一确定——v0.6.18 起走 HATCH 兜底
+    （_section_prisms_from_hatch，出图侧真实截面边界）；HATCH 也不
+    可用时宁缺毋滥跳过（父棱柱兜底）。
+    变换链与父视图完全一致（_section_face_to_prism）：视图变换 →
+    top 镜像 → Z 对齐复用父偏移（截面与父同帧，父偏移使截面落在
+    同一高度基准）→ 父居中向量（同一投影方向的两个视图必须用
+    同一居中基准）。
+
+    返回棱柱列表（HATCH 兜底多块截面 → 多棱柱）。
+    """
+    rdata = (all_rings or {}).get(v["name"])
+    ptype = v.get("view_type")
+    parent = next((pv for pv in views
+                   if not pv.get("_is_section")
+                   and pv["view_type"] == ptype), None)
+    if rdata is None:
+        print(f"  [剖面] '{v['name']}' 截面环提取失败")
+    elif parent is None or parent.get("_outer_face") is None:
+        print(f"  [剖面] '{v['name']}' 父视图（{ptype}）缺失")
+    else:
+        pof = parent["_outer_face"]
+        pw = pof["x_max"] - pof["x_min"]
+        ph = pof["y_max"] - pof["y_min"]
+        sb = rdata.get("geom_bbox") or rdata["bbox"]
+        sw, sh = sb[2] - sb[0], sb[3] - sb[1]
+        if pw > 0 and ph > 0 \
+                and sw >= pw * 0.98 and sh >= ph * 0.98 \
+                and sw <= pw * 1.15 and sh <= ph * 1.15:
+            dx = (pof["x_min"] + pof["x_max"]) / 2 - (sb[0] + sb[2]) / 2
+            dy = (pof["y_min"] + pof["y_max"]) / 2 - (sb[1] + sb[3]) / 2
+            face = _section_face_from_rings(rdata, edges, scale_factor,
+                                            dx, dy)
+            if face is not None and not BRepCheck_Analyzer(face).IsValid():
+                # 截面环复杂度低于标准视图（融合体投影无往返副本），
+                # ShapeFix 失败即放弃
+                _fx = ShapeFix_Shape(face)
+                _fx.Perform()
+                _fxd = _fx.Shape()
+                face = _fxd if BRepCheck_Analyzer(_fxd).IsValid() else None
+            if face is None:
+                print(f"  [剖面] '{v['name']}' Face 构建失败")
+            else:
+                prism = _section_face_to_prism(face, ptype, parent,
+                                               extrude_dist)
+                if prism is not None:
+                    print(f"  剖面 '{v['name']}'({ptype}): 截面 "
+                          f"{sw:.0f}×{sh:.0f}mm, 对齐偏移 ({dx:.1f}, {dy:.1f})")
+                    return [prism]
+                print(f"  [剖面] '{v['name']}' 拉伸失败")
+        else:
+            print(f"  [剖面] '{v['name']}' 截面 {sw:.0f}×{sh:.0f} vs "
+                  f"父 {pw:.0f}×{ph:.0f} 非全尺寸，走 HATCH 兜底")
+    # HATCH 兜底：可见轮廓环不可用（提环失败/非全尺寸/建面或拉伸失败）
+    if hatch_regions:
+        return _section_prisms_from_hatch(v, views, hatch_regions,
+                                          scale_factor, extrude_dist)
+    return []
 
 
 def _micro_chain_lengths(edges):
@@ -4828,10 +5020,11 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
         # v0.6.15: 剖面视图走专有棱柱路径（截面沿父视图轴拉伸，
         # 变换/居中全部复用父视图），不参与外轮廓提取与 P0 特征
         if v.get("_is_section"):
-            _sprism = _build_section_prism(v, views, all_rings, edges,
-                                           scale_factor, extrude_dist)
-            if _sprism is not None:
-                prisms.append(_sprism)
+            _sprisms = _build_section_prism(
+                v, views, all_rings, edges, scale_factor, extrude_dist,
+                hatch_regions=(annotations or {}).get("hatch_regions"))
+            if _sprisms:
+                prisms.extend(_sprisms)
             continue
         ring_data = no_merge_rings.get(v["name"])
         # v0.6.11: 外轮廓合理性校验——无合并边图上有局部断点
@@ -5396,6 +5589,13 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             c = _r
         return c
 
+    if __import__("os").environ.get("DBG_PRISMS"):
+        for _pi, _pp in enumerate(prisms):
+            _bb = Bnd_Box()
+            brepbndlib.Add(_pp, _bb)
+            _b1 = _bb.Get()
+            print(f"  [DBG棱柱] #{_pi} bbox=({_b1[0]:.1f},{_b1[1]:.1f},"
+                  f"{_b1[2]:.1f})-({_b1[3]:.1f},{_b1[4]:.1f},{_b1[5]:.1f})")
     print(f"\n  CSG 求交: {len(prisms)} 个棱柱 → 交集"
           + (f" + {len(prisms_flange)} 个环带棱柱分体" if prisms_flange
              else ""))
