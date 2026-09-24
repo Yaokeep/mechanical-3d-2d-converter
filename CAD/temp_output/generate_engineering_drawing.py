@@ -333,6 +333,38 @@ def _supplement_outline_lines(shape, dz, up, dx):
             cand_thetas = list(thetas)
             if span < 2 * math.pi - 1e-6:
                 cand_thetas += [u1, u2]
+            # v0.6.19 面片身份判定（在候选母线之前，面片级一次）:
+            # 取 u 参数中点（避开 u 边界槽缝——bracket 凸台 y=±1
+            # 槽缝贯穿壁厚 z 全高，u 边界母线整条骑在槽缝上，径向
+            # 内侧采样全落空腔）径向内侧 ε 分类——内侧 IN = 实体
+            # 外壁面片（母线是外轮廓，整段输出，中段被遮挡也要补，
+            # 外环闭合靠它）；内侧 OUT = 内部空腔壁面片（腔壁母线
+            # 106.19/137.56 投影落在凸台内部，是假轮廓——旧判据
+            # `_visible(p1) or _visible(p2)` 画出的假竖线进图纸后
+            # 重建 front 棱柱被切，凸台右环带 [137.57,147.37] 整体
+            # 缺失 = 用户标记 #1/#2 的直接根源；分段采样只输出
+            # 可见段，槽缝等真轮廓段保留）。⚠️ 不能判"径向外侧
+            # OUT"——bracket 凸台外壁径向外的点落在相邻臂区方块
+            # 实体里（IN），会误判真轮廓母线为腔壁。
+            _v1f = s.FirstVParameter()
+            _v2f = s.LastVParameter()
+            _p_uf = s.Value((u1 + u2) / 2, (_v1f + _v2f) / 2)
+            _ap = pos.Location()
+            _rad = gp_Vec(_p_uf.X() - _ap.X(),
+                          _p_uf.Y() - _ap.Y(),
+                          _p_uf.Z() - _ap.Z())
+            _al = _rad.Dot(gp_Vec(axis))
+            _rad = gp_Vec(_rad.X() - _al * axis.X(),
+                          _rad.Y() - _al * axis.Y(),
+                          _rad.Z() - _al * axis.Z())
+            _rn = _rad.Magnitude()
+            _is_inner_cavity = True
+            if _rn > 1e-9:
+                _rad.Scale(1.0 / _rn)
+                _qi = gp_Pnt(_p_uf.X() - 0.05 * _rad.X(),
+                             _p_uf.Y() - 0.05 * _rad.Y(),
+                             _p_uf.Z() - 0.05 * _rad.Z())
+                _is_inner_cavity = not _inside(_qi)
             for th in cand_thetas:
                 # 归一到面片角度范围 [u1, u2)
                 t = th
@@ -345,9 +377,30 @@ def _supplement_outline_lines(shape, dz, up, dx):
                         continue
                 v1 = s.FirstVParameter()
                 v2 = s.LastVParameter()
-                p1 = s.Value(t, v1)
-                p2 = s.Value(t, v2)
-                if _visible(p1) or _visible(p2):
+                if not _is_inner_cavity:
+                    p1 = s.Value(t, v1)
+                    p2 = s.Value(t, v2)
+                    a2 = _prj2(p1)
+                    b2 = _prj2(p2)
+                    out.append((a2[0], a2[1], b2[0], b2[1]))
+                    continue
+                NSEG = 8
+                vis = [False] * (NSEG + 1)
+                for k in range(NSEG + 1):
+                    vv = v1 + (v2 - v1) * k / NSEG
+                    vis[k] = _visible(s.Value(t, vv))
+                segs = []
+                for k0 in range(NSEG + 1):
+                    if vis[k0]:
+                        if segs and segs[-1][1] == k0 - 1:
+                            segs[-1][1] = k0
+                        else:
+                            segs.append([k0, k0])
+                for a, b in segs:
+                    va = v1 + (v2 - v1) * max(0.0, a - 0.5) / NSEG
+                    vb = v1 + (v2 - v1) * min(float(NSEG), b + 0.5) / NSEG
+                    p1 = s.Value(t, va)
+                    p2 = s.Value(t, vb)
                     a2 = _prj2(p1)
                     b2 = _prj2(p2)
                     out.append((a2[0], a2[1], b2[0], b2[1]))

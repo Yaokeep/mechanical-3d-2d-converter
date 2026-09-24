@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.18
+"""通用 DXF 工程图 → 3D SolidWorks 模型转换器 v0.6.19
 
 核心算法链（详见 CLAUDE.md「dxf_to_3d_general.py」条目）:
   边图构建 → 封闭环检测 → 视图分离(Y+X 间隙) → CSG 体积求交 /
@@ -3208,11 +3208,37 @@ def extract_outer_rings_no_merge(edges, views):
         weld_vp = dict(vertex_pos)
         weld_ev = weld_chain_ends(edges, weld_vp, edge_vertices)
     result = _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv)
+    # v0.6.19: 整圆附加环统一归属（两遍合并后做）——单遍内归属会把
+    # 本遍未提取到主环的视图的 extra 丢掉（v6 未焊接遍缺 top 主环 →
+    # r25.5 丢、焊接遍缺 front 主环 → r12 丢）
+    _all_ex = list(result.pop("__extras__", []))
     if weld_ev is not None:
         result2 = _extract_rings_impl(edges, views, weld_vp, weld_ev, nv)
+        # 两遍的整圆附加环可能不同（焊接图挂线结构变化），按面积
+        # 去重合并——bracket top 一遍合成凸台圆 r25.5、另一遍合成
+        # 叉臂圆 r20，任一丢失都会漏恢复
+        for _xr in result2.pop("__extras__", []):
+            if all(abs(_xr["area"] - _m["area"]) > 1.0
+                   for _m in _all_ex):
+                _all_ex.append(_xr)
         for name, rd in result2.items():
-            if name not in result or rd["area"] > result[name]["area"]:
+            if name not in result:
                 result[name] = rd
+            elif rd["area"] > result[name]["area"]:
+                result[name] = rd
+    for _xr in _all_ex:
+        _cx = (_xr["bbox"][0] + _xr["bbox"][2]) / 2
+        _cy = (_xr["bbox"][1] + _xr["bbox"][3]) / 2
+        _v = None
+        for _vv in views:
+            _x1, _y1, _x2, _y2 = _vv["bbox"]
+            if _x1 - 5 <= _cx <= _x2 + 5 and _y1 - 5 <= _cy <= _y2 + 5:
+                _v = _vv["name"]
+                break
+        if _v and _v in result:
+            result[_v].setdefault("extra_rings", []).append(
+                {"ring": _xr["ring"], "area": _xr["area"],
+                 "vpos": _xr["vpos"]})
     # v0.6.12: top 视图 x 镜像检测——model_to_drawing / SW 工程图的
     # 俯视图是沿 −Z 看（up=Y）的镜像投影（DXF_X = −3D_X），而
     # _get_view_transform top 是恒等（不镜像）。对称件（法兰/阶梯轴）
@@ -3286,6 +3312,10 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv,
     不再只留最大环；跳过方∩圆增强块（该块按 dict 结构消费且会追加合成边）。
     """
     from collections import defaultdict
+
+    # v0.6.19: 整圆附加环收集（挂线穿圆外的圆，各分量 arc_ring 合成后
+    # 存入）——分量循环按视图归属随主环输出，CSG 侧 Union 到棱柱
+    extra_rings = []
 
     adj = build_adjacency(vertex_pos, edge_vertices, edges, nv)
 
@@ -3388,6 +3418,7 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv,
 
     def arc_ring(vids):
         """ARC 连通分量中顶点度全 2 的闭合环，取弧数最多者。"""
+        extra_circle_keys = []
         arc_adj = defaultdict(list)
         for v in vids:
             for eid, w, ang in adj.get(v, []):
@@ -3440,6 +3471,14 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv,
         # 真实外环是圆+4 叶片角凸起；整圆合成会吞掉叶片角。
         # v0.6.2 修的法兰带 r=40 假整圆场景在 v6 图纸已不存在
         # （r=40 弧覆盖 28.7° 不触发合成），此条件无回归风险。
+        # ---- v0.6.19: 挂线穿圆外的圆合成"附加材料环" ----
+        # 凸台圆与主体/叉臂轮廓相切时，外环遍历沿叉臂线绕行
+        # （切点转角差 0.1°），凸台右弧成"圆∪叉臂"并集的内边界
+        # 被淘汰——但三视图投影无高度分层信息，棱柱必须取
+        # "整圆 ∪ 外环"并集才能恢复凸台圆柱段（bracket 凸台右弧
+        # 缺失 = 用户标记空缺）。附加环对"圆 ⊂ 外环"的件
+        # （PF60K 叶片圆 r30）是无害子集；内孔圆挂线全在圆内
+        # （或仅弧副本），不附加。
         full_circles_clean = []
         for key in full_circles:
             cvs = set()
@@ -3453,11 +3492,29 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv,
                         cvs.add(w)
             if cvs and all(len(adj.get(v, [])) == 2 for v in cvs):
                 full_circles_clean.append(key)
-            else:
-                print(f"[环提取] 圆 c=({key[0]:.1f},{key[1]:.1f}) "
-                      f"r={key[2]:.1f} 有挂线顶点, 跳过整圆合成")
-        if full_circles_clean:
-            cx, cy, r = max(full_circles_clean, key=lambda k: k[2])
+            elif not keep_all:
+                # 挂线穿出圆外（另一端距圆心 > r+0.3）→ 附加环
+                _sticks_out = False
+                for _v in cvs:
+                    for _eid2, _w, _ang2 in adj.get(_v, []):
+                        _e2 = edges[_eid2]
+                        if _e2.radius and (round(_e2.center[0], 3),
+                                           round(_e2.center[1], 3),
+                                           round(_e2.radius, 3)) == key:
+                            continue
+                        _p = vertex_pos[_w]
+                        if ((_p[0] - key[0]) ** 2 + (_p[1] - key[1]) ** 2) \
+                                ** 0.5 > key[2] + 0.3:
+                            _sticks_out = True
+                            break
+                    if _sticks_out:
+                        break
+                if _sticks_out:
+                    extra_circle_keys.append(key)
+                else:
+                    print(f"[环提取] 圆 c=({key[0]:.1f},{key[1]:.1f}) "
+                          f"r={key[2]:.1f} 有挂线顶点, 跳过整圆合成")
+        def _synth_circle(cx, cy, r):
             # 合成整圆: 36 条 10° 弧边 + 36 个新顶点
             # （顶点多边形面积 0.5·n·r²·sin(2π/n) 逼近 πr²，参与面积比较）
             n_seg = 36
@@ -3476,9 +3533,19 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv,
                                   radius=r, start_angle=a1, end_angle=a2))
                 vertex_pos[base_v + k] = p1
                 ring.append((eid, base_v + k, base_v + (k + 1) % n_seg))
-            print(f"[环提取] 整圆合成: r={r:.1f} c=({cx:.1f},{cy:.1f}) "
-                  f"{n_seg} 段弧", flush=True)
             return ring
+
+        if full_circles_clean:
+            cx, cy, r = max(full_circles_clean, key=lambda k: k[2])
+            print(f"[环提取] 整圆合成: r={r:.1f} c=({cx:.1f},{cy:.1f}) "
+                  f"36 段弧", flush=True)
+            return _synth_circle(cx, cy, r)
+        if extra_circle_keys and not keep_all \
+                and not __import__("os").environ.get("NO_EXTRAS"):
+            cx, cy, r = max(extra_circle_keys, key=lambda k: k[2])
+            print(f"[环提取] 整圆附加: r={r:.1f} c=({cx:.1f},{cy:.1f}) "
+                  f"(挂线穿出, 待 Union)", flush=True)
+            extra_rings.append(_synth_circle(cx, cy, r))
         seen_a = set()
         best = None
         for v in arc_adj:
@@ -3851,6 +3918,27 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv,
         elif vname not in result or area > result[vname]["area"]:
             result[vname] = rdata
 
+    # v0.6.19: 整圆附加环**不能在本遍内归属视图**——分量按大小
+    # 排序处理，本遍可能根本提取不到某视图的主环（v0.6.12 两遍
+    # 互补设计的常态：v6 未焊接遍缺 top、焊接遍缺 front），此刻
+    # 归属会把该视图的 extra 丢掉（r25.5 即因此丢）。以 __extras__
+    # 原样随遍输出，外壳层两遍合并后统一归属。keep_all 路径（剖面
+    # 截面）不输出，避免被内外环分类误当孔洞。
+    if not keep_all and extra_rings:
+        result["__extras__"] = []
+        for _er in extra_rings:
+            _ep = [vertex_pos[_f] for _, _f, _t in _er]
+            result["__extras__"].append({
+                "ring": _er,
+                "area": ring_area_pts(_ep),
+                "bbox": (min(p[0] for p in _ep), min(p[1] for p in _ep),
+                         max(p[0] for p in _ep), max(p[1] for p in _ep)),
+                # 顶点坐标快照——两遍合成的顶点 id 空间重叠（第二遍
+                # 的 vertex_pos 是第一遍前的副本），跨遍用主环的
+                # vertex_pos 查会错位，wire 构建必须用本快照
+                "vpos": {_f: vertex_pos[_f] for _, _f, _t in _er},
+            })
+
     if keep_all:
         return result  # 跳过方∩圆增强（按 dict 结构消费 + 追加合成边）
 
@@ -3863,6 +3951,8 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv,
     # 退化为纯方形 → 叶片材料整体缺失（基准 r[30,40] 环带）。
     # 判据"弧端点落在 bbox 边上"证明圆与方边真实相交，排除整圆外环。
     for vname, rdata in result.items():
+        if vname == "__extras__":  # v0.6.19: 整圆附加环载体，跳过
+            continue
         xmin, ymin, xmax, ymax = rdata["bbox"]
         w = xmax - xmin
         h = ymax - ymin
@@ -3972,6 +4062,8 @@ def _extract_rings_impl(edges, views, vertex_pos, edge_vertices, nv,
     # 且自由端弦长≈直径（2r）→ 替换为绕外侧（环行进方向左侧）的
     # 整段弧。PF60K 方∩圆 4 角弧同圆但自由端弦 ≈r 级≠2r 不触发。
     for vname, rdata in list(result.items()):
+        if vname == "__extras__":  # v0.6.19: 整圆附加环载体，跳过
+            continue
         ring = rdata["ring"]
         n = len(ring)
         if n < 3:
@@ -5416,6 +5508,46 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
             full16_prism = _extrude_face_dual(full16_face, extrude_axis,
                                               extrude_dist)
 
+        # v0.6.19: 整圆附加环 Union——外环遍历把与主体轮廓相切的
+        # 整圆淘汰（凸台右弧成"圆∪叉臂"并集的内边界），但三视图
+        # 投影无高度分层信息，棱柱必须取"整圆 ∪ 外环"并集才能恢复
+        # 凸台圆柱段（bracket 凸台右弧缺失 = 用户标记空缺）。附加圆
+        # ⊂ 外环时是无害子集（PF60K 叶片圆 r30）。Union 在居中前做，
+        # 与主体棱柱共用同一居中平移。
+        if use_ring_wire and ring_wire_data is not None \
+                and ring_wire_data.get("extra_rings"):
+            for _xr in ring_wire_data["extra_rings"]:
+                try:
+                    # 顶点坐标用 extra 自带快照（两遍合成顶点 id
+                    # 空间重叠，主环 vertex_pos 查会错位）
+                    _xw = build_wire_from_directed_ring(
+                        _xr["ring"], _xr.get("vpos",
+                                             ring_wire_data["vertex_pos"]),
+                        edges, scale_factor)
+                    _xf = build_occ_face(_xw) if _xw is not None else None
+                    if _xf is None:
+                        continue
+                    _xf = _apply_view_transform(_xf, v["view_type"])
+                    if v["view_type"] == "top" and v.get("_x_mirrored"):
+                        _xf = BRepBuilderAPI_Transform(_xf, trsf_mir).Shape()
+                    if v["view_type"] != "front":
+                        _xf = BRepBuilderAPI_Transform(_xf,
+                                                       trsf_align).Shape()
+                    _xp = _extrude_face_dual(_xf, extrude_axis,
+                                             extrude_dist)
+                    if _xp is None:
+                        continue
+                    _op = BRepAlgoAPI_Fuse(prism, _xp)
+                    if _op.IsDone():
+                        prism = _op.Shape()
+                        print(f"  [整圆附加] 视图 '{v['name']}' Union "
+                              f"整圆环 area={_xr['area']:.0f}mm2")
+                    else:
+                        print(f"  [WARN] 视图 '{v['name']}' 整圆附加 "
+                              f"Union 失败")
+                except Exception as _xe:
+                    print(f"  [WARN] 视图 '{v['name']}' 整圆附加环失败: {_xe}")
+
         # 棱柱居中到原点：避免大坐标导致的布尔运算精度问题
         # （在拉伸后整体平移，保持各维度的相对位置正确；分体的两个
         # 棱柱共用外环棱柱的居中平移量，保持主体与环带相对位置）
@@ -5653,7 +5785,6 @@ def csg_reconstruct(views, edges, edge_vertices, vertex_pos, scale_factor=1.0,
     except Exception as e:
         print(f"  [FAIL] CSG 交集异常: {e}")
         return None, None
-
     # ---- v0.6.3: 顶段角凸补丁 ----
     # 基准顶段 16 边环的 4 角凸（r[30,40] 角区，与法兰叶片同形状）
     # 三视图投影被 HLR 过滤（top 被外环覆盖、front/side 无母线），
@@ -8975,19 +9106,19 @@ def convert_dxf_to_3d(dxf_path: str, step_output: str = None,
         except Exception as e:
             print(f"  [WARN] 网格线合并失败: {e}")
 
-    # ---- Fix 1: 坐标归一化 —— 将实体平移到几何中心 ----
-    try:
-        final_bbox = Bnd_Box()
-        brepbndlib.Add(combined, final_bbox)
-        fx1, fy1, fz1, fx2, fy2, fz2 = final_bbox.Get()
-        cx, cy, cz = (fx1 + fx2) / 2, (fy1 + fy2) / 2, (fz1 + fz2) / 2
-        if abs(cx) > 0.01 or abs(cy) > 0.01 or abs(cz) > 0.01:
-            trsf_c = gp_Trsf()
-            trsf_c.SetTranslation(gp_Vec(-cx, -cy, -cz))
-            combined = BRepBuilderAPI_Transform(combined, trsf_c).Shape()
-            print(f"  坐标归一化: 中心({cx:.0f},{cy:.0f},{cz:.0f}) → 原点")
-    except Exception as e:
-        print(f"  [WARN] 坐标归一化失败: {e}")
+    # ---- v0.6.19: 删除"坐标归一化"（原 Fix 1，v0.5.4 起）----
+    # 旧行为：实体 bbox 中心偏离原点 >0.01mm 即整体平移使中心归零。
+    # 该假设「模型应以原点为中心」对本项目不成立——模型坐标就是图纸
+    # 坐标系（CSG 系 = 物理 x−63.65、z−22），基准模型中心并不在原点
+    # （bracket CSG 系 bbox 中心 x=0.39）。强行居中引入 0.4947mm 系统
+    # 错位：凸台（CSG 轴 x=58.22、r25.5、右缘 83.72）被推出验证盒，
+    # 盒内材料 32.9→25.0（基准 32.5）→ 用户标记的"凸台右弧空缺"；
+    # 整个模型左移同量（挂耳右半 272→基准 278 之类的系统性偏小同源）。
+    # 实测（v6 重建，--dz 21.95）：多余 2898.96→903.16、缺失
+    # 2356.21→935.28、重合 98.8%→99.5%，dx 由 63.65 修正为 63.56
+    # （差值 0.09 属图纸精度级残差，dz 21.95 同源）。
+    # 纯平移不改逐轴尺寸，回归套件（尺寸口径）不受影响。
+
 
     # 验证
     exp = TopExp_Explorer(combined, TopAbs_FACE)
@@ -9130,7 +9261,7 @@ def main():
         output_sldprt = str(input_dir / f"{input_stem}_{ts}.sldprt")
 
     print("=" * 60)
-    print("通用 DXF → 3D SolidWorks 转换器 v0.6.18")
+    print("通用 DXF → 3D SolidWorks 转换器 v0.6.19")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  STEP: {step_path}")
