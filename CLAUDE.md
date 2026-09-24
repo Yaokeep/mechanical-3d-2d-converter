@@ -388,6 +388,7 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。
   ⚠️ **`.gitignore:20` 的 `*.swp`（本意是 vim swap）与 SolidWorks 宏工程文件扩展名撞车**，`soldwork/Macro1.swp`、`Macro2.swp`、`test.swp` 三个 SW 宏工程被静默排除、从未入库。要保留某个 `.swp` 宏工程需显式 `git add -f`，或把该规则收窄为 `.*.swp`。
+  ⚠️ **入库产物与脚本脱节（2026-09-25 查，待处理）**：跟踪的 `CAD/temp_output/motor_engineering.dxf` 只有 380 个实体，而 `generate_engineering_drawing.py` 当前产出 1581 个（LINE 1562 / TEXT 14 / CIRCLE 2 / LWPOLYLINE 3）——该产物自入库后未随脚本更新。刷新它可以对齐，但会带来约 3 万行 handle/GUID churn，故 v0.6.19 未动；要刷新就单起一个"仅刷新产物"的提交，别混进功能修复。
 
 ## Git 约定
 
