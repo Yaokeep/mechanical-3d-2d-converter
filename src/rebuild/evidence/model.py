@@ -12,10 +12,10 @@ from enum import StrEnum
 from typing import Any
 
 from ..model.claim import Claim, Tier
-from ..model.geom2d import Arc2, BBox2, Circle2, Line2, Point2
+from ..model.geom2d import Arc2, BBox2, Circle2, Line2, Point2, Polyline2
 from ..model.ids import EvidenceRef
 
-Geom2D = Line2 | Arc2 | Circle2
+Geom2D = Line2 | Arc2 | Circle2 | Polyline2
 
 
 class Kind(StrEnum):
@@ -98,6 +98,8 @@ class Evidence:
         g = self.geom
         if isinstance(g, Line2):
             return BBox2.of_points([g.start, g.end])
+        if isinstance(g, Polyline2):
+            return g.bbox()
         return self.exact_bbox
 
     @property
@@ -109,6 +111,8 @@ class Evidence:
         if isinstance(g, Circle2):
             return BBox2(g.center.x - g.radius, g.center.y - g.radius,
                          g.center.x + g.radius, g.center.y + g.radius)
+        if isinstance(g, Polyline2):
+            return g.bbox()
         # Arc2：端点 + 落在张角内的四个象限点
         pts = [
             Point2(g.center.x + g.radius * math.cos(a),

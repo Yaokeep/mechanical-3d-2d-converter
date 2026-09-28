@@ -15,7 +15,7 @@ from pathlib import Path
 import ezdxf
 
 from ..model.claim import Claim, Tier
-from ..model.geom2d import Arc2, Circle2, Line2, Point2
+from ..model.geom2d import Arc2, Circle2, Line2, Point2, Polyline2
 from ..model.ids import EvidenceRef
 from .model import Dimension, Drawing, Evidence, Kind, Role
 from .text_parser import parse_text
@@ -112,8 +112,8 @@ def read_dxf(path: str | Path) -> Drawing:
 
     def add_geom(e, geom, kind: Kind, layer: str, linetype: str,
                  role_override: Claim[Role] | None = None,
-                 pattern: str = "") -> None:
-        ref = new_ref(e)
+                 pattern: str = "", ref_override: EvidenceRef | None = None) -> None:
+        ref = ref_override or new_ref(e)
         role = role_override or classify_role(layer, linetype, ref)
         drawing.evidence.append(Evidence(
             handle=ref, kind=kind, geom=geom, role=role,
@@ -164,6 +164,20 @@ def read_dxf(path: str | Path) -> Drawing:
         except Exception as exc:   # noqa: BLE001 —— 单条多段线坏掉不该毁掉整张图
             print(f"  [WARN] 多段线展开失败（handle={getattr(e.dxf, 'handle', '?')}）: {exc}")
 
+    # ---- 样条 / 椭圆：采样成折线，**不许静默丢** ----
+    # 旧管线完全不读这两类，而"断裂视图的波浪线"恰恰通常就是 SPLINE
+    # （本项目 CAD/reducer.dxf 有 4 条）。丢掉它 = 把断裂视图当完整视图，
+    # 尺寸直接搞错且毫无提示。
+    # 采样精度取 DXF 的 $SPLINESEGS 量级（8 段起步），判据只用到 bbox 与走向。
+    for e in msp.query("SPLINE ELLIPSE"):
+        pts = _sample_curve(e)
+        if len(pts) >= 2:
+            add_edge(e, Polyline2(tuple(pts)), e.dxf.layer,
+                     getattr(e.dxf, "linetype", ""))
+        else:
+            print(f"  [WARN] 曲线采样失败（handle={getattr(e.dxf, 'handle', '?')}）"
+                  "—— 如实跳过，覆盖率检查会看到")
+
     # ---- 剖面填充：HATCH 本身 + 其边界 ----
     for e in msp.query("HATCH"):
         ref = new_ref(e)
@@ -179,10 +193,16 @@ def read_dxf(path: str | Path) -> Drawing:
         ))
         # 边界边单独入账，kind=EDGE（它确实是边，要参与视图包围盒）——
         # 剖面材料信号来自这里（v0.6.15 的 HATCH 通道）
-        for geom in _hatch_boundary_geoms(e):
+        # ⚠️ ref 必须**加后缀去重**：一个 HATCH 展开成几十条边界，若全都顶着
+        # 同一个 handle，则"handle → 图元"不再是单值（实测 20160112 的 2C7
+        # 一条 handle 对应 21 条记录），下游按 handle 建索引就会只拿到最后一条
+        # （于是"该视图有剖面线"这个判断静默失效）。IR 的不变式是
+        # **每条 Evidence 可被 handle 唯一寻址**。
+        for i, geom in enumerate(_hatch_boundary_geoms(e)):
             add_geom(e, geom, Kind.EDGE, e.dxf.layer, "",
                      role_override=Claim(Role.HATCH_BOUNDARY,
-                                         "convention:hatch", Tier.CONVENTION, (ref,)))
+                                         "convention:hatch", Tier.CONVENTION, (ref,)),
+                     ref_override=EvidenceRef(f"{ref}#{i}"))
 
     # ---- 块引用：**记录但标明未展开** ----
     # 不能假装没看见：INSERT 里可能有真几何（本项目 20160112 图上
@@ -217,6 +237,27 @@ def read_dxf(path: str | Path) -> Drawing:
 
 def _rad(deg: float) -> float:
     return math.radians(deg)
+
+
+def _sample_curve(e) -> list[Point2]:
+    """SPLINE / ELLIPSE → 折线顶点。
+
+    ezdxf 两条曲线都有 ``flattening(distance)``：按弦高误差采样。
+    取 0.05mm —— 比本仓库图纸的最小特征（φ3.3 孔）小两个数量级，
+    对"走向/跨度/包围盒"这类判据绰绰有余，且一条曲线只入账**一个**图元
+    （若展开成 N 条 LINE，图元计数会随采样密度漂移，破坏基线可比性）。
+    """
+    try:
+        pts = list(e.flattening(0.05))
+    except Exception as exc:      # noqa: BLE001 —— 单条曲线坏掉不该毁整张图
+        print(f"  [WARN] flattening 失败: {exc}")
+        return []
+    out: list[Point2] = []
+    for p in pts:
+        q = Point2(float(p.x), float(p.y))
+        if not out or out[-1].distance_to(q) > 1e-9:
+            out.append(q)
+    return out
 
 
 def _insert_bbox_geom(e) -> Line2:

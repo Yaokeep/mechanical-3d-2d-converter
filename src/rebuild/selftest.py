@@ -29,6 +29,17 @@ from src.rebuild.evidence.text_parser import (                           # noqa:
     find_projection,
     parse_text,
 )
+from src.rebuild.conventions import (                                    # noqa: E402
+    BrokenView,
+    ConvKind,
+    Conventions,
+    Pattern,
+    RuleCtx,
+    ThreadSpec,
+    run_rules,
+)
+from src.rebuild.conventions import registry as REG                      # noqa: E402
+from src.rebuild.conventions.section import _classify                    # noqa: E402
 from src.rebuild.model import Claim, OpenQuestion, Tier, merge           # noqa: E402
 from src.rebuild.model.geom import Axis3                                 # noqa: E402
 from src.rebuild.views import (                                          # noqa: E402
@@ -626,6 +637,213 @@ def test_correspondence() -> None:
           str(n_center))
 
 
+# ============ G. 约定层（阶段 2） ============
+
+_SEC_DWG = ROOT / "CAD" / "temp_output" / "bracket_angker_图纸_20260922_剖面图.dxf"
+_BLOCK = ROOT / "CAD" / "test_simple" / "block_3view.dxf"
+_PF60K = ROOT / "CAD" / "temp_output" / "pf60k_闭环_三视图_20260817.dxf"
+#: 自检自给的断裂视图夹具（不能依赖入库产物：一次性夹具按约定不入库）
+_FIXTURE_BREAK = ROOT / "CAD" / "temp_output" / "_selftest_break.dxf"
+
+
+def _write_break_fixture(out: Path) -> Path:
+    """造一张**断裂视图**图纸。
+
+    主视图沿横向被截短（图上 120，真长 200），俯视图完整 —— 于是
+    "X 跨度该信谁"有唯一正确答案，也能做反向对照（不喂断裂信息时
+    会不会真去用那个残缺的 120）。附带螺纹/未注圆角的正例与一条
+    "零件名里的 M4 片段不该当螺纹"的反例。
+    """
+    import ezdxf
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc = ezdxf.new("R2010")
+    for name in ("轮廓线", "波浪线", "标注"):
+        doc.layers.add(name)
+    msp = doc.modelspace()
+
+    def rect(x0: float, y0: float, x1: float, y1: float) -> None:
+        msp.add_lwpolyline([(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)],
+                           dxfattribs={"layer": "轮廓线"})
+
+    rect(0, 80, 120, 140)                    # 主视图（断裂）
+    msp.add_lwpolyline([(60, 76), (57, 84), (63, 92), (57, 100), (63, 108),
+                        (57, 116), (63, 124), (57, 132), (63, 140), (60, 144)],
+                       dxfattribs={"layer": "波浪线"})
+    rect(0, 0, 200, 60)                      # 俯视图（完整）
+    rect(250, 80, 310, 140)                  # 左视图（完整）
+    msp.add_circle((280, 110), 4, dxfattribs={"layer": "轮廓线"})   # M8 大径圆
+    for text, pos in (("主视图", (55, 148)), ("俯视图", (90, -12)),
+                      ("左视图", (272, 148)), ("M8", (276, 98)),
+                      ("未注圆角 R2", (250, 74)),
+                      ("麒浚传动_PF60K-14-50-70-M4-L2-12", (250, 66))):
+        msp.add_text(text, dxfattribs={"layer": "标注", "height": 5}
+                     ).set_placement(pos)
+    doc.saveas(out)
+    return out
+
+
+def _prepared(path: Path):
+    """读 → 分离 → 定性（约定层与对应层的共同前置）。"""
+    d = read_dxf(path)
+    detect_views(d)
+    type_views(d)
+    return d
+
+
+def test_conventions() -> None:
+    section("G. 约定层（阶段 2）")
+
+    # ---- G1 每条规则**独立**可跑（阶段 2 验收原文："每条规则有独立测试"） ----
+    names = REG.registered()
+    check("注册表里 8 条规则", len(names) == 8, str(names))
+    d = _prepared(_SEC_DWG)
+    per: dict[str, Conventions] = {
+        n: run_rules(RuleCtx(d=d), only=[n]) for n in names}
+    for n in names:
+        check(f"单跑 {n} 不抛异常", not per[n].failed, str(per[n].failed))
+        check(f"单跑 {n} 的结论只来自它自己",
+              all(c.rule == n for c in per[n].items))
+
+    # ---- G2 失败隔离：坏规则变成待确认项，其余照跑 ----
+    def _boom(ctx: RuleCtx):                       # noqa: ANN202
+        raise RuntimeError("故意的")
+
+    REG.register("selftest.boom")(_boom)           # 临时插一条会炸的规则
+    try:
+        r = run_rules(RuleCtx(d=d))
+    finally:
+        REG._RULES[:] = [x for x in REG._RULES if x.name != "selftest.boom"]
+    check("坏规则被记账", [n for n, _ in r.failed] == ["selftest.boom"],
+          str(r.failed))
+    check("坏规则转成待确认项",
+          bool(r.questions.by_kind(OpenQuestion.OUT_OF_DOMAIN)))
+    check("其余规则照跑（材料结论仍在）", bool(r.of_kind(ConvKind.MATERIAL)))
+    check("临时规则已摘除", "selftest.boom" not in REG.registered())
+
+    # ---- G3 断裂视图：从波浪线一路走到"该模型轴坐标不可用" ----
+    d2 = _prepared(_write_break_fixture(_FIXTURE_BREAK))
+    conv = run_rules(RuleCtx(d=d2))
+    front = next(v.id for v in d2.views if v.resolved_type == ViewType.FRONT)
+    brk = conv.of_kind(ConvKind.BREAK)
+    check("识别出 1 处断裂（波浪线折线聚成一条）",
+          len(brk) == 1 and brk[0].view == front,
+          f"{len(brk)} 条：{[c.view for c in brk]}")
+    check("断裂方向 = 图纸横向 u（竖波浪线横跨零件）",
+          bool(brk) and isinstance(brk[0].value, BrokenView)
+          and brk[0].value.which == ("u",),
+          str(brk[0].value.which) if brk else "无")
+    check("断裂是 CONVENTION 级（图层名明写）",
+          bool(brk) and brk[0].tier is Tier.CONVENTION)
+    check("断裂信息汇总进 Conventions.broken", conv.broken == {front: ("u",)},
+          str(conv.broken))
+    bq = conv.questions.by_kind(OpenQuestion.BROKEN_VIEW)
+    check("报出断裂视图待确认项", len(bq) == 1 and bq[0].view == front,
+          str([q.view for q in bq]))
+
+    # 约定层说"图纸横向不可用" → 视图坐标系把它翻成模型轴 x
+    res = build_correspondence(d2, broken=conv.broken)
+    f0 = res.frames[front]
+    top = next(v.id for v in d2.views if v.resolved_type == ViewType.TOP)
+    check("主视图的 x 轴被判为断裂轴", f0.broken_axes == ("x",),
+          str(f0.broken_axes))
+    check("断裂轴的跨度不可用（返回 None）", f0.model_span("x") is None)
+    check("未断裂的 z 轴跨度照常可用", f0.model_span("z") == (80.0, 140.0),
+          str(f0.model_span("z")))
+    check("X 跨度改由俯视图提供（0–200，而非残缺的 0–120）",
+          f0.u_span == (0.0, 200.0), str(f0.u_span))
+    check("俯视图自己不被牵连", res.frames[top].broken_axes == ()
+          and res.frames[top].model_span("x") == (0.0, 200.0))
+    # 反向对照：这条链子真的在起作用 —— 不喂断裂信息，主视图就会拿
+    # 自己残缺的 120 去给全图定标（正是旧管线的错法）
+    plain = build_correspondence(d2).frames[front]
+    check("反向对照：不喂断裂信息则会用残缺的 120 定标",
+          plain.u_span == (0.0, 120.0), str(plain.u_span))
+
+    # ---- G4 螺纹：正例（有几何佐证）+ 反例（零件名里的 M4） ----
+    th = conv.of_kind(ConvKind.THREAD)
+    check("「M8」读出 1 条螺纹", len(th) == 1, str(len(th)))
+    if th:
+        spec = th[0].value
+        check("M8 大径 = 8", isinstance(spec, ThreadSpec) and spec.major_d == 8.0,
+              str(spec))
+        check("找到对应大径圆 ⇒ 升到 CONVENTION 级",
+              th[0].tier is Tier.CONVENTION and spec.hole_ref is not None)
+    longs = [t for t in d2.texts if "PF60K" in (t.text or "")]
+    check("零件名长文字确实被读到（防反例空转）", len(longs) == 1,
+          str(len(longs)))
+    if longs:
+        lh = longs[0].handle
+        check("零件名里的 M4 片段不被当成螺纹",
+              all(lh not in c.evidence for c in th))
+
+    # ---- G5 未注圆角 ----
+    fl = conv.of_kind(ConvKind.FILLET)
+    check("「未注圆角 R2」读出 R2",
+          len(fl) == 1 and fl[0].value.radius == 2.0,
+          str([c.value for c in fl]))
+    check("未注圆角是 ANNOTATED 级（图上明写）",
+          bool(fl) and fl[0].tier is Tier.ANNOTATED)
+
+    # ---- G6 剖切种类 → 能不能当截面棱柱用（决策表逐条） ----
+    for kind, sc, usable in (("纵向全剖", "full", True), ("横剖", "full", True),
+                             ("剖视", "full", True), ("半剖", "half", False),
+                             ("局部剖", "local", False), ("旋转剖", "multi", False),
+                             ("阶梯剖", "multi", False), ("", "unknown", False)):
+        got = _classify(kind)
+        check(f"剖切「{kind or '空'}」⇒ {sc}/{'可用' if usable else '不可用'}",
+              got[0] == sc and got[1] is usable, str(got[:2]))
+    scs = per["section.scope"].of_kind(ConvKind.SECTION)
+    check("bracket 三个剖视图全判为可作截面棱柱",
+          len(scs) == 3 and all(c.value.usable_as_prism for c in scs),
+          str([(c.view, c.value.scope) for c in scs]))
+
+    # ---- G7 HATCH ⇒ 材料 ----
+    mat = per["section.material"].of_kind(ConvKind.MATERIAL)
+    check("bracket 三个剖视图各 2 处剖面填充",
+          len(mat) == 3 and all(c.value.count == 2 for c in mat),
+          str([(c.view, c.value.count) for c in mat]))
+    check("填充图案读到了（ANSI31）",
+          bool(mat) and all(c.value.pattern for c in mat))
+    check("剖面填充的证据 handle 互不重复（IR 不变式）",
+          all(len(set(c.evidence)) == len(c.evidence) for c in mat))
+
+    # ---- G8 虚线 ⇒ 内部特征 ----
+    hid = per["linetype.hidden"].of_kind(ConvKind.HIDDEN)
+    check("bracket 六个视图都读到虚线",
+          len(hid) == 6 and all(c.value.count > 0 for c in hid),
+          str([(c.view, c.value.count) for c in hid]))
+
+    # ---- G9 阵列：PF60K 的 4×φ5.5 分布圆 ----
+    cf = run_rules(RuleCtx(d=_prepared(_PF60K)))
+    pat = cf.of_kind(ConvKind.PATTERN)
+    check("PF60K 认出 1 个环形阵列", len(pat) == 1, str(len(pat)))
+    if pat:
+        p = pat[0].value
+        check("是 Pattern 且 4 个孔", isinstance(p, Pattern) and p.n == 4,
+              str(p))
+        check("分布圆 R35", abs(p.radius - 35.0) < 0.01, f"{p.radius:.4f}")
+        check("孔半径 2.75（φ5.5）", abs(p.hole_radius - 2.75) < 1e-9,
+              str(p.hole_radius))
+        check("四孔严格 90° 等距",
+              [round(a, 6) for a in p.angles] == [45.0, 135.0, 225.0, 315.0],
+              str(p.angles))
+        check("图上没写「均布」⇒ 如实报出待确认项",
+              not p.annotated
+              and bool(cf.questions.by_kind(OpenQuestion.AMBIGUOUS_FEATURE)))
+
+    # ---- G10 对称（正例 block_3view / 负例：夹具里没有中心线） ----
+    c3 = run_rules(RuleCtx(d=_prepared(_BLOCK)))
+    sym = c3.of_kind(ConvKind.SYMMETRY)
+    check("block_3view 三个视图都判出对称",
+          len(sym) == 3 and all(c.value.support >= 0.9 for c in sym),
+          str([(c.view, round(c.value.support, 3)) for c in sym]))
+    check("无中心线的夹具不产生对称结论",
+          not conv.of_kind(ConvKind.SYMMETRY))
+    check("无剖面的三视图不产生材料/虚线结论",
+          not c3.of_kind(ConvKind.MATERIAL) and not c3.of_kind(ConvKind.HIDDEN))
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -638,6 +856,7 @@ def main() -> int:
     test_views()
     test_verify()
     test_correspondence()
+    test_conventions()
 
     print("\n" + "=" * 72)
     if _failed:

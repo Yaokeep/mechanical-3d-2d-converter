@@ -69,6 +69,30 @@ class Arc2:
 
 
 @dataclass(frozen=True)
+class Polyline2:
+    """折线（样条/椭圆的采样结果也用它承载）。
+
+    存在的理由有两件，都属"不许静默丢信息"：
+
+    1. **断裂视图的波浪线**通常画成 SPLINE —— "这个视图被缩短了"这个信号
+       只能从它读出来。旧管线完全不读 SPLINE（本项目 `CAD/reducer.dxf`
+       就有 4 条），断裂视图因此被当成完整视图，尺寸直接搞错
+    2. 采样的多边形比原曲线低一档精度，但**方向与跨度**这类判据只用到
+       bbox，足够；真正的精确曲线留给 OCC 侧（emit）从原文件重读
+    """
+
+    points: tuple[Point2, ...]
+    closed: bool = False
+
+    def bbox(self) -> BBox2:
+        return BBox2.of_points(list(self.points))
+
+    @property
+    def length(self) -> float:
+        return sum(p.distance_to(q) for p, q in zip(self.points, self.points[1:]))
+
+
+@dataclass(frozen=True)
 class BBox2:
     xmin: float
     ymin: float

@@ -98,6 +98,11 @@ class ViewFrame:
     ``mirror_axes`` 列出**符号未定**的轴：俯/仰、主/后、左/右 各自只差一次
     镜像，未定性时同一张图纸有两种解释。此处的立场是
     **两种都算、都不选**（§3 原则二），由 gate 决定要不要降级。
+
+    ``broken_axes`` 列出**被断裂画法打断**的轴：该向的图只画了一部分，
+    跨度是残缺值。立场同样是"不猜"——``model_span`` 对这类轴返回 ``None``，
+    让所有拿跨度做判断的调用方（区间一致性、总尺寸定标）自动退让，
+    而不是拿一个偏小的跨度去把一个零件按比例压扁。
     """
 
     view_id: str
@@ -111,7 +116,7 @@ class ViewFrame:
     u_span: tuple[float, float] = (0.0, 0.0)
     v_span: tuple[float, float] = (0.0, 0.0)
     mirror_axes: tuple[str, ...] = ()
-
+    broken_axes: tuple[str, ...] = ()
     def u_to_model(self, u: float, mirror: bool = False) -> float:
         """图纸横向坐标 → 模型坐标（``mirror`` 按 u 跨度翻转）。"""
         val = u + self.u_off
@@ -135,7 +140,12 @@ class ViewFrame:
         return Point3(coords["x"], coords["y"], coords["z"])
 
     def model_span(self, axis: str) -> tuple[float, float] | None:
-        """该视图在某个模型轴上覆盖的区间。"""
+        """该视图在某个模型轴上覆盖的区间。
+
+        断裂画法打断的轴返回 ``None``（跨度残缺，不可作任何定标依据）。
+        """
+        if axis in self.broken_axes:
+            return None
         if axis == self.u_axis:
             return self.u_span
         if axis == self.v_axis:
@@ -143,9 +153,10 @@ class ViewFrame:
         return None
 
     def __str__(self) -> str:
+        tag = f" 断裂={','.join(self.broken_axes)}" if self.broken_axes else ""
         return (f"{self.view_id}({self.view_type.value}) "
                 f"u={self.u_axis}+{self.u_off:.2f} v={self.v_axis}+{self.v_off:.2f} "
-                f"p={self.p_axis}")
+                f"p={self.p_axis}{tag}")
 
 
 # ---- 圆柱提示：圆（一个视图）+ 轮廓线（另一个视图）合成的 3D 解释 ----
@@ -218,15 +229,35 @@ class CorrespondenceResult:
 
 # ---- 1) 视图坐标系 ----
 
-def solve_frames(d: Drawing, qs: QuestionList | None = None
+def solve_frames(d: Drawing, qs: QuestionList | None = None,
+                 broken: dict[str, tuple[str, ...]] | None = None
                  ) -> tuple[dict[str, ViewFrame], QuestionList]:
     """给每个视图确立 图纸坐标 → 模型坐标 的映射，并做**跨视图一致性检查**。
 
     一致性检查是白拿的冗余：主视图与俯视图都给出 X 向尺寸、主视图与左视图
     都给出 Z 向尺寸、俯视图与左视图都给出 Y 向尺寸。两路不符 ⇒ 图纸本身
     不自洽（或某视图定性错了），**必须报出来而不是挑一个用**。
+
+    ``broken``：断裂视图（详见 ``conventions.linetype``）。该视图沿某方向的
+    图面跨度和位置本来就是残缺的（波浪线处截掉了一段），所以它
+
+    - 不能当该方向的**基准视图**（会把零件尺寸定小）
+    - 不参与该方向的**一致性检查**（拿残缺尺寸比完整尺寸必然"不一致"）
+
+    而其他视图仍能给出该方向的完整尺寸 —— 这正是"另找依据"的落点。
     """
     questions = qs if qs is not None else QuestionList()
+    broken = broken or {}
+
+    def broken_axes_of(v: View) -> tuple[str, ...]:
+        """把约定层的图纸方向（u/v）翻成模型轴名 —— 这需要视图的轴向表，
+        故只有本函数（视图坐标系的家）能做这个翻译。"""
+        dirs = broken.get(v.id, ())
+        if not dirs or v.id not in axis_of:
+            return ()
+        ua, va = axis_of[v.id]
+        return tuple(a for d_, a in (("u", ua), ("v", va)) if d_ in dirs)
+
     typed = [v for v in d.views if v.bbox is not None and v.resolved_type]
     if not typed:
         return {}, questions
@@ -257,7 +288,8 @@ def solve_frames(d: Drawing, qs: QuestionList | None = None
                          ("y", (ViewType.TOP, ViewType.LEFT))):
         for want in prefer:
             hit = [v for v in typed if v.resolved_type == want
-                   and v.id in axis_of and axis in axis_of[v.id]]
+                   and v.id in axis_of and axis in axis_of[v.id]
+                   and axis not in broken_axes_of(v)]
             if hit:
                 v = hit[0]
                 ua, va = axis_of[v.id]
@@ -287,12 +319,16 @@ def solve_frames(d: Drawing, qs: QuestionList | None = None
             view_id=v.id, view_type=t, u_axis=ua, v_axis=va, p_axis=pa,
             u_off=u_lo - v.bbox.xmin, v_off=v_lo - v.bbox.ymin,
             u_span=(u_lo, u_hi), v_span=(v_lo, v_hi), mirror_axes=mirror,
+            broken_axes=broken_axes_of(v),
         )
         frames[v.id] = frame
 
         # ---- 一致性检查（同一个模型轴被两个视图各说了一次） ----
+        broken_here = broken_axes_of(v)
         for axis, mine in ((ua, (v.bbox.xmin, v.bbox.xmax)),
                            (va, (v.bbox.ymin, v.bbox.ymax))):
+            if axis in broken_here:
+                continue     # 断裂视图的跨度量的是残缺的部分，比了必然"不一致"
             ref = span.get(axis)
             if ref is None or (axis == ua and (u_lo, u_hi) == ref) \
                     or (axis == va and (v_lo, v_hi) == ref):
@@ -1044,11 +1080,17 @@ def points_from_vertices(d: Drawing, frames: dict[str, ViewFrame],
 
 # ---- 主入口 ----
 
-def build_correspondence(d: Drawing, qs: QuestionList | None = None
+def build_correspondence(d: Drawing, qs: QuestionList | None = None,
+                         broken: dict[str, tuple[str, ...]] | None = None
                          ) -> CorrespondenceResult:
-    """算出图纸里的全部跨视图对应。副作用：无（frames 记在返回值里）。"""
+    """算出图纸里的全部跨视图对应。副作用：无（frames 记在返回值里）。
+
+    ``broken`` 是约定层给出的断裂视图（``{view_id: ("u"/"v", …)}``，
+    见 ``conventions.linetype``）—— 断裂视图沿某方向的图面坐标**整条不可用**，
+    必须在这里就挡掉，否则后面每一条对应都会静默用错坐标。
+    """
     questions = qs if qs is not None else QuestionList()
-    frames, questions = solve_frames(d, questions)
+    frames, questions = solve_frames(d, questions, broken=broken)
     res = CorrespondenceResult(frames=frames, questions=questions)
     if not frames:
         return res
