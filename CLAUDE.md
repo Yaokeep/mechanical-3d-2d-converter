@@ -364,21 +364,37 @@ x 平移伪影。补上 dx 后同一对模型是：三视图 多余 1,681.28 / �
 `model`（零依赖纯数据）← `evidence` ← `views` ← `conventions` ← `features` ← `verify`；
 `verify` **不得依赖 `emit`**（验证须能只看特征树就预测形状）。
 
-解释器分层：`model`~`features` + `verify.predict/coverage` + `report` 只需
-ezdxf+numpy，**跑默认 python**；`verify.reproject` 与 `emit` 需要 OCC。
+解释器分层：`model`~`features` + `verify.compare/coverage/gate` + `report` 只需
+ezdxf+numpy，**跑默认 python**；`verify/step_probe.py`（读 STEP 量尺寸）与
+`emit` 需要 OCC。**`verify/__init__.py` 不许导出 step_probe** —— 导出了就等于
+把整包的 import 绑死在 cad-occt 上，selftest 的 E 组会把这条拉回。
+阶段 1 的 `verify.reproject` 同样归 OCC 侧。
 
 阶段 0 已完成（2026-09-28）：`model/`（Claim/geom/feature_tree）、
-`evidence/`（dxf_reader + text_parser）、`report.py`、`inspect.py`、`selftest.py`。
+`evidence/`（dxf_reader + text_parser）、`views/`（view_detector + view_typer）、
+`verify/`（compare/coverage/gate/step_probe）、`report.py`、`inspect.py`、
+`selftest.py`、`verify_legacy.py`。
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--explain HANDLE]
-python -m src.rebuild.selftest       # 60 项自检，退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 122 项自检，退出码 0 = 全过（项目无 pytest）
+# 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
+PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
+PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
 ```
-阶段 0 关键成果：**剖面标题的切平面与半径读出来了**。图纸里明写着
-`B—B  横剖 x=121.89（穿 r25.5 孔轴）`，而旧管线 `dxf_to_3d_general.py:618` 的
-正则 `^([A-Z])[-—–]\1$` 要求整串恰好是标签，把带描述的标题整条丢弃——
-**CLAUDE.md 记为"缺"的 B—B 圆心基准，一直在文件里**。
-未完成：`views/`（视图分离/投影制/对应关系）、`verify/`（compare/coverage/gate/
-predict）、`verify_legacy` CLI。
+阶段 0 关键成果：
+- **剖面标题的切平面与半径读出来了**。图纸里明写着
+  `B—B  横剖 x=121.89（穿 r25.5 孔轴）`，而旧管线 `dxf_to_3d_general.py:618` 的
+  正则 `^([A-Z])[-—–]\1$` 要求整串恰好是标签，把带描述的标题整条丢弃——
+  **CLAUDE.md 记为"缺"的 B—B 圆心基准，一直在文件里**。
+- **验证器可用且指向旧管线**：判据只用图纸+模型（不需要基准），主判据是
+  **尺度无关比例**（图纸可能缩比）。实测 spoon REJECT（Y 偏离 92.3%、
+  逐轴比例尺 0.985/0.076/1.000 ⇒ 一句话点名旧管线的强制拉伸），bracket 三视图与
+  剖面图纸 ACCEPT（隐含比例尺 1.0016）。
+- **验收③ 修正**：6 个回归用例里只有 `block_3view` 具三视图 ⇒ ACCEPT；其余 5 个是
+  单视图零标注的极简 DXF，第三向尺寸**不在图上** ⇒ 正确判决是 NEEDS_CONFIRMATION
+  （原写"6/6 ACCEPT"是把靶子当成真图纸了，见 `docs/ARCHITECTURE.md` §8 阶段 0）。
+未完成：`views/correspondence.py`（阶段 1：对应关系/3D 轴线）、`conventions/`、
+`features/`、`verify.predict`、`emit`。
 
 ### SolidWorks 自动化模块 (`src/core/sw_automation/`)
 
