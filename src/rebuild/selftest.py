@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -41,7 +42,25 @@ from src.rebuild.conventions import (                                    # noqa:
 from src.rebuild.conventions import registry as REG                      # noqa: E402
 from src.rebuild.conventions.section import _classify                    # noqa: E402
 from src.rebuild.model import Claim, OpenQuestion, Tier, merge           # noqa: E402
-from src.rebuild.model.geom import Axis3                                 # noqa: E402
+from src.rebuild.model.feature_tree import (                             # noqa: E402
+    ConstraintType,
+    Feature,
+    FeatureType,
+)
+from src.rebuild.model.geom import Axis3, Point3, Vector3                # noqa: E402
+from src.rebuild.model.ids import FeatureId                              # noqa: E402
+from src.rebuild.features import (                                       # noqa: E402
+    PARAMS,
+    ir_coords,
+    ir_point,
+    merge_with_conflict,
+    predict_in_view,
+    profile_plane,
+    recognize,
+    snap_claim,
+    snap_diameter,
+    snap_radius,
+)
 from src.rebuild.views import (                                          # noqa: E402
     CorrKind,
     build_correspondence,
@@ -844,6 +863,173 @@ def test_conventions() -> None:
           not c3.of_kind(ConvKind.MATERIAL) and not c3.of_kind(ConvKind.HIDDEN))
 
 
+# ---- 阶段 3：特征层 ----
+
+def _recognized(path: Path):
+    """读 → 分离 → 定性 → 约定 → 对应 → 识别（阶段 3 全链）。"""
+    d = _prepared(path)
+    conv = run_rules(RuleCtx(d=d))
+    corr = build_correspondence(d, broken=conv.broken)
+    return d, conv, corr, recognize(d, corr, conv)
+
+
+def test_features() -> None:
+    section("H. 特征层（阶段 3）")
+
+    # ---- H1 参数契约与轮廓坐标系（发射器按同一张表落位） ----
+    missing = [t.value for t in FeatureType if t not in PARAMS]
+    check("每种特征都有参数契约 PARAMS", not missing, str(missing))
+    for d_name, (b1, b2) in ((n, profile_plane(n)) for n in "xyz"):
+        c = b1.cross(b2)
+        axis = {"x": Vector3(1, 0, 0), "y": Vector3(0, 1, 0),
+                "z": Vector3(0, 0, 1)}[d_name]
+        check(f"{d_name} 向轮廓基右手（b1×b2 = dir）",
+              (c - axis).norm < 1e-12, f"{b1}×{b2}={c}")
+    # 往返：ir_coords 以**零件原点**为原点（o≠原点时 ir_point 不是它的逆）
+    ok = True
+    for n in "xyz":
+        p = ir_point(Point3(0.0, 0.0, 0.0), n, 7.0, -4.0, 11.0)
+        ok = ok and all(abs(x - y) < 1e-9
+                        for x, y in zip(ir_coords(p, n), (7.0, -4.0, 11.0)))
+    check("ir_point / ir_coords 往返一致（三向，原点为 o）", ok)
+
+    # ---- H2 预测：孔与凸台在同一条轴上**唯一**的区分是虚实 ----
+    # 取盲孔（depth 给出）：通孔的长度由基体决定，横视图的预测要等基体知了才有
+    hole = Feature(id=FeatureId(1), type=Claim(FeatureType.HOLE, "t", Tier.GUESS),
+                   params={"radius": Claim(5.0, "t", Tier.GUESS),
+                           "through": Claim(False, "t", Tier.GUESS),
+                           "depth": Claim(10.0, "t", Tier.GUESS)},
+                   axis=Claim(Axis3(Point3(0, 0, 0), Vector3(0, 0, 1)),
+                              "t", Tier.GUESS))
+    boss = Feature(id=FeatureId(2), type=Claim(FeatureType.BOSS, "t", Tier.GUESS),
+                   params={"radius": Claim(5.0, "t", Tier.GUESS),
+                           "height": Claim(3.0, "t", Tier.GUESS)},
+                   axis=Claim(Axis3(Point3(0, 0, 0), Vector3(0, 0, 1)),
+                              "t", Tier.GUESS))
+    ph = predict_in_view(hole, "front")
+    pb = predict_in_view(boss, "front")
+    check("孔沿 z 在正视图中预测为两条**虚**平行线",
+          len(ph) == 2 and all(x.kind == "segment" and not x.visible for x in ph),
+          str(ph))
+    check("凸台沿 z 在正视图中预测为两条**实**平行线",
+          len(pb) == 2 and all(x.kind == "segment" and x.visible for x in pb),
+          str(pb))
+    check("顺轴（俯视）看两者都是实心圆",
+          all(x.kind == "circle" for x in predict_in_view(hole, "top")
+              + predict_in_view(boss, "top")))
+
+    # ---- H3 先验：R8 vs R8.5（CLAUDE.md 信息论局限表的落点） ----
+    s85 = snap_radius(8.5)
+    check("R10 优先数系里没有 8.5，最近的是 8.0",
+          s85.standard and abs(s85.value - 8.0) < 1e-9 and s85.changed,
+          str(s85))
+    check("偏离约 5.88%（8.5→8.0）", abs(s85.delta_pct - 5.88) < 0.01,
+          f"{s85.delta_pct:.2f}%")
+    s80 = snap_radius(8.0)
+    check("8.0 本身就是标准值（不改）",
+          s80.standard and not s80.changed, str(s80))
+    d85 = snap_diameter(8.5)
+    check("φ8.5 在麻花钻表里是标准值 ⇒ 两张表必须分开",
+          d85.standard and not d85.changed and d85.source == "drill", str(d85))
+    far = snap_radius(1000.0)
+    check("表外的值如实报「非标准」，不硬套", not far.standard, str(far))
+    c85 = snap_claim(8.5, "radius")
+    check("snap_claim 给出 PRIOR 级并保留原值作备选",
+          c85.tier is Tier.PRIOR and c85.value == 8.0
+          and 8.5 in c85.alternatives, str(c85))
+
+    # ---- H4 求解：合并的冲突判据（硬碰硬才算矛盾） ----
+    a = Claim(25.5, "note:x", Tier.ANNOTATED, evidence=("H1",))
+    b = Claim(25.5, "projection:y", Tier.PROJECTION, evidence=("H3",))
+    m, cf = merge_with_conflict(a, b, label="半径")
+    check("同值两路合并无冲突", cf is None and m.value == 25.5)
+    m2, cf2 = merge_with_conflict(
+        a, Claim(26.5, "note:z", Tier.ANNOTATED, evidence=("H2",)), label="半径")
+    check("两路都是图上明标且差 1mm ⇒ 报冲突",
+          cf2 is not None and m2.value == 25.5, str(cf2))
+    m3, cf3 = merge_with_conflict(
+        a, Claim(26.5, "projection:y", Tier.PROJECTION, evidence=("H4",)),
+        label="半径")
+    check("标注 vs 投影差 1mm **不**算冲突（出图误差是常态）", cf3 is None)
+
+    # ---- H5 bracket：剖面标题进树 + 通孔判定 ----
+    _, conv_b, corr_b, rep_b = _recognized(_SEC_DWG)
+    f1 = next((f for f in rep_b.part.features if f.id == FeatureId(1)), None)
+    check("bracket 剖面图纸识别出 6 个特征", len(rep_b.part.features) == 6,
+          str([(str(f.id), f.type.value) for f in rep_b.part.features]))
+    base = rep_b.part.features[0]
+    check("基体=沿 z 拉伸 44（最薄向）",
+          base.type.value == "base" and base.params["dir"].value == "z"
+          and abs(base.params["length"].value - 44.0) < 1e-9)
+    check("#1 半径被剖面标题（B—B 的 r25.5）精化为 ANNOTATED",
+          f1 is not None and f1.params["radius"].tier is Tier.ANNOTATED
+          and abs(f1.params["radius"].value - 25.5) < 1e-9,
+          str(f1.params["radius"]) if f1 else "无 #1")
+    check("同一根轴的两路证据合并（≥2 项）",
+          f1 is not None and len(f1.evidence) >= 2, str(f1.evidence if f1 else ""))
+    check("有特征直接来自剖面标题（note:section_title）",
+          any(f.type.method == "note:section_title"
+              for f in rep_b.part.features))
+    f2 = next((f for f in rep_b.part.features if f.id == FeatureId(2)), None)
+    check("#2 深 22 < 材料厚 44 ⇒ 判为盲孔（DERIVED，非 GUESS）",
+          f2 is not None and f2.params["through"].value is False
+          and f2.params["through"].tier is Tier.DERIVED
+          and f2.params["through"].method == "derived:depth_vs_material",
+          str(f2.params["through"]) if f2 else "无 #2")
+    check("每处孔都有 through（发射器不接受缺参数）",
+          all("through" in f.params for f in rep_b.part.features
+              if f.type.value == "hole"))
+
+    # ---- H6 PF60K：阵列挂到正确的孔上（判据是"在分布圆上"，不是"在圆心上"） ----
+    _, _, _, rep_p = _recognized(_PF60K)
+    pats = [f for f in rep_p.part.features if f.type.value == "pattern"]
+    check("PF60K 识别出 1 个阵列特征", len(pats) == 1, str(len(pats)))
+    if pats:
+        p = pats[0]
+        child = p.params.get("child")
+        ch = (next((f for f in rep_p.part.features if f.id == child.value), None)
+              if child is not None else None)
+        check("阵列挂上了被阵列的孔（不是「找不到 child」）",
+              ch is not None, str(child))
+        if ch is not None:
+            o, c3 = ch.axis.value.origin, p.placement.value
+            dist = ((o.x - c3.x) ** 2 + (o.y - c3.y) ** 2) ** 0.5
+            r_bc = p.params["bc_radius"].value
+            check("孔轴落在分布圆上（|dist − R| ≤ 0.6）",
+                  abs(dist - r_bc) <= 0.6, f"dist={dist:.4f} R={r_bc:.4f}")
+            check("孔径与阵列声明一致（r2.75）",
+                  abs(ch.params["radius"].value - 2.75) < 1e-9)
+        check("阵列中心＝孔系中心（其余孔绕它均布）",
+              abs(p.placement.value.x - 32.0) < 0.01
+              and abs(p.placement.value.y - 192.9) < 0.01,
+              f"({p.placement.value.x:.2f},{p.placement.value.y:.2f})")
+
+    # ---- H7 关系抽取：等半径/同心成为约束（gate 的输入） ----
+    sr = rep_p.solved
+    check("PF60K 四个 r2.75 孔两两等半径（6 条）",
+          sr is not None
+          and sum(1 for c in sr.constraints
+                  if c.type is ConstraintType.EQUAL_RADIUS) == 6,
+          str(sr.constraints if sr else "无求解报告"))
+    check("阵列与子孔同心",
+          sr is not None
+          and any(c.type is ConstraintType.CONCENTRIC for c in sr.constraints))
+
+    # ---- H8 待确认项不重复报（识别层与求解层共用一份清单） ----
+    marker = re.compile(r"#(\d+)\.(\w+)")
+    for name, rep in (("bracket 剖面图纸", rep_b), ("PF60K", rep_p)):
+        where: dict[str, str] = {}
+        dup: list[str] = []
+        for q in rep.questions:
+            for m in marker.finditer(q.detail):
+                if m.group(0) in where:
+                    dup.append(f"{m.group(0)}：{where[m.group(0)]} / {q.detail[:24]}")
+                where[m.group(0)] = q.detail[:24]
+        check(f"{name}：同一参数只被一条待确认项点名", not dup, str(dup))
+    check("识别层末尾自动跑求解（rep.solved 非空）",
+          rep_b.solved is not None and rep_p.solved is not None)
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -857,6 +1043,7 @@ def main() -> int:
     test_verify()
     test_correspondence()
     test_conventions()
+    test_features()
 
     print("\n" + "=" * 72)
     if _failed:

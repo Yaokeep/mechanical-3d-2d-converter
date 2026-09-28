@@ -1,0 +1,568 @@
+# -*- coding: utf-8 -*-
+"""特征识别 —— 证据 + 对应 + 约定 ⇒ 特征树（ARCHITECTURE §6.3、阶段 3）。
+
+## 本模块的立场：**只认有依据的特征，认不出的如实留着**
+
+旧管线是"先造几何、再反推特征"（`dxf_to_sw_features.py` 从 CSG 结果切片
+反推）—— 等于把烧掉的信息再猜一遍。这里是反的：先把**说得清依据的**特征
+装进树，每一条都带 evidence 与 tier；说不清的地方变成 ``OpenQuestion``，
+由覆盖率的缺口说话（未解释的图元有多少，report 里看得见）。
+
+于是"这个零件重建得对不对"变成可查的问题：**特征树解释了哪些图元、
+没解释哪些、每个数字的依据是什么。**
+
+## 三路来源，按可信度参与 merge
+
+1. **剖面标题**（ANNOTATED，最硬）——「B—B 横剖 x=121.89（穿 r25.5 孔轴）」
+   直接给出"这里有一条沿 Z 的孔轴，半径 25.5"
+2. **跨视图对应**（PROJECTION）—— 一个视图里的圆 + 正交视图里的轮廓对
+   ⇒ ``CylinderHint``（圆柱，含长度与"孔还是凸台"）
+3. **约定**（CONVENTION）—— 阵列/螺纹/对称面
+
+同一特征被多路说中时**不挑一个丢一个**：值取高 tier，其余进备选、
+证据合并（§3 原则二）。bracket 上正是这样：B—B 的 r25.5 与俯视图的
+r25.5 圆说的是同一个凸台，合并后证据有两条。
+
+## 不做的事（写下来是为了以后别顺手加）
+
+- **不做轮廓环提取**：基体按视图包围盒近似（tier=PROJECTION，
+  并如实报一条待确认）。旧管线那套"边图→封闭环"是 8957 行里最重的一块，
+  塞到这里会让本模块变成第二个它；正确做法是让它作为独立证据通道进来
+- **不把"未注圆角"塞进特征树**：那是全局技术条件，不是可定位的特征。
+  它已经在约定层（``simplification.fillets``）报出来了，重复一遍只会
+  让发射器收到建不出来的特征
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from ..model.claim import Claim, Tier
+from ..model.feature_tree import Feature, FeatureType, Part, SymmetryOp
+from ..model.geom import Axis3, Point3, Vector3
+from ..model.ids import FeatureId
+from ..model.questions import OpenQuestion, Question, QuestionList
+from ..views.correspondence import CorrespondenceResult, CylinderHint
+from .library import ir_point, mk_claim
+from .solver import Conflict, SolveReport, merge_with_conflict, solve
+
+#: 两条轴"是同一条"的判据：垂直距离 + 方向夹角
+AXIS_POS_TOL = 0.6       # mm
+AXIS_DIR_TOL = 1e-3      # 方向余弦差（轴向必须几乎一致）
+
+#: 拉伸方向 → 轮廓平面的两个模型轴（与 ``library.profile_plane`` 同一张表）
+_PLANE_AXES: dict[str, tuple[str, str]] = {
+    "x": ("y", "z"), "y": ("z", "x"), "z": ("x", "y")}
+
+
+def _dirs_parallel(a: Vector3, b: Vector3) -> bool:
+    return max(abs(a.x - b.x), abs(a.y - b.y), abs(a.z - b.z)) < AXIS_DIR_TOL
+
+
+def axis_distance(a: Axis3, b: Axis3) -> float | None:
+    """两条平行轴的垂直距离；不平行返回 None。
+
+    点线距离用叉积：``|(p2−p1) × d| / |d|``（d 已归一）。
+    """
+    if not _dirs_parallel(a.direction, b.direction):
+        return None
+    v = b.origin - a.origin
+    cross = v.cross(a.direction)
+    return cross.norm
+
+
+@dataclass
+class RecognizeReport:
+    """识别过程的可读输出（report.py 消费）。"""
+
+    part: Part
+    questions: QuestionList = field(default_factory=QuestionList)
+    notes: list[str] = field(default_factory=list)
+    #: 同一参数两路"硬依据"对不上（§6.2 说的"图纸自相矛盾"）
+    conflicts: list[Conflict] = field(default_factory=list)
+    #: 求解报告（``recognize`` 末尾自动跑一次；单独调 ``solve`` 则为 None）
+    solved: SolveReport | None = None
+
+    def describe(self) -> str:
+        lines = [f"识别出 {len(self.part.features)} 个特征"]
+        for f in self.part.features:
+            lines.append(f"  #{f.id} {f.type.value} "
+                         f"依据 {f.type.method} <{f.type.tier.name}> "
+                         f"图元 {len(f.evidence)} 项")
+        lines.extend("  " + n for n in self.notes)
+        if self.solved is not None:
+            lines.append("  —— 求解 ——")
+            lines.extend("  " + ln for ln in
+                         self.solved.describe(questions=False).splitlines())
+        if self.questions:
+            lines.append(f"  待确认 {len(self.questions)} 项")
+            lines.extend("    " + str(q) for q in self.questions)
+        return "\n".join(lines)
+
+
+# ---- 1) 基体 ----
+
+def _extents(frames) -> dict[str, float]:
+    """各模型轴上的零件总跨度（断裂视图的轴不参与）。"""
+    out: dict[str, float] = {}
+    for a in "xyz":
+        spans = [f.model_span(a) for f in frames.values()]
+        spans = [s for s in spans if s is not None]
+        if spans:
+            out[a] = max(s[1] for s in spans) - min(s[0] for s in spans)
+    return out
+
+
+def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature:
+    """基体：按视图包围盒近似成一块拉伸体。
+
+    **选哪条轴拉伸**：取零件最小的那个正跨度 —— 板类零件的自然读法是
+    "沿最薄的方向拉伸"。这条是启发式（tier=PROJECTION 而非 CONVENTION），
+    且必须报出来，因为"最薄方向不是拉伸方向"的零件（如长轴套）会被读错。
+
+    轮廓坐标是"垂直拉伸方向的那个平面"上的 (a, b)，按
+    ``library.profile_plane`` 的右手基向量落位 —— 发射器用同一张表，
+    所以沿 Y 拉伸的板不会被转 90°。
+    """
+    frames = corr.frames
+    ext = _extents(frames)
+    if not ext:
+        raise ValueError("没有任何视图给出可用跨度，无法定基体")
+    dir_name = min(ext, key=lambda a: ext[a])
+    # 轮廓取"看不出的正是拉伸方向"的那个视图（它正对着这个平面）
+    prof_view = next((f for f in frames.values() if f.p_axis == dir_name),
+                     next(iter(frames.values())))
+    b1_axis, b2_axis = _PLANE_AXES[dir_name]
+    lo1 = min(f.model_span(b1_axis)[0] for f in frames.values()
+              if f.model_span(b1_axis) is not None)
+    hi1 = max(f.model_span(b1_axis)[1] for f in frames.values()
+              if f.model_span(b1_axis) is not None)
+    lo2 = min(f.model_span(b2_axis)[0] for f in frames.values()
+              if f.model_span(b2_axis) is not None)
+    hi2 = max(f.model_span(b2_axis)[1] for f in frames.values()
+              if f.model_span(b2_axis) is not None)
+    box = [(0.0, 0.0), (hi1 - lo1, 0.0), (hi1 - lo1, hi2 - lo2), (0.0, hi2 - lo2)]
+    t_lo = min(f.model_span(dir_name)[0] for f in frames.values()
+               if f.model_span(dir_name) is not None)
+    length = ext[dir_name]
+    ev = tuple(dict.fromkeys(e for v in d.views for e in v.evidence[:1]))
+    origin = ir_point(Point3(0.0, 0.0, 0.0), dir_name, lo1, lo2, t_lo)
+    f = Feature(
+        id=FeatureId(0),
+        type=Claim(FeatureType.BASE, "projection:view_bounds", Tier.PROJECTION,
+                   evidence=ev),
+        params={
+            "dir": Claim(dir_name, "projection:thinnest_extent", Tier.PROJECTION,
+                         evidence=ev),
+            "length": Claim(length, "projection:view_bounds", Tier.PROJECTION,
+                            evidence=ev),
+            # 轮廓**相对 origin**（发射器按 ir_point(origin, dir, a, b, t) 落位）；
+            # 写成绝对坐标会与 origin 叠加一次，造出双倍偏移的零件
+            "profile": Claim(box, "projection:view_bounds", Tier.PROJECTION,
+                             evidence=ev),
+            "origin": Claim(origin, "projection:view_bounds", Tier.PROJECTION,
+                            evidence=ev),
+        },
+        placement=Claim(origin, "projection:view_bounds", Tier.PROJECTION,
+                        evidence=ev),
+        source_view=prof_view.view_id,
+        evidence=list(ev),
+    )
+    rep.notes.append(
+        f"基体：轮廓 {hi1 - lo1:.2f}×{hi2 - lo2:.2f}（{b1_axis},{b2_axis} 面）"
+        f"沿 {dir_name} 拉伸 {length:.2f}，角点在 "
+        f"({origin.x:.2f},{origin.y:.2f},{origin.z:.2f})")
+    rep.questions.add(Question(
+        OpenQuestion.AMBIGUOUS_FEATURE,
+        f"基体目前只按视图包围盒近似（{b1_axis},{b2_axis} 面上的矩形 "
+        f"{hi1 - lo1:.2f}×{hi2 - lo2:.2f} 沿 {dir_name} 拉伸 {length:.2f}）—— "
+        "轮廓内的台阶/缺口**没有**被解释；真实轮廓需要环提取通道，本阶段刻意不做",
+        view=prof_view.view_id, evidence=ev[:1],
+    ))
+    return f
+
+
+# ---- 2) 圆柱（跨视图对应） ----
+
+def _cyl_claim(hint: CylinderHint) -> Claim[FeatureType]:
+    """孔还是凸台 —— **没定就不许定**（§3 原则二）。
+
+    ``CylinderHint.solid`` 由正交视图里那两条轮廓线是实线还是虚线给出，
+    这是二者唯一的消解依据。它没算出来（None）时只能给 GUESS + 备选。
+    """
+    ev = hint.axis.radius.evidence if hint.axis.radius else ()
+    if hint.solid is True:
+        return Claim(FeatureType.BOSS, "projection:outline_visible",
+                     Tier.PROJECTION, evidence=ev)
+    if hint.solid is False:
+        return Claim(FeatureType.HOLE, "projection:outline_hidden",
+                     Tier.PROJECTION, evidence=ev)
+    return Claim(FeatureType.HOLE, "unresolved:outline", Tier.GUESS,
+                 alternatives=(FeatureType.BOSS,))
+
+
+def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
+                      next_id: int) -> list[Feature]:
+    """一个 ``CylinderHint`` 一条特征。"""
+    out: list[Feature] = []
+    for c in corr.cylinders():
+        hint = c.mapping.value
+        assert isinstance(hint, CylinderHint)
+        ev = tuple(hint.axis.radius.evidence) if hint.axis.radius else ()
+        t = _cyl_claim(hint)
+        params: dict[str, Claim] = {}
+        if hint.axis.radius is not None:
+            params["radius"] = hint.axis.radius
+        if hint.length is not None:
+            params["height" if t.value == FeatureType.BOSS else "depth"] = mk_claim(
+                hint.length, "projection:outline_pair", Tier.PROJECTION, ev)
+        f = Feature(
+            id=FeatureId(next_id), type=t, params=params,
+            axis=Claim(hint.axis, "projection:circle_plus_outline",
+                       Tier.PROJECTION, ev),
+            placement=Claim(hint.axis.origin, "projection:cylinder", Tier.PROJECTION,
+                            ev),
+            source_view=c.views[0] if c.views else "",
+            evidence=list(ev),
+        )
+        out.append(f)
+        if t.value == FeatureType.HOLE and "depth" not in params:
+            # 文本里点出 `#id.depth` 与 `#id.through`：这两个字段是同一桩
+            # 未定事（深度不知道 ⇒ 通孔/盲孔也不知道），求解层的"欠定"兜底
+            # 靠这两个记号去重，别只点一个
+            rep.questions.add(Question(
+                OpenQuestion.MISSING_DIMENSION,
+                f"#{f.id}.depth / #{f.id}.through：r{hint.radius:g} 在正交视图里"
+                "找不到配对的轮廓 ⇒ 深度未知，通孔/盲孔也未定",
+                view=f.source_view, evidence=ev))
+        next_id += 1
+    return out
+
+
+# ---- 3) 剖面标题给的轴线 ----
+
+def merge_section_axes(corr: CorrespondenceResult, rep: RecognizeReport,
+                       part: Part) -> None:
+    """把剖面标题/中心线给出的 3D 轴并进特征树。
+
+    与已有特征同一根轴 ⇒ 合并（标注压投影，证据并起来）；
+    对不上任何特征且**带半径** ⇒ 它是图纸明写的一处孔/凸台，建成新特征；
+    不带半径的中心线（``radius is None``）⇒ 别硬造特征，只记一条待确认。
+    """
+    for c in corr.axes():
+        axis = c.mapping.value
+        assert isinstance(axis, Axis3)
+        hit = None
+        for f in part.features:
+            if f.axis is None or f.axis.value is None:
+                continue
+            d = axis_distance(f.axis.value, axis)
+            if d is not None and d <= AXIS_POS_TOL:
+                hit = f
+                break
+        if hit is not None:
+            _absorb(hit, axis, c, rep)
+            continue
+        if axis.radius is None:
+            rep.questions.add(Question(
+                OpenQuestion.MISSING_DIMENSION,
+                f"{'×'.join(c.views)} 的中心线定出一条 3D 轴"
+                f"（过 {'(' + ', '.join(f'{q:.2f}' for q in (axis.origin.x, axis.origin.y, axis.origin.z)) + ')'}），"
+                "但图纸没给它的半径 ⇒ 是参考轴还是某个特征的轴未定",
+                evidence=tuple(e for _, e in c.refs)))
+            continue
+        f = Feature(
+            id=part.next_id(),
+            type=Claim(FeatureType.HOLE, "note:section_title", Tier.ANNOTATED,
+                       evidence=axis.radius.evidence),
+            params={"radius": axis.radius,
+                    "through": mk_claim(True, "note:section_title", Tier.ANNOTATED,
+                                        axis.radius.evidence)},
+            axis=Claim(axis, "note:section_title", Tier.ANNOTATED,
+                       axis.radius.evidence),
+            placement=Claim(axis.origin, "note:section_title", Tier.ANNOTATED,
+                            axis.radius.evidence),
+            source_view=c.views[0] if c.views else "",
+            evidence=list(axis.radius.evidence),
+        )
+        part.add(f)
+        rep.notes.append(
+            f"#{f.id} 由剖面标题建成：r{axis.radius.value:g} 轴沿 "
+            f"{_axis_name(axis.direction)}")
+
+
+def _absorb(f: Feature, axis: Axis3, c, rep: RecognizeReport) -> None:
+    """同一根轴的二次声明并进已有特征：值取高 tier，证据合起来。"""
+    old = f.params.get("radius")
+    new = axis.radius
+    if new is not None and old is not None:
+        merged, conflict = merge_with_conflict(
+            old, new, label=f"#{f.id} 半径的两路声明")
+        f.params["radius"] = merged
+        if conflict is not None:
+            rep.conflicts.append(conflict)
+        if new.tier > old.tier:
+            rep.notes.append(
+                f"#{f.id} 半径被剖面标题精化：{old.value:g} → {new.value:g}"
+                f"（{old.tier.name} → {new.tier.name}）")
+    ev = new.evidence if new is not None else ()
+    for h in ev:
+        if h not in f.evidence:
+            f.evidence.append(h)
+    rep.notes.append(f"#{f.id} 与 {'×'.join(c.views)} 的轴线并为一处"
+                     f"（共 {len(f.evidence)} 项依据）")
+
+
+def _material_extent(base: Feature) -> dict[str, float]:
+    """基体在三个模型轴上的"材料厚度"（当前是包围盒口径）。
+
+    拉伸方向上是 ``length``；轮廓平面内的两轴上是轮廓的宽/高。写成一张表
+    而不是"孔轴必须与拉伸方向同向才判"—— PF60K 的孔沿 z、基体沿 y 拉伸，
+    孔轴与拉伸方向不同，但 z 向的材料厚度就是轮廓的 z 跨度，照样能判。
+    """
+    dir_name = base.params["dir"].value
+    b1, b2 = _PLANE_AXES[dir_name]
+    prof = base.params["profile"].value
+    return {dir_name: base.params["length"].value,
+            b1: max(a for a, _ in prof),
+            b2: max(b for _, b in prof)}
+
+
+def derive_through(part: Part, rep: RecognizeReport) -> None:
+    """通孔还是盲孔 —— 由「孔深 vs 该轴上的材料厚度」推（旧管线全靠猜）。
+
+    材料厚度取基体在该轴上的跨度。基体目前只有包围盒级精度，故
+    tier=DERIVED 而不是 ANNOTATED —— 但它至少是**推出来的**，
+    依据（深度/厚度两个数）写进报告，而不是一个静默的 False。
+
+    每一处孔都必须有 ``through``：发射器不知道"通孔"该不该默认，
+    缺参数就抛异常。所以定不下来的地方给 GUESS 值 + 备选 + 缺口计数，
+    而不是让字段缺席。
+    """
+    base = next((f for f in part.features if f.type.value == "base"), None)
+    if base is None:
+        return
+    thick = _material_extent(base)
+    unknown = 0
+    for f in part.features:
+        if f.type.value != "hole":
+            continue
+        cur = f.params.get("through")
+        if cur is not None and cur.tier > Tier.DERIVED:
+            continue                    # 图纸明写的（剖面标题「穿…孔轴」）不降级
+        depth = f.params.get("depth")
+        ax = f.axis.value if f.axis is not None else None
+        name = _axis_name(ax.direction) if ax is not None else ""
+        mat = next((v for k, v in thick.items()
+                    if name in (f"+{k.upper()}", f"−{k.upper()}")), None)
+        ev = tuple(f.evidence[:1])
+        if depth is not None and mat is not None:
+            through = depth.value >= mat - AXIS_POS_TOL
+            f.params["through"] = Claim(through, "derived:depth_vs_material",
+                                        Tier.DERIVED, ev)
+            rep.notes.append(
+                f"#{f.id} 深 {depth.value:.2f} vs 该轴材料厚 {mat:.2f} ⇒ "
+                f"{'通孔' if through else '盲孔'}")
+            continue
+        # 深度不知道（没配到轮廓对），或孔轴不是主轴（材料厚度算不出来）
+        # ⇒ 按制图惯例"没画底轮廓即通孔"取 True，但配对失败也有同样表现：
+        # 只给 GUESS 并保留 False 作备选（歧义不消解）
+        f.params["through"] = Claim(True, "unresolved:no_bottom_contour",
+                                    Tier.GUESS, ev, alternatives=(False,))
+        unknown += 1
+    if unknown:
+        rep.notes.append(
+            f"{unknown} 处孔的通孔/盲孔未定（深度或该轴材料厚度缺失）⇒ "
+            "暂按通孔、备选盲孔")
+
+
+def _axis_name(d: Vector3) -> str:
+    for name, v in (("+X", (1, 0, 0)), ("−X", (-1, 0, 0)), ("+Y", (0, 1, 0)),
+                    ("−Y", (0, -1, 0)), ("+Z", (0, 0, 1)), ("−Z", (0, 0, -1))):
+        if max(abs(d.x - v[0]), abs(d.y - v[1]), abs(d.z - v[2])) < 1e-6:
+            return name
+    return f"({d.x:.2f},{d.y:.2f},{d.z:.2f})"
+
+
+# ---- 4) 约定：阵列 / 螺纹 / 对称 ----
+
+def pattern_features(conv, corr: CorrespondenceResult, rep: RecognizeReport,
+                     part: Part) -> list[Feature]:
+    """均布孔阵列 ⇒ PATTERN 特征（child 指向被阵列的那个孔）。
+
+    ``Pattern`` 是**图纸系**表达（与 ``Symmetry`` 同理），必须经视图坐标系
+    翻到模型系才能与孔轴比位置 —— 直接拿图纸坐标比模型坐标是"看着像对上了"
+    的经典错法。
+    """
+    from ..conventions import ConvKind
+    out: list[Feature] = []
+    if conv is None:
+        return out
+    for c in conv.of_kind(ConvKind.PATTERN):
+        p = c.value
+        frame = corr.frames.get(p.view)
+        if frame is None:
+            rep.questions.add(Question(
+                OpenQuestion.AMBIGUOUS_VIEW,
+                f"{p.view} 认出 {p.n}×φ{2 * p.hole_radius:g} 的均布阵列"
+                f"（分布圆 R{p.radius:g}），但该视图没有坐标系 ⇒ "
+                "阵列中心在模型系里的位置未定",
+                view=p.view, evidence=c.evidence))
+            continue
+        center3 = frame.to_model(p.center.x, p.center.y)
+        # 被阵列的孔**不在分布圆心上**，而在分布圆上：判据是"孔轴到阵列中心的
+        # **面内**距离 ≈ 分布圆半径"且"半径 ≈ 阵列孔半径"。早期版本比的是
+        # 轴心到圆心的距离 ≤ 容差（= 在圆心处找孔），PF60K 上必然找不到 child
+        child = None
+        for f in part.features:
+            if f.type.value == "pattern" or f.axis is None or f.axis.value is None:
+                continue
+            r = f.params.get("radius")
+            if r is None or abs(r.value - p.hole_radius) > 0.05:
+                continue
+            o = f.axis.value.origin
+            cm = {"x": o.x, "y": o.y, "z": o.z}
+            cn = {"x": center3.x, "y": center3.y, "z": center3.z}
+            d = ((cm[frame.u_axis] - cn[frame.u_axis]) ** 2
+                 + (cm[frame.v_axis] - cn[frame.v_axis]) ** 2) ** 0.5
+            if abs(d - p.radius) <= AXIS_POS_TOL:
+                child = f
+                break
+        params = {
+            "kind": mk_claim("circular", "convention:pattern", Tier.CONVENTION,
+                             c.evidence),
+            "count": mk_claim(p.n, "convention:pattern", Tier.CONVENTION,
+                              c.evidence),
+            "bc_radius": mk_claim(p.radius, "convention:pattern", Tier.CONVENTION,
+                                  c.evidence),
+            "start_deg": mk_claim(p.angles[0] if p.angles else 0.0,
+                                  "convention:pattern", Tier.CONVENTION,
+                                  c.evidence),
+        }
+        f = Feature(
+            id=part.next_id(),
+            type=Claim(FeatureType.PATTERN, "convention:pattern",
+                       Tier.CONVENTION, c.evidence),
+            params=params,
+            placement=Claim(center3, "convention:pattern",
+                            Tier.CONVENTION, c.evidence),
+            source_view=p.view, evidence=list(c.evidence),
+        )
+        if child is not None:
+            f.depends_on.append(child.id)
+            f.params["child"] = mk_claim(child.id, "convention:pattern",
+                                         Tier.CONVENTION, c.evidence)
+        else:
+            rep.questions.add(Question(
+                OpenQuestion.AMBIGUOUS_FEATURE,
+                f"认出 {p.n}×φ{2 * p.hole_radius:g} 的均布阵列（分布圆 R{p.radius:g}），"
+                "但没找到被阵列的那个孔 ⇒ 阵列挂在哪个特征上未定",
+                view=p.view, evidence=c.evidence))
+        out.append(f)
+    return out
+
+
+def thread_links(conv, rep: RecognizeReport, part: Part) -> int:
+    """螺纹标注挂到对应的孔上（挂不上就报出来，不静默丢）。"""
+    from ..conventions import ConvKind
+    n = 0
+    if conv is None:
+        return 0
+    for c in conv.of_kind(ConvKind.THREAD):
+        spec = c.value
+        for f in part.features:
+            if f.axis is None or f.axis.value is None:
+                continue
+            if spec.hole_ref is None or spec.hole_ref not in f.evidence:
+                continue
+            f.params["thread"] = mk_claim(spec.code, "convention:thread_code",
+                                          Tier.CONVENTION, (spec.text_ref,))
+            n += 1
+            break
+    return n
+
+
+def symmetries(conv, corr: CorrespondenceResult, part: Part,
+               rep: RecognizeReport) -> None:
+    """对称面 —— 约定层给的是**图纸系**，这里翻成模型系。
+
+    翻译需要视图坐标系（``ViewFrame``）：图纸里的"竖中心线"在模型系是
+    垂直于该视图 u 轴的那个面。这一步是 views 层的存在价值之一 ——
+    约定层只说"这张图上 u 向对称"，不抢答模型轴。
+    """
+    from ..conventions import ConvKind
+    if conv is None:
+        return
+    for c in conv.of_kind(ConvKind.SYMMETRY):
+        s = c.value
+        frame = corr.frames.get(s.view)
+        if frame is None:
+            rep.questions.add(Question(
+                OpenQuestion.AMBIGUOUS_VIEW,
+                f"{s.view} 判出{'左右' if s.which == 'u' else '上下'}对称，"
+                "但该视图没有坐标系 ⇒ 对称面在模型系里的位置未定",
+                view=s.view, evidence=c.evidence))
+            continue
+        if s.which == "u":
+            at = frame.u_to_model(s.at)
+            normal = _axis_vector(frame.u_axis)
+        else:
+            at = frame.v_to_model(s.at)
+            normal = _axis_vector(frame.v_axis)
+        point = {'x': Point3(at, 0.0, 0.0), 'y': Point3(0.0, at, 0.0),
+                 'z': Point3(0.0, 0.0, at)}[frame.u_axis if s.which == "u"
+                                            else frame.v_axis]
+        part.symmetry.append(Claim(SymmetryOp(normal.normalized(), point),
+                                   f"convention:symmetry:{s.view}",
+                                   Tier.CONVENTION, c.evidence))
+        rep.notes.append(
+            f"对称面：法向 {_axis_name(normal)} 过 {frame.u_axis if s.which == 'u' else frame.v_axis}"
+            f"={at:.2f}（支撑率 {s.support:.0%}）")
+
+
+def _axis_vector(name: str) -> Vector3:
+    return {"x": Vector3(1.0, 0.0, 0.0), "y": Vector3(0.0, 1.0, 0.0),
+            "z": Vector3(0.0, 0.0, 1.0)}[name]
+
+
+# ---- 主入口 ----
+
+def recognize(d, corr: CorrespondenceResult, conv=None,
+              qs: QuestionList | None = None) -> RecognizeReport:
+    """图纸 → 特征树（含待确认项）。
+
+    ``d`` 是已过 ``detect_views``/``type_views`` 的 ``Drawing``。
+    """
+    questions = qs if qs is not None else QuestionList()
+    rep = RecognizeReport(part=Part(questions=questions), questions=questions)
+    if not corr.frames:
+        rep.questions.add(Question(
+            OpenQuestion.UNKNOWN_VIEW, "没有可用的视图坐标系，无法识别特征"))
+        return rep
+
+    part = rep.part
+    if conv is not None:                    # 约定先行：对称/阵列要挂到特征上
+        symmetries(conv, corr, part, rep)
+
+    base = base_feature(d, corr, rep)
+    part.add(base)
+    for f in cylinder_features(corr, rep, next_id=1):
+        part.add(f)
+    merge_section_axes(corr, rep, part)
+    for f in pattern_features(conv, corr, rep, part):
+        part.add(f)
+    if thread_links(conv, rep, part):
+        rep.notes.append("螺纹标注已挂到对应孔上")
+    # 通孔/盲孔必须等剖面标题那一路也进树之后才能判（标题可能已明写「穿…」）
+    derive_through(part, rep)
+    # 求解**在层内收尾**：先验/关系/欠定兜底共用同一个待确认清单，
+    # 否则调用方忘了传 qs 就会重复报（求解层去重正是靠这份清单）
+    rep.solved = solve(part, qs=questions)
+    rep.conflicts.extend(rep.solved.conflicts)
+    return rep
+
+
+__all__ = [
+    "RecognizeReport", "axis_distance", "base_feature", "cylinder_features",
+    "derive_through", "merge_section_axes", "pattern_features", "recognize",
+    "symmetries", "thread_links",
+]
