@@ -12,6 +12,7 @@ from __future__ import annotations
 from .model.claim import Claim
 from .evidence.model import Drawing
 from .evidence.text_parser import TextKind
+from .views.view_typer import describe_views
 
 H1 = "=" * 72
 H2 = "-" * 72
@@ -107,6 +108,23 @@ def evidence_report(d: Drawing) -> str:
     return "\n".join(out)
 
 
+# ---- 视图报告 ----
+
+def views_report(d: Drawing, questions: list | None = None) -> str:
+    """视图分离与定性结果 —— 第 2 层的验收视图。
+
+    ``type`` 的 tier 直接写在行里（``<图上标注>``/``<标准先验>``…）：
+    **同一张表里既给出答案也给出这个答案有多硬**，这是旧管线没有的东西。
+    """
+    out: list[str] = []
+    out.append(_rule(f"视图（{len(d.views)} 个）"))
+    out.append(describe_views(d))
+    if questions is not None:
+        out.append(open_questions_report(questions))
+    out.append("")
+    return "\n".join(out)
+
+
 # ---- explain 查询 ----
 
 def explain(d: Drawing, handle: str, claims: list[Claim] | None = None) -> str:
@@ -128,7 +146,8 @@ def explain(d: Drawing, handle: str, claims: list[Claim] | None = None) -> str:
         if ev.pattern:
             out.append(f"  填充   {ev.pattern}")
         out.append(f"  几何   {ev.geom}")
-        out.append(f"  视图   {ev.view or '（未归属）'}")
+        v = d.view_of(handle)
+        out.append(f"  视图   {v.id if v is not None else '（未归属 —— views 层尚未运行）'}")
 
     # 引用了它的文字
     for t in d.texts:

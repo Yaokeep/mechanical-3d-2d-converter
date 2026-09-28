@@ -14,6 +14,9 @@ from typing import Any
 from .claim import Claim, Tier
 from .geom import Axis3, Point3, Vector3
 from .ids import EvidenceRef, FeatureId
+# OpenQuestion/Question 在 questions.py —— 视图层与约定层也要产出待确认项，
+# 让它们反过来依赖特征树是错的依赖方向。此处仅为兼容旧引用而透出。
+from .questions import OpenQuestion, Question, QuestionList  # noqa: F401
 
 
 class FeatureType(StrEnum):
@@ -69,33 +72,6 @@ class Constraint:
     def __str__(self) -> str:
         names = [f"#{fid}.{p}" for fid, p in self.refs]
         return f"{self.type.value}({', '.join(names)})"
-
-
-class OpenQuestion(StrEnum):
-    """欠定项的种类 —— 报告里要明确告诉用户"缺什么"（§2 目标 4）。"""
-
-    MISSING_DIMENSION = "缺尺寸标注"
-    MISSING_SECTION_POS = "缺剖切位置"
-    AMBIGUOUS_FEATURE = "特征歧义未消解"    # value 与 alternatives 并存
-    MISSING_VIEW = "缺视图"
-    UNREADABLE_NOTE = "标注无法解析"
-    UNKNOWN_PROJECTION = "投影制未确定"      # 第一角/第三角判不出
-    OUT_OF_DOMAIN = "超出解释域"             # 自由曲面等（§12）
-
-
-@dataclass
-class Question:
-    """一个具体的"待确认"条目。"""
-
-    kind: OpenQuestion
-    detail: str
-    view: str = ""
-    evidence: tuple[EvidenceRef, ...] = ()
-    candidates: tuple[Any, ...] = ()
-
-    def __str__(self) -> str:
-        loc = f"[{self.view}] " if self.view else ""
-        return f"{loc}{self.kind.value}: {self.detail}"
 
 
 @dataclass
@@ -154,7 +130,7 @@ class Part:
     features: list[Feature] = field(default_factory=list)
     symmetry: list[Claim[SymmetryOp]] = field(default_factory=list)
     constraints: list[Constraint] = field(default_factory=list)
-    questions: list[Question] = field(default_factory=list)
+    questions: QuestionList = field(default_factory=QuestionList)
 
     def add(self, feature: Feature) -> Feature:
         self.features.append(feature)

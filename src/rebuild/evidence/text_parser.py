@@ -59,6 +59,29 @@ def _normalize_label(t: str) -> str:
     """标签归一化：大写、合并空白。中文不受影响。"""
     return " ".join(t.upper().split())
 
+
+#: 投影制标志 → ProjectionMethod.value。
+#: **判错会让整个零件镜像**（ARCHITECTURE §4.2），所以只认标题栏明写的符号，
+#: 绝不靠"俯视图在上还是在下"反推（本仓库的出图脚本就是非标准布局，
+#: 实测俯视图在主视图**上方**而左视图又放在主视图**右方**）。
+PROJECTION_LABELS: dict[str, str] = {
+    "第一角": "first_angle", "第一角画法": "first_angle", "第一角投影": "first_angle",
+    "FIRST ANGLE": "first_angle", "FIRST-ANGLE": "first_angle",
+    "第三角": "third_angle", "第三角画法": "third_angle", "第三角投影": "third_angle",
+    "THIRD ANGLE": "third_angle", "THIRD-ANGLE": "third_angle",
+}
+
+
+def find_projection(text: str) -> str:
+    """从文字里找投影制标志；找不到返回 ""。长标志优先（取最长匹配）。"""
+    norm = _normalize_label(text)
+    hit = ""
+    for key in PROJECTION_LABELS:
+        if key in norm and len(key) > len(hit):
+            hit = key
+    return PROJECTION_LABELS[hit] if hit else ""
+
+
 #: 剖切种类关键词。长词在前 —— 匹配时按顺序试，避免"全剖"吃掉"纵向全剖"。
 CUT_KINDS: tuple[str, ...] = (
     "纵向全剖", "横向全剖", "旋转剖", "阶梯剖", "复合剖", "斜剖",
@@ -98,6 +121,7 @@ class TextKind(StrEnum):
     VIEW_LABEL = "view_label"          # 主视图 / 俯视图 / …
     SECTION_TITLE = "section_title"    # B—B 横剖 x=… （穿 r… 孔轴）
     SECTION_MARKER = "section_marker"  # 单个 "B—B"（剖切线两端的标记）
+    PROJECTION = "projection"          # 第一角/第三角画法标志（标题栏）
     NOTE = "note"                      # 其它带数值的技术要求
     PLAIN = "plain"                    # 纯文字，无可抽取信息
     UNKNOWN = "unknown"
@@ -140,6 +164,7 @@ class ParsedText:
     layer: str = ""
     kind: TextKind = TextKind.UNKNOWN
     view_type: str = ""                      # VIEW_LABEL 时的 ViewType.value
+    projection: str = ""                     # PROJECTION 时的 ProjectionMethod.value
     cut: CutSpec | None = None
     #: NOTE 时抽到的所有数值对：("φ", 17.0) / ("r", 8.0) / ("±", 0.1) / ("x", 121.89) …
     values: tuple[tuple[str, float], ...] = ()
@@ -210,7 +235,13 @@ def parse_text(
         return ParsedText(handle, raw, x, y, layer,
                           TextKind.SECTION_TITLE, cut=cut, leftover=cut.raw)
 
-    # 3) 其它带数值的文字 ⇒ NOTE
+    # 3) 投影制标志（标题栏）—— 判错会让整个零件镜像，只认明写的符号
+    proj = find_projection(t)
+    if proj:
+        return ParsedText(handle, raw, x, y, layer,
+                          TextKind.PROJECTION, projection=proj)
+
+    # 4) 其它带数值的文字 ⇒ NOTE
     values = _extract_values(t)
     if values:
         return ParsedText(handle, raw, x, y, layer, TextKind.NOTE, values=values)

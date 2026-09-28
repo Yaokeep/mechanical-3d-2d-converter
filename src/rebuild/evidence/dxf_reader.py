@@ -148,12 +148,13 @@ def read_dxf(path: str | Path) -> Drawing:
             pass
         drawing.evidence.append(Evidence(
             handle=ref, kind=Kind.HATCH, geom=_hatch_bbox_geom(e),
-            role=Claim(Role.HATCH_BOUNDARY, "convention:hatch", Tier.CONVENTION, (ref,)),
+            role=Claim(Role.HATCH_FILL, "convention:hatch", Tier.CONVENTION, (ref,)),
             layer=e.dxf.layer, linetype="", pattern=pattern,
         ))
-        # 边界路径单独入账 —— 剖面材料信号来自这里（v0.6.15 的 HATCH 通道）
+        # 边界边单独入账，kind=EDGE（它确实是边，要参与视图包围盒）——
+        # 剖面材料信号来自这里（v0.6.15 的 HATCH 通道）
         for geom in _hatch_boundary_geoms(e):
-            add_geom(e, geom, Kind.HATCH, e.dxf.layer, "",
+            add_geom(e, geom, Kind.EDGE, e.dxf.layer, "",
                      role_override=Claim(Role.HATCH_BOUNDARY,
                                          "convention:hatch", Tier.CONVENTION, (ref,)))
 

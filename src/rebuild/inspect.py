@@ -22,15 +22,44 @@ if __package__ in (None, ""):
 
 from src.rebuild.evidence.dxf_reader import read_dxf_safe   # noqa: E402
 from src.rebuild.evidence.text_parser import TextKind       # noqa: E402
-from src.rebuild.report import evidence_report, explain     # noqa: E402
+from src.rebuild.report import (                            # noqa: E402
+    evidence_report,
+    explain,
+    views_report,
+)
+from src.rebuild.views import detect_views, type_views      # noqa: E402
 
 
-def _as_json(d) -> dict:
+def _as_json(d, questions=None) -> dict:
     """机器可读输出 —— 供后续阶段与测试消费。"""
     return {
         "path": d.path,
         "counts": d.kind_counts(),
         "layers": d.layers,
+        "views": [
+            {
+                "id": v.id,
+                "type": v.type.value.value if hasattr(v.type.value, "value")
+                        else str(v.type.value),
+                "tier": int(v.type.tier),
+                "settled": v.type.is_settled,
+                "alternatives": [a.value for a in v.type.alternatives],
+                "method": (v.method.value if v.method is not None else None),
+                "n_evidence": len(v.evidence),
+                "n_annotations": len(v.annotations),
+                "bbox": ([v.bbox.xmin, v.bbox.ymin, v.bbox.xmax, v.bbox.ymax]
+                         if v.bbox is not None else None),
+                "cut": ({"label": v.cut.label, "axis": v.cut.cut_axis,
+                         "pos": v.cut.cut_pos, "radius": v.cut.radius}
+                        if v.cut is not None else None),
+            }
+            for v in d.views
+        ],
+        "questions": [
+            {"kind": q.kind.value, "detail": q.detail, "view": q.view,
+             "candidates": list(q.candidates)}
+            for q in (questions or [])
+        ],
         "section_titles": [
             {
                 "handle": str(t.handle), "text": t.text,
@@ -77,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="溯源某个图元 handle")
     ap.add_argument("--dims", action="store_true", help="只列尺寸标注")
     ap.add_argument("--texts", action="store_true", help="只列文字解析结果")
+    ap.add_argument("--views", action="store_true", help="只列视图分离与定性")
     ap.add_argument("--json", action="store_true", help="机器可读输出")
     args = ap.parse_args(argv)
 
@@ -85,8 +115,14 @@ def main(argv: list[str] | None = None) -> int:
         print("[FAIL] 图纸为空或读取失败", file=sys.stderr)
         return 2
 
+    # 视图分离 + 定性：默认一并做掉 —— 这两步只依赖 ezdxf，代价可忽略，
+    # 而"某图元属于哪个视图"是后面所有推理的前提
+    detect_views(drawing)
+    questions = type_views(drawing)
+
     if args.json:
-        print(json.dumps(_as_json(drawing), ensure_ascii=False, indent=2))
+        print(json.dumps(_as_json(drawing, questions), ensure_ascii=False,
+                         indent=2))
         return 0
 
     if args.explain:
@@ -112,7 +148,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{t.kind.value:15} {t.text[:52]:54}{extra}")
         return 0
 
+    if args.views:
+        print(views_report(drawing, questions))
+        return 0
+
     print(evidence_report(drawing))
+    print(views_report(drawing, questions))
     return 0
 
 

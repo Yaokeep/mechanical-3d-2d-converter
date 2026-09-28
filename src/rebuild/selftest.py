@@ -20,8 +20,14 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.rebuild.evidence.dxf_reader import read_dxf                     # noqa: E402
-from src.rebuild.evidence.text_parser import TextKind, parse_text        # noqa: E402
-from src.rebuild.model import Claim, Tier, merge                         # noqa: E402
+from src.rebuild.evidence.model import ViewType                          # noqa: E402
+from src.rebuild.evidence.text_parser import (                           # noqa: E402
+    TextKind,
+    find_projection,
+    parse_text,
+)
+from src.rebuild.model import Claim, OpenQuestion, Tier, merge           # noqa: E402
+from src.rebuild.views import detect_views, type_views                   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -200,6 +206,105 @@ def test_reader() -> None:
     check("B—B 半径 = 25.5", titles["B"].radius == 25.5)
 
 
+# ============ D. 视图分离与定性 ============
+
+def test_views() -> None:
+    section("D. 视图分离与定性")
+    tmp = ROOT / "CAD" / "temp_output"
+    simple = ROOT / "CAD" / "test_simple"
+
+    # D0 投影制标志识别（判错会让整件镜像，故只认明写的符号）
+    check("第三角画法 → third_angle",
+          find_projection("第三角画法") == "third_angle")
+    check("THIRD ANGLE PROJECTION → third_angle",
+          find_projection("THIRD ANGLE PROJECTION") == "third_angle")
+    check("无标志 → 空", find_projection("技术要求") == "")
+    check("'第一角' 字样被认到", find_projection("按第一角绘制") == "first_angle")
+    r = parse_text("第三角画法", "H9", 0.0, 0.0, "")
+    check("投影制文字归一为 PROJECTION",
+          r.kind == TextKind.PROJECTION and r.projection == "third_angle",
+          f"{r.kind.value}/{r.projection}")
+
+    # D1 无标签三视图：布局规则必须推出与带标签图纸一致的主/俯/左
+    d = read_dxf(tmp / "bracket_angker_三视图_v4.dxf")
+    detect_views(d)
+    qs = type_views(d)
+    got = {v.id: v.resolved_type for v in d.views}
+    check("三视图 v4 分离出 3 个视图", len(d.views) == 3, str(len(d.views)))
+    check("三视图 v4 主视图定在 V1", got.get("V1") == ViewType.FRONT,
+          str(got.get("V1")))
+    check("三视图 v4 V0 判为俯视图", got.get("V0") == ViewType.TOP,
+          str(got.get("V0")))
+    check("三视图 v4 V2 判为左视图", got.get("V2") == ViewType.LEFT,
+          str(got.get("V2")))
+    v0 = next(v for v in d.views if v.id == "V0")
+    check("俯/仰歧义必须进备选（不许静默当俯视图）",
+          ViewType.BOTTOM in v0.type.alternatives, str(v0.type.alternatives))
+    check("俯/仰歧义 ⇒ 未定",
+          not v0.type.is_settled)
+    check("无标签图纸必须报投影制未确定",
+          any(q.kind == OpenQuestion.UNKNOWN_PROJECTION for q in qs))
+
+    # D2 视图归属只有一个真相来源：全部图元都能反查到视图
+    assigned = set()
+    for v in d.views:
+        assigned |= set(v.all_handles())
+    unassigned = [e.handle for e in d.evidence if e.handle not in assigned]
+    check("三视图 v4 图元全部归属视图", not unassigned,
+          f"{len(unassigned)} 项未归属")
+    ev0 = next(e for e in d.evidence if e.kind.value == "edge")
+    v = d.view_of(ev0.handle)
+    check("Drawing.view_of 能反查", v is not None)
+    check("view_of 与 View.evidence 一致",
+          v is not None and ev0.handle in v.evidence)
+
+    # D3 带中文标签的剖面图纸：标签是 ANNOTATED，剖面切平面来自文字
+    d2 = read_dxf(tmp / "bracket_angker_图纸_20260922_剖面图.dxf")
+    detect_views(d2)
+    type_views(d2)
+    kinds = {v.resolved_type for v in d2.views}
+    check("剖面图纸 6 个视图", len(d2.views) == 6, str(len(d2.views)))
+    check("主/俯/左/剖 全部定性",
+          {ViewType.FRONT, ViewType.TOP, ViewType.LEFT,
+           ViewType.SECTION} <= kinds, str(kinds))
+    by_type = {v.resolved_type: v for v in d2.views}
+    for label, want in (("主视图", ViewType.FRONT), ("俯视图", ViewType.TOP),
+                        ("左视图", ViewType.LEFT)):
+        v = by_type[want]
+        check(f"{label} 由标签定性且 tier=ANNOTATED",
+              v.type.tier == Tier.ANNOTATED and v.type.is_settled,
+              f"{v.type}")
+    secs = [v for v in d2.views if v.resolved_type == ViewType.SECTION]
+    cut_pos = {v.cut.label: v.cut.cut_pos for v in secs}
+    check("三个剖视图都带切平面位置",
+          cut_pos == {"A": 0.0, "B": 121.89, "C": -18.11}, str(cut_pos))
+    check("剖视图定性依据是剖面标题（不是猜）",
+          all(v.type.method == "note:section_title" for v in secs))
+
+    # D4 英文标签 + 只写 SIDE VIEW 的侧视图（左右未定但要有值可用）
+    d3 = read_dxf(simple / "block_3view.dxf")
+    detect_views(d3)
+    qs3 = type_views(d3)
+    got3 = {v.label_handle: v.resolved_type for v in d3.views}
+    types3 = {v.resolved_type for v in d3.views}
+    check("block_3view 三个视图全定性", None not in got3.values(), str(got3))
+    check("block_3view 得到 主/俯/侧",
+          {ViewType.FRONT, ViewType.TOP} <= types3, str(types3))
+    side = next(v for v in d3.views if v.label_handle is not None
+                and d3.text_by_handle(v.label_handle).view_type == "side")
+    check("只写 SIDE VIEW ⇒ 给出可用值但保留备选",
+          side.resolved_type in (ViewType.LEFT, ViewType.RIGHT)
+          and not side.type.is_settled,
+          str(side.type))
+    check("SIDE VIEW 的左右歧义有对应待确认项",
+          any(q.view == side.id for q in qs3 if q.candidates),
+          str([str(q) for q in qs3]))
+
+    # D5 三视图 v4 无文字 ⇒ 标注数必须为 0（不能凭空造出标签来定性）
+    check("三视图 v4 无任何标注",
+          all(len(v.annotations) == 0 for v in d.views))
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -209,6 +314,7 @@ def main() -> int:
     test_claim()
     test_text_parser()
     test_reader()
+    test_views()
 
     print("\n" + "=" * 72)
     if _failed:

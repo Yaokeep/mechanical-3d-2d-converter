@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from ..model.claim import Claim
+from ..model.claim import Claim, Tier
 from ..model.geom2d import Arc2, BBox2, Circle2, Line2, Point2
 from ..model.ids import EvidenceRef
 
@@ -39,7 +39,8 @@ class Role(StrEnum):
     VISIBLE = "visible"                  # 粗实线：可见轮廓
     HIDDEN = "hidden"                    # 虚线：被遮挡
     AXIS = "axis"                        # 点划线：轴线 / 对称面
-    HATCH_BOUNDARY = "hatch_boundary"    # 剖面线边界
+    HATCH_BOUNDARY = "hatch_boundary"    # 剖面线的**边界边**（是边，参与视图包围盒）
+    HATCH_FILL = "hatch_fill"            # 剖面填充**本体**（无单一几何，只有 provenance）
     BREAK_LINE = "break_line"            # 波浪线 / 双折线：视图断裂
     SECTION_CUT = "section_cut"          # 剖切线（切平面所在位置的粗短线）
     UNKNOWN = "unknown"
@@ -58,6 +59,8 @@ class ViewType(StrEnum):
     SECTION = "section"      # 剖视图
     AUXILIARY = "auxiliary"  # 斜视图
     DETAIL = "detail"        # 局部放大
+    #: 尚未定性 —— views 层已分离出这一簇，但还没判出它是什么视图
+    UNKNOWN = "unknown"
 
 
 class ProjectionMethod(StrEnum):
@@ -70,7 +73,11 @@ class ProjectionMethod(StrEnum):
 
 @dataclass(frozen=True)
 class Evidence:
-    """一个 DXF 图元。**未做解释** —— 只记录 + 一个可被推翻的角色 Claim。"""
+    """一个 DXF 图元。**未做解释** —— 只记录 + 一个可被推翻的角色 Claim。
+
+    视图归属**不在此处**：它是 views 层的结论，只存在 ``View.evidence`` 一处，
+    反查用 ``Drawing.view_of(handle)``。这样"某图元属于哪个视图"只有一个真相来源。
+    """
 
     handle: EvidenceRef
     kind: Kind
@@ -78,7 +85,6 @@ class Evidence:
     role: Claim[Role]
     layer: str = ""
     linetype: str = ""
-    view: str = ""     # 由 views/view_detector.py 回填；空 = 尚未归属
     pattern: str = ""  # HATCH 的填充图案名
 
     @property
@@ -139,7 +145,7 @@ class Dimension:
     p3: Point2 | None = None      # 定义点（defpoint），角度/半径类用
     text_override: str = ""       # 图中覆盖显示的文字（"<>" = 用实测值）
     layer: str = ""
-    view: str = ""
+    # 视图归属不在此处 —— 见 View.annotations（Drawing.view_of 反查）
 
     @property
     def is_overridden(self) -> bool:
@@ -149,12 +155,23 @@ class Dimension:
 
 @dataclass
 class View:
-    """一个视图。frame 是视图局部系 → 图纸系的映射，由 views 层填写。"""
+    """一个视图。
+
+    **视图归属的唯一定义处**：``evidence`` 是几何图元（边/轴线/填充本体），
+    ``annotations`` 是归属到本视图的文字与尺寸。反查用 ``Drawing.view_of()``。
+
+    frame（视图局部系 → 图纸系）由 view_typer 填写；
+    剖视图的切平面信息在 ``cut``（来自剖面标题文字，tier=ANNOTATED）。
+    """
 
     id: str
-    type: Claim[ViewType]
+    type: Claim[ViewType] = field(
+        default_factory=lambda: Claim(ViewType.UNKNOWN, "pending", Tier.GUESS)
+    )
     method: Claim[ProjectionMethod] | None = None
     evidence: list[EvidenceRef] = field(default_factory=list)
+    #: 归属到本视图的文字/尺寸 handle（含剖面标题、剖面标记）
+    annotations: list[EvidenceRef] = field(default_factory=list)
     bbox: BBox2 | None = None
     label_handle: EvidenceRef | None = None
     #: 剖视图专用：切平面信息（由剖面标题文字解析而来）
@@ -163,6 +180,22 @@ class View:
     @property
     def is_section(self) -> bool:
         return bool(self.type.is_settled and self.type.value == ViewType.SECTION)
+
+    @property
+    def resolved_type(self) -> ViewType | None:
+        """**可用的**视图类型；仍属"未定性"（UNKNOWN）才为 None。
+
+        注意与 ``type.is_settled`` 的分工：带备选的值**照样可用**
+        （如"俯视图，但也可能是仰视图"）—— 不确定性由备选承载，
+        该不该因此降级/拒绝是 gate 的事（§3 原则二）。
+        把两者混为一谈会让下游在"有答案但不确定"时拿到 None 而卡住。
+        """
+        if self.type.value == ViewType.UNKNOWN:
+            return None
+        return self.type.value
+
+    def all_handles(self) -> list[EvidenceRef]:
+        return list(self.evidence) + list(self.annotations)
 
 
 @dataclass
@@ -182,6 +215,19 @@ class Drawing:
         for e in self.evidence:
             if e.handle == handle:
                 return e
+        return None
+
+    def text_by_handle(self, handle: str):
+        for t in self.texts:
+            if t.handle == handle:
+                return t
+        return None
+
+    def view_of(self, handle: str) -> View | None:
+        """某图元归属哪个视图。**视图归属的唯一查询入口**。"""
+        for v in self.views:
+            if handle in v.evidence or handle in v.annotations:
+                return v
         return None
 
     def handles(self) -> set[str]:

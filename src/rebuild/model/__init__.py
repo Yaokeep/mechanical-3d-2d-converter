@@ -10,20 +10,19 @@ from .feature_tree import (
     ConstraintType,
     Feature,
     FeatureType,
-    OpenQuestion,
     Part,
-    Question,
     SymmetryOp,
 )
 from .geom import AXIS_BY_NAME, AXIS_X, AXIS_Y, AXIS_Z, Axis3, Point3, Vector3
 from .geom2d import Arc2, BBox2, Circle2, Line2, Point2
 from .ids import ConflictError, EvidenceRef, FeatureId, UnderDetermined, ViewId
+from .questions import OpenQuestion, Question, QuestionList
 
 __all__ = [
     "TIER_LABEL", "Claim", "Tier", "merge",
-    "Constraint", "ConstraintType", "Feature", "FeatureType",
-    "OpenQuestion", "Part", "Question", "SymmetryOp",
+    "Constraint", "ConstraintType", "Feature", "FeatureType", "Part", "SymmetryOp",
     "AXIS_BY_NAME", "AXIS_X", "AXIS_Y", "AXIS_Z", "Axis3", "Point3", "Vector3",
     "Arc2", "BBox2", "Circle2", "Line2", "Point2",
     "ConflictError", "EvidenceRef", "FeatureId", "UnderDetermined", "ViewId",
+    "OpenQuestion", "Question", "QuestionList",
 ]
