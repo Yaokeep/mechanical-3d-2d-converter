@@ -79,11 +79,14 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
                                                # 用户目视标记缺陷的入口（v0.6.18 三缺陷即由此而来）。
                                                # 脚本内路径写死 bracket：换重建结果改 main() 里 read_step 的 _3d.step 路径
 # 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性脚本一律用 `_` 前缀，
-# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；现存 52 个（2026-09-24
-# 计数）分五类：`_probe_*.py` 几何探针（~20 个：_probe_ysec 逐 y 层截面 / _probe_zsec
-# 水平截面 / _probe_tor9 挂耳）、`_diag_*.py` 根因诊断、`_csg_*.py` 代码版本备份、
-# `_dump_*`/`_draw_*` 截面叠加工具链（见下方"截面叠加图"节）、`_analyze_*`/`_dump_ear`
-# 挂耳分析及 `_sheet_strip`/`_verify_drawing`/`_closeloop_check` 等杂项。
+# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；现存 67 个（2026-09-28
+# 计数）分五类：`_probe_*.py` 几何探针（34 个：_probe_ysec 逐 y 层截面 / _probe_zsec
+# 水平截面 / _probe_tor9 挂耳 / _probe_gap145 挂耳间隙）、`_diag_*.py` 根因诊断（14）、
+# `_csg_*.py` 代码版本备份、`_dump_*`/`_draw_*` 截面叠加工具链（见下方"截面叠加图"节）、
+# `_analyze_*`/`_dump_ear` 挂耳分析及杂项。其中两个常用：
+# `_run_rebuild.py` 受控实验/基线重跑（直接调 convert_dxf_to_3d，不经 CLI、不触发
+# SW 导入——单靶子重跑首选）、`_sw_show.py` 把 STEP 导入 SW 留给用户看（不调
+# disconnect()，绕开"收尾关活动文档"问题）。
 # 正式修复应落在 dxf_to_3d_general.py 等主脚本
 
 # 截面叠加图（"图形识别"排查链，两段式——cad-occt 无 matplotlib，默认 python 无 OCC）
@@ -146,7 +149,7 @@ conda install -c conda-forge pythonocc-core=7.7.2
 pip install -r requirements.txt
 ```
 
-实际存在的三个解释器（2026-09-22 复测，PyQt6/pytest 仍三者皆无；选错解释器是最常见的时间浪费）：
+实际存在的三个解释器（2026-09-28 复测，PyQt6/pytest 仍三者皆无；选错解释器是最常见的时间浪费）：
 
 | 解释器 | OCC | ezdxf | pywin32 | PyQt6 | ruff | pytest | 用途 |
 |--------|-----|-------|---------|-------|------|--------|------|
@@ -383,7 +386,7 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   `main_window.py:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
   + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
   `dxf_to_sw_features.py` 的 docstring 与结尾 print）。
-  ⚠️ **tag 落后 HEAD**：`git tag -f v0.6.19 HEAD` 前移后再 push 即可对齐。
+  （2026-09-28 核对：tag 已与 HEAD 对齐，git describe 返回 v0.6.19）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。
