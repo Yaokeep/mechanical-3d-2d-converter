@@ -305,6 +305,170 @@ def test_views() -> None:
           all(len(v.annotations) == 0 for v in d.views))
 
 
+# ============ E. 验证层 ============
+
+def _spans(triple: tuple[float, float, float], tier: Tier = Tier.PROJECTION
+           ) -> dict:
+    """造一个齐备的 Expected.spans（三轴各一个已定的 Claim）。"""
+    return {
+        a: Claim(triple[i], f"test:{a}", tier, evidence=("E1",))
+        for i, a in enumerate(("x", "y", "z"))
+    }
+
+
+def test_verify() -> None:
+    section("E. 验证层（图纸判模型）")
+    from src.rebuild.verify import (
+        RATIO_TOL,
+        Comparison,
+        Expected,
+        Verdict,
+        compare,
+        coverage,
+        decide,
+        expect_from_drawing,
+    )
+    from src.rebuild.verify.compare import _combine
+    tmp = ROOT / "CAD" / "temp_output"
+
+    # E0 _combine 的返回契约 —— 一致时报"说明"、冲突时才报 Question。
+    #    两者都是字符串，混淆过一次（agree 路径返回裸 str 塞进 Question 位）
+    #    会让全部 verify 崩在 QuestionList.add 上，故把形状锁住。
+    a = Claim(203.300, "view:V0.u", Tier.PROJECTION, evidence=("EA",))
+    b = Claim(203.301, "view:V1.u", Tier.PROJECTION, evidence=("EB",))
+    merged, note, q = _combine([a, b], "x")
+    check("_combine 一致 ⇒ 无 Question", q is None, repr(q))
+    check("_combine 一致 ⇒ 有说明且为 str", isinstance(note, str) and bool(note),
+          repr(note))
+    check("_combine 一致 ⇒ 取均值且算已定",
+          abs(merged.value - 203.3005) < 1e-6 and merged.is_settled,
+          f"{merged.value} settled={merged.is_settled}")
+    merged2, note2, q2 = _combine(
+        [Claim(51.0, "view:V2.v", Tier.PROJECTION, evidence=("EC",)),
+         Claim(67.0, "view:V0.v", Tier.PROJECTION, evidence=("ED",))], "y")
+    check("_combine 冲突 ⇒ 报 Question", q2 is not None and isinstance(note2, str))
+    # merge 的语义：值取其中一个（可用的那个），另一个进备选 —— 备选里装的是
+    # **落选者**，不是全部候选，故 51.0 与 67.0 二者恰有一个在 alternatives 里
+    check("_combine 冲突 ⇒ 值仍可用但保留备选",
+          not merged2.is_settled and merged2.value in (51.0, 67.0)
+          and (merged2.alternatives == (67.0,) if merged2.value == 51.0
+               else merged2.alternatives == (51.0,)),
+          f"{merged2.value} / {merged2.alternatives}")
+
+    # E1 三视图 v4：期望三向尺寸＝图纸包围盒（本项是阶段 0 的尺子本身）
+    d = read_dxf(tmp / "bracket_angker_三视图_v4.dxf")
+    detect_views(d)
+    type_views(d)
+    ex = expect_from_drawing(d)
+    check("三视图 v4 给全三向尺寸", not ex.missing, str(ex.missing))
+    t = ex.triple() or (0, 0, 0)
+    check("三视图 v4 期望 X≈203.30", abs(t[0] - 203.30) < 0.05, f"{t[0]:.3f}")
+    check("三视图 v4 期望 Y=51.00", abs(t[1] - 51.0) < 0.05, f"{t[1]:.3f}")
+    check("三视图 v4 期望 Z=44.00", abs(t[2] - 44.0) < 0.05, f"{t[2]:.3f}")
+    check("期望尺寸 tier=PROJECTION（不是猜的）",
+          all(c.tier == Tier.PROJECTION for c in ex.spans.values()),
+          str({a: c.tier.name for a, c in ex.spans.items()}))
+    check("每路观测都带依据（无依据不入 Claim）",
+          all(c.evidence for c in ex.spans.values()))
+    check("三视图 v4 两路来源一致（不报视图歧义）",
+          not ex.questions.by_kind(OpenQuestion.AMBIGUOUS_VIEW),
+          str([str(q) for q in ex.questions]))
+
+    # E2 剖面图纸：剖切线画在视图外且两端伸出，若混入包围盒会把 Y 从 51 撑到 67。
+    #    这条是回归锚 —— 视图分离里"排除 Role.SECTION_CUT"那条规则的守卫。
+    d2 = read_dxf(tmp / "bracket_angker_图纸_20260922_剖面图.dxf")
+    detect_views(d2)
+    type_views(d2)
+    ex2 = expect_from_drawing(d2)
+    t2 = ex2.triple() or (0, 0, 0)
+    check("剖面图纸期望 Y=51.00（剖切线未撑大包围盒）",
+          abs(t2[1] - 51.0) < 0.05, f"{t2[1]:.3f}")
+    sec_ids = {v.id for v in d2.views
+               if v.resolved_type == ViewType.SECTION}
+    check("剖视图不参与期望尺寸（只画剖到的一块）",
+          sec_ids.isdisjoint({vid for vid, _, _ in ex2.observations}),
+          str(sorted(sec_ids)))
+
+    # E3 判决的四种走向（纯合成，不读文件）
+    good = (204.289, 51.0, 44.0)
+    g_ok = decide(compare(Expected(spans=_spans((203.30, 51.0, 44.0))), good),
+                  Expected(spans=_spans((203.30, 51.0, 44.0))))
+    check("尺寸齐 + 比例符 ⇒ ACCEPT", g_ok.verdict == Verdict.ACCEPT,
+          g_ok.verdict.value)
+
+    ex_rej = Expected(spans=_spans((203.30, 51.0, 44.0)))
+    g_rej = decide(compare(ex_rej, (204.3, 1.92, 44.0)), ex_rej)
+    check("单轴被拉伸 ⇒ REJECT", g_rej.verdict == Verdict.REJECT,
+          f"{g_rej.verdict.value} {g_rej.reasons}")
+    check("REJECT 的理由点名了那条轴",
+          any("Y" in r for r in g_rej.reasons), str(g_rej.reasons))
+
+    ex_conf = Expected(spans=_spans((203.30, 51.0, 44.0)))
+    ex_conf.spans["y"] = merge([
+        Claim(51.0, "view:V2.v", Tier.PROJECTION, evidence=("E1",)),
+        Claim(67.0, "view:V0.v", Tier.PROJECTION, evidence=("E2",)),
+    ])
+    g_conf = decide(compare(ex_conf, good), ex_conf)
+    check("图纸两路来源冲突 ⇒ NEEDS_CONFIRMATION（不是 ACCEPT）",
+          g_conf.verdict == Verdict.NEEDS_CONFIRMATION, g_conf.verdict.value)
+
+    ex_none = Expected()
+    g_err = decide(compare(ex_none, None), ex_none, measured_ok=False,
+                   measure_error="STEP 读不了")
+    check("模型量不到 ⇒ ERROR（不是通过）",
+          g_err.verdict == Verdict.ERROR, g_err.verdict.value)
+
+    # E4 主判据必须尺度无关：整体缩比照样 ACCEPT，单轴拉伸必须毙
+    ex_s = Expected(spans=_spans((203.30, 51.0, 44.0)))
+    c_scale = compare(ex_s, (203.30 * 2, 51.0 * 2, 44.0 * 2))
+    check("图纸与模型差 2 倍缩比 ⇒ 比例仍通过", c_scale.ratio_ok,
+          str(c_scale.failing_axes))
+    check("缩比时隐含比例尺一致", c_scale.scale_uniform
+          and all(abs(v - 2.0) < 1e-9 for v in c_scale.implied_scale.values()),
+          str(c_scale.implied_scale))
+    c_stretch = compare(ex_s, (203.30, 51.0 * 1.2, 44.0))
+    check("单轴 +20% 拉伸 ⇒ 落在容差外", c_stretch.failing_axes == ["y"],
+          str(c_stretch.failing_axes))
+    check("比例容差是 5%", abs(RATIO_TOL - 0.05) < 1e-12, str(RATIO_TOL))
+
+    # E5 读取覆盖率：两张靶子都必须 100% 归位（掉下去就是丢东西了）
+    for name, dd in (("三视图 v4", d), ("剖面图纸", d2)):
+        cov = coverage(dd)
+        check(f"{name} 图元 100% 归位", cov.evidence_ratio == 1.0
+              and not cov.orphans, cov.summary())
+        check(f"{name} 文字 100% 分类", cov.text_ratio == 1.0,
+              str(cov.unparsed))
+        check(f"{name} 角色依据分布非空", bool(cov.tier_hist),
+              str(cov.tier_hist))
+
+    # E6 依赖分层：verify 的 __init__ 不许把 OCC 拉进来
+    #    （默认 python 没有 OCC，本文件能在默认 python 下跑完即证明了这一点）
+    check("verify 包不拉入 step_probe", "src.rebuild.verify.step_probe"
+          not in sys.modules, "被 __init__ 导出了")
+    check("verify 包不拉入 OCC", not [m for m in sys.modules
+                                     if m.split(".")[0] == "OCC"],
+          str([m for m in sys.modules if m.split(".")[0] == "OCC"][:3]))
+    check("Comparison 可独立构造（报告层可用）",
+          Comparison(None, None).ratio_ok)
+
+    # E7 **该拒绝时必须拒绝**：单视图、零尺寸标注的极简靶子，第三向尺寸
+    #    根本不在图上（plate 的图面 4 线 2 圆，文字还写着与实况不符的 100x60x10）
+    #    ⇒ 必须 NEEDS_CONFIRMATION，不许"照常输出"。老管线在这几个靶子上
+    #    之所以"对"，是因为靶子是人按已知答案画的，不是它读出来的。
+    single = read_dxf(ROOT / "CAD" / "test_simple" / "plate_100x60.dxf")
+    detect_views(single)
+    type_views(single)
+    ex_single = expect_from_drawing(single)
+    check("单视图靶子：三向尺寸给不全",
+          set(ex_single.missing) == {"x", "y", "z"}, str(ex_single.spans))
+    g_single = decide(compare(ex_single, (100.0, 60.0, 20.0)), ex_single)
+    check("单视图靶子 ⇒ NEEDS_CONFIRMATION（不猜厚度）",
+          g_single.verdict == Verdict.NEEDS_CONFIRMATION,
+          g_single.verdict.value)
+    check("拒判的理由点名缺视图",
+          any("缺" in r for r in g_single.reasons), str(g_single.reasons))
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -315,6 +479,7 @@ def main() -> int:
     test_text_parser()
     test_reader()
     test_views()
+    test_verify()
 
     print("\n" + "=" * 72)
     if _failed:

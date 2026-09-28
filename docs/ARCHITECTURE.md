@@ -418,7 +418,7 @@ DXF ──evidence──→ Evidence[] + View[]                        【第1�
 |---|---|
 | **交付物** | `model/claim.py`、`model/feature_tree.py`（最小）、`evidence/*`、`views/view_detector.py`、`verify/{compare,coverage,gate}.py`、`report.py`、CLI `python -m src.rebuild.inspect <dxf>`、CLI `python -m src.rebuild.verify_legacy <dxf> <step>` |
 | **关键** | 验证器先**指向现有 `dxf_to_3d_general.py` 的输出**，不写新重建器 |
-| **验收** | ① `verify_legacy` 在 **spoon 上必须 REJECT**（现在静默成功——这是验证器是否真的在工作的判据）<br>② 在 bracket 三视图 + 剖面图纸上 ACCEPT，报告的覆盖率与 CLAUDE.md 基线自洽<br>③ 6/6 回归用例 ACCEPT<br>④ `inspect` 在剖面图纸上**读出 `B—B x=121.89 r25.5`**（现管线正则丢弃的那条） |
+| **验收** | ① `verify_legacy` 在 **spoon 上必须 REJECT**（现在静默成功——这是验证器是否真的在工作的判据）<br>② 在 bracket 三视图 + 剖面图纸上 ACCEPT，报告的覆盖率与 CLAUDE.md 基线自洽<br>③ 6 个回归用例上判决与图纸信息量相符（2026-09-28 实测修正，原写"6/6 ACCEPT"是把靶子当成真图纸了）——只有 `block_3view` 有三视图且对齐 ⇒ **ACCEPT**；其余 5 个（`plate_100x60` 4 线 2 圆、`l_bracket` 6 线、`flange_d80` 6 圆 2 线、`图形练习` 16 线、`法兰练习` 8 线 5 圆）都是**单视图、零尺寸标注**的极简 DXF，第三向尺寸**根本不在图上**（`plate` 的文字还是 "PLATE 100x60x10"，与黄金厚度 20 不符）⇒ 正确判决是 **NEEDS_CONFIRMATION**。这条恰恰是目标 4「知道什么时候该拒绝」的样本：老管线知道答案是因为人写靶子时心里有，不是因为它读出来了<br>④ `inspect` 在剖面图纸上**读出 `B—B x=121.89 r25.5`**（现管线正则丢弃的那条） |
 | **为什么先做** | 拿到：验证器被证可用 + 免基准回归线架 + 当前管线失败模式的量化地图。然后才在新验证器盯着的情况下重写重建器 |
 
 ### 阶段 1：视图 + 对应关系

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..evidence.model import Dimension, Drawing, Evidence, Kind, View
+from ..evidence.model import Dimension, Drawing, Evidence, Kind, Role, View
 from ..evidence.text_parser import ParsedText, TextKind
 from ..model.geom2d import BBox2, Point2
 
@@ -119,10 +119,16 @@ def detect_views(d: Drawing, params: DetectParams | None = None) -> list[View]:
     """
     p = params or DetectParams()
 
-    # ---- 参与分离的几何：边（含 HATCH 边界）；排除轴线与填充本体 ----
-    # HATCH 本体的 geom 只是个占位对角线段（真实形状在它的边界图元里），
-    # 若让它参与聚类会把视图包围盒撑成对角线 —— 故按 kind 排除。
-    geom = [e for e in d.evidence if e.kind == Kind.EDGE]
+    # ---- 参与分离的几何：轮廓边与 HATCH 边界 ----
+    # 排除三类，各有理由：
+    #  - Kind.HATCH：本体的 geom 只是个占位对角线段（真实形状在它的边界图元里），
+    #    让它参与会把视图包围盒撑成对角线
+    #  - Role.SECTION_CUT：剖切线画在视图**外**（两端伸出并带箭头），
+    #    实测把 bracket 俯视图的纵向尺寸从 51 撑到 67（+31%）
+    #  - Kind.AXIS / Kind.BREAK：轴线的 kind 不是 EDGE，天然排除
+    # 这些图元仍归属到视图（见 _assign），只是不参与定包围盒。
+    geom = [e for e in d.evidence
+            if e.kind == Kind.EDGE and e.role.value != Role.SECTION_CUT]
     if not geom:
         d.views = []
         return []
@@ -158,24 +164,25 @@ def detect_views(d: Drawing, params: DetectParams | None = None) -> list[View]:
             bbox=_bbox_of(members),
         ))
 
-    _assign(d, views)
+    _assign(d, views, clustered={m.handle for m in geom})
 
     d.views = views
     return views
 
 
-def _assign(d: Drawing, views: list[View]) -> None:
-    """把非边证据归属到视图：轴线/填充 → evidence，文字/尺寸 → annotations。
+def _assign(d: Drawing, views: list[View], clustered: set[str]) -> None:
+    """把未参与聚类的图元归属到视图。
 
+    归类：轴线 / 填充本体 / 剖切线 → ``evidence``；文字 / 尺寸 → ``annotations``。
     归属判据是**位置**（几何邻近），不是图层或命名 —— 与分离阶段同一套信号。
     """
     if not views:
         return
 
-    # ---- 轴线与填充本体：属于某个视图的图元 ----
-    # EDGE 在分离阶段已归位，跳过；其余按自身几何中心归属
+    # ---- 轴线、填充本体、剖切线：属于某个视图的图元 ----
+    # 它们不参与聚类（会撑大包围盒或跨视图），故按自身几何中心就近归属
     for e in d.evidence:
-        if e.kind == Kind.EDGE:
+        if e.handle in clustered:
             continue
         v = _nearest_view(views, _center(e.exact_bbox))
         if v is not None:
