@@ -13,9 +13,11 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -46,6 +48,7 @@ from src.rebuild.model.feature_tree import (                             # noqa:
     ConstraintType,
     Feature,
     FeatureType,
+    Part,
 )
 from src.rebuild.model.geom import Axis3, Point3, Vector3                # noqa: E402
 from src.rebuild.model.ids import FeatureId                              # noqa: E402
@@ -67,6 +70,7 @@ from src.rebuild.views import (                                          # noqa:
     detect_views,
     type_views,
 )
+from src.rebuild.pipeline import rebuild, understand                     # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -955,7 +959,8 @@ def test_features() -> None:
     # ---- H5 bracket：剖面标题进树 + 通孔判定 ----
     _, conv_b, corr_b, rep_b = _recognized(_SEC_DWG)
     f1 = next((f for f in rep_b.part.features if f.id == FeatureId(1)), None)
-    check("bracket 剖面图纸识别出 6 个特征", len(rep_b.part.features) == 6,
+    check("bracket 剖面图纸识别出 8 个特征（同心圆不合并后 +2，见 G 段说明）",
+          len(rep_b.part.features) == 8,
           str([(str(f.id), f.type.value) for f in rep_b.part.features]))
     base = rep_b.part.features[0]
     check("基体=沿 z 拉伸 44（最薄向）",
@@ -970,12 +975,15 @@ def test_features() -> None:
     check("有特征直接来自剖面标题（note:section_title）",
           any(f.type.method == "note:section_title"
               for f in rep_b.part.features))
-    f2 = next((f for f in rep_b.part.features if f.id == FeatureId(2)), None)
-    check("#2 深 22 < 材料厚 44 ⇒ 判为盲孔（DERIVED，非 GUESS）",
+    f2 = next((f for f in rep_b.part.features if f.id == FeatureId(3)), None)
+    check("#3 深 22 < 材料厚 44 ⇒ 判为盲孔（DERIVED，非 GUESS）",
           f2 is not None and f2.params["through"].value is False
           and f2.params["through"].tier is Tier.DERIVED
           and f2.params["through"].method == "derived:depth_vs_material",
-          str(f2.params["through"]) if f2 else "无 #2")
+          str(f2.params["through"]) if f2 else "无 #3")
+    check("同轴同心圆各建一个特征（r25.5 凸台里再有一个 r15.7 凸台）",
+          any(f.id == FeatureId(2) and abs(f.params["radius"].value - 15.7) < 1e-9
+              for f in rep_b.part.features))
     check("每处孔都有 through（发射器不接受缺参数）",
           all("through" in f.params for f in rep_b.part.features
               if f.type.value == "hole"))
@@ -1006,11 +1014,13 @@ def test_features() -> None:
 
     # ---- H7 关系抽取：等半径/同心成为约束（gate 的输入） ----
     sr = rep_p.solved
-    check("PF60K 四个 r2.75 孔两两等半径（6 条）",
+    eq = [c for c in (sr.constraints if sr else ())
+          if c.type is ConstraintType.EQUAL_RADIUS]
+    check("PF60K 的等半径孔两两成约束（C(4,2)=6 条起）", len(eq) >= 6,
+          f"{len(eq)} 条")
+    check("同轴特征之间抽出共线约束（同心圆不再被合并的连带结果）",
           sr is not None
-          and sum(1 for c in sr.constraints
-                  if c.type is ConstraintType.EQUAL_RADIUS) == 6,
-          str(sr.constraints if sr else "无求解报告"))
+          and any(c.type is ConstraintType.COLLINEAR for c in sr.constraints))
     check("阵列与子孔同心",
           sr is not None
           and any(c.type is ConstraintType.CONCENTRIC for c in sr.constraints))
@@ -1030,6 +1040,216 @@ def test_features() -> None:
           rep_b.solved is not None and rep_p.solved is not None)
 
 
+# ---- 阶段 4：汇流（理解层；发射层要 OCC/SW，见 emit 自己的 --demo） ----
+
+_FIXTURES = {
+    "block_3view": "test_simple/block_3view.dxf",
+    "plate_100x60": "test_simple/plate_100x60.dxf",
+    "l_bracket": "test_simple/l_bracket.dxf",
+    "flange_d80": "test_simple/flange_d80.dxf",
+    "图形练习": "图形练习.dxf",
+    "法兰练习": "法兰练习.dxf",
+}
+
+
+def _fixture(name: str) -> Path:
+    return ROOT / "CAD" / _FIXTURES[name]
+
+
+def test_pipeline() -> None:
+    section("I. 汇流（阶段 4，理解层）")
+
+    # ---- I1 六个回归用例逐张跑通（读→…→特征树），不在理解层抛异常 ----
+    trees: dict[str, Any] = {}
+    for name in _FIXTURES:
+        p = _fixture(name)
+        if not p.exists():
+            check(f"{name} 存在", False, str(p))
+            continue
+        d, _conv, _corr, rep = understand(p)
+        trees[name] = rep
+        check(f"{name} 得出特征树", rep.part is not None)
+    # 单视图：看得见的照常量，看不见的降成 GUESS 并拦路 —— 既不装作知道，
+    # 也不因为缺一维就把整张图丢掉（旧管线在此处直接当已知量用）
+    pt = trees["plate_100x60"]
+    check("plate_100x60 单视图仍认出轮廓 100×60 + 两个 Ø10 孔",
+          len(pt.part.features) == 3
+          and pt.part.features[0].params["length"].tier is Tier.GUESS,
+          str([(str(f.id), f.type.value) for f in pt.part.features]))
+    check("厚度未知 ⇒ 拦路的缺尺寸待确认项",
+          any(q.kind is OpenQuestion.MISSING_DIMENSION for q in pt.questions),
+          str([q.kind.value for q in pt.questions]))
+
+    # ---- I2 block_3view：树与黄金值**结构**一致 ----
+    rep = trees["block_3view"]
+    base = rep.part.features[0]
+    prof = base.params["profile"].value
+    ext = (max(a for a, _ in prof), max(b for _, b in prof))
+    check("基体 100×60 沿 y 拉伸 30（= 黄金 bbox 100/30/60）",
+          base.params["dir"].value == "y"
+          and base.params["length"].value == 30.0
+          and ext == (60.0, 100.0),          # dir=y 时平面基 (z,x) ⇒ 60×100
+          f"{ext} {prof}")
+    holes = [f for f in rep.part.features if f.type.value == "hole"]
+    check("4 个 r5 孔（两块视图各 2 个）",
+          len(holes) == 4 and all(abs(f.params["radius"].value - 5.0) < 1e-9
+                                  for f in holes), str(len(holes)))
+    zs = sorted(round(f.axis.value.origin.x) for f in holes
+                if round(f.axis.value.direction.z) == 1)
+    ys = sorted(round(f.axis.value.origin.x) for f in holes
+                if round(f.axis.value.direction.y) == 1)
+    check("沿 z 的两孔在 x=30/70", zs == [30, 70], str(zs))
+    check("沿 y 的两孔在 x=30/70", ys == [30, 70], str(ys))
+    check("四孔都是通孔（无底轮廓 ⇒ 惯例取通孔，备选盲孔）",
+          all(f.params["through"].value is True for f in holes)
+          and all(False in f.params["through"].alternatives for f in holes))
+
+    # ---- I3 树能**算回**黄金体积（这才是"解释得通"的硬判据） ----
+    import math
+    def _thick(axis_name: str) -> float:
+        """基体在某轴上的材料厚度（与 recognizer._material_extent 同口径）。"""
+        b1, b2 = {"x": ("y", "z"), "y": ("z", "x"), "z": ("x", "y")}[
+            base.params["dir"].value]
+        prof = base.params["profile"].value
+        return {base.params["dir"].value: base.params["length"].value,
+                b1: max(a for a, _ in prof), b2: max(b for _, b in prof)}[axis_name]
+
+    box = 100.0 * 30.0 * 60.0
+    cut = sum(math.pi * (f.params["radius"].value ** 2)
+              * _thick("z" if round(f.axis.value.direction.z) == 1 else "y")
+              for f in holes)
+    overlap = 2 * 16 * 5.0 ** 3 / 3.0          # 沿 y 与沿 z 的孔互相穿过
+    vol = box - cut + overlap
+    gold = 167196.2
+    check(f"树算出的体积 {vol:.1f} ≈ 黄金 {gold}（±1）",
+          abs(vol - gold) <= 1.0, f"{vol:.2f}")
+
+    # ---- I4 rebuild()：发射失败不算理解失败，两类结果分开记账 ----
+    r = rebuild(ROOT / "CAD" / "test_simple" / "block_3view.dxf")
+    check("不给 --step/--sldprt 时不发模型、也不报错",
+          r.ok and r.step is None and r.sldprt is None and not r.errors,
+          str(r.errors))
+    check("未知投影制**不**算拦路项（镜像已在视图坐标系里处理）",
+          all(q.kind is not OpenQuestion.UNKNOWN_PROJECTION
+              for q in r.blocking()),
+          str([q.kind.value for q in r.blocking()]))
+    js = json.loads(r.to_json())
+    check("to_json 可解析且特征数一致",
+          len(js["features"]) == len(r.part.features)
+          and js["source"].endswith("block_3view.dxf"))
+
+    # ---- I5 发射闸门：**类型未定也算拦路**（发射器据此拒绝） ----
+    # 这是"知道该拒绝"的硬判据：孔还是凸台没定的特征，radius/depth 却可能是
+    # 实打实带证据的 —— 只查参数会让闸门形同虚设（实测曾如此）。
+    check("block_3view 的孔类型未定 ⇒ 报成拦路的歧义",
+          any(q.kind is OpenQuestion.AMBIGUOUS_FEATURE
+              and "#1.type" in q.detail for q in r.blocking()),
+          str([q.detail[:40] for q in r.blocking()]))
+    r2 = rebuild(ROOT / "CAD" / "test_simple" / "block_3view.dxf",
+                 step=ROOT / "CAD" / "temp_output" / "_never.step")
+    check("有拦路项时默认**不发射**（并说明为什么、怎么放行）",
+          r2.step is None and not r2.errors
+          and any("force" in n for n in r2.notes),
+          str(r2.notes))
+
+    # ---- I6 回转体基体上的孔也要判出通孔（flange_d80 曾整批漏判） ----
+    f80 = trees["flange_d80"]
+    holes80 = [f for f in f80.part.features if f.type.value == "hole"]
+    r8 = [f for f in holes80 if abs(f.params["radius"].value - 4.0) < 1e-9]
+    check("flange_d80 五个孔（Ø40 中心孔 + 四个 Ø8）都挂上了 through",
+          len(holes80) == 5 and len(r8) == 4
+          and all("through" in f.params for f in holes80),
+          str([(str(f.id), sorted(f.params)) for f in holes80]))
+    pat = next((f for f in f80.part.features if f.type.value == "pattern"), None)
+    check("阵列中心记在 placement 上（发射器即从此取，不再另有 center 参数）",
+          pat is not None and "center" not in pat.params
+          and isinstance(pat.placement.value, Point3),
+          str(pat.params) if pat else "没有阵列特征")
+
+    # ---- I7 发射器里**不碰 SW/OCC 的那部分**逻辑（阶段 4） ----
+    # `sw_builder` 只在 `_connect()` 里 import pywin32，模块本身是纯的 ⇒
+    # 阵列覆盖判据、克隆标记、特征命名、缺参记账全都能在这里验，
+    # 不必等 SW 在跑（那部分归 `run_rebuild_acceptance.py --sw`）。
+    import contextlib
+    import io
+
+    from .emit import sw_builder as SWB
+
+    # ① 阵列实例已被逐个孔占掉 ⇒ 不再重复发射（不判就会在同一处切两刀，
+    #    SW 的 `FeatureCut3` 返回 None，整棵树发射失败 —— flange_d80 实测死在这）
+    plan = SWB.pattern_plan(pat, f80.part)
+    covered_ids = {str(q.id) for q in f80.part.features if q.type.value == "hole"}
+    check("flange_d80 的 4 处阵列实例里 3 处已被逐个孔建出 ⇒ 阵列不再新建几何",
+          not plan.positions and len(plan.covered) == 3
+          and set(plan.covered) <= covered_ids,
+          f"positions={len(plan.positions)} covered={plan.covered}")
+
+    # ② 反过来：没被占掉的实例必须照发（否则就是静默少建）
+    part = Part()
+    part.add(Feature(
+        id=FeatureId(0), type=Claim(FeatureType.REVOLVE, "t", Tier.GUESS),
+        params={"angle_deg": Claim(360.0, "t", Tier.GUESS),
+                "dir": Claim("z", "t", Tier.GUESS),
+                "radius_profile": Claim([(0.0, 50.0), (10.0, 50.0)], "t", Tier.GUESS)},
+        axis=Claim(Axis3(Point3(0, 0, 0), Vector3(0, 0, 1)), "t", Tier.GUESS)))
+    part.add(Feature(
+        id=FeatureId(1), type=Claim(FeatureType.HOLE, "t", Tier.GUESS),
+        params={"radius": Claim(4.0, "t", Tier.GUESS),
+                "through": Claim(True, "t", Tier.GUESS),
+                "axial_at": Claim(0.0, "t", Tier.GUESS)},
+        axis=Claim(Axis3(Point3(35.0, 0.0, 0.0), Vector3(0, 0, 1)), "t", Tier.GUESS),
+        depends_on=[FeatureId(0)]))
+    part.add(Feature(
+        id=FeatureId(2), type=Claim(FeatureType.PATTERN, "t", Tier.GUESS),
+        params={"kind": Claim("circular", "t", Tier.GUESS),
+                "count": Claim(6, "t", Tier.GUESS),
+                "child": Claim(1, "t", Tier.GUESS),
+                "start_deg": Claim(0.0, "t", Tier.GUESS)},
+        placement=Claim(Point3(0.0, 0.0, 0.0), "t", Tier.GUESS),
+        depends_on=[FeatureId(0), FeatureId(1)]))
+    p2 = SWB.pattern_plan(part.features[2], part)
+    r_first = (p2.positions[0] - Point3(0.0, 0.0, 0.0)).norm if p2.positions else 0.0
+    check("无人覆盖的阵列照发 5 个实例，且都落在分布圆 r35 上",
+          len(p2.positions) == 5 and not p2.covered
+          and all(abs((q - Point3(0.0, 0.0, 0.0)).norm - 35.0) < 1e-9
+                  for q in p2.positions)
+          and abs(r_first - 35.0) < 1e-9,
+          f"positions={len(p2.positions)} 首个半径={r_first:.3f}")
+
+    # ③ 克隆要能被认出来：SW 树里克隆的切除名字带 `p` 后缀，否则与原件重名
+    ghost = SWB._clone_at(part.features[1], Point3(0.0, 35.0, 0.0), Vector3(0, 0, 1))
+    check("阵列克隆与原件分得开（判据是轴上来源标记 pattern:rotate）",
+          SWB._is_clone(ghost) and not SWB._is_clone(part.features[1]))
+
+    class _Named:                      # 冒充 SW 特征对象，只看它被起了什么名
+        pass
+
+    fake = _Named()
+    SWB._name_feature(fake, ghost, "Cut")
+    SWB._name_feature(_Named(), part.features[1], "Boss")
+    check("克隆命名带 p 后缀（Cut1p vs Cut1）⇒ SW 树能与特征树逐条对",
+          str(fake.Name) == f"Cut{ghost.id}p", str(fake.Name))
+
+    # ④ 缺 `axial_at` 不许静默：0 是默认值不是读数，必须留一行账
+    #    （实测代价：bracket 的凸台全从 z=0 长出、伸出基体 2mm，bbox 46 vs 基准 44）
+    boss_no_ax = Feature(
+        id=FeatureId(9), type=Claim(FeatureType.BOSS, "t", Tier.GUESS),
+        params={"radius": Claim(5.0, "t", Tier.GUESS),
+                "height": Claim(3.0, "t", Tier.GUESS)},
+        axis=Claim(Axis3(Point3(0, 0, 0), Vector3(0, 0, 1)), "t", Tier.GUESS))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        t0 = SWB._axial_at(boss_no_ax)
+    check("boss 没给 axial_at ⇒ 按 0 起但**留账**（不静默）",
+          t0 == 0.0 and "没有 axial_at" in buf.getvalue(), buf.getvalue().strip())
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        t0b = SWB._axial_at(part.features[1])          # 这个孔带了 axial_at=0
+    check("给了 axial_at 就照读数走、不打账",
+          t0b == 0.0 and buf2.getvalue() == "",
+          f"{buf2.getvalue().strip()!r} {part.features[1].params['axial_at']}")
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -1044,6 +1264,7 @@ def main() -> int:
     test_correspondence()
     test_conventions()
     test_features()
+    test_pipeline()
 
     print("\n" + "=" * 72)
     if _failed:

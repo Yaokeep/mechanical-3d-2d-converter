@@ -275,6 +275,16 @@ def solve(part: Part, *, qs: QuestionList | None = None) -> SolveReport:
                 if ((v.tier <= Tier.PROJECTION and (not v.is_settled or not v.evidence))
                     or v.is_guessed)
                 and f"#{f.id}.{k}" not in seen]
+        # **类型**本身没定是比某个参数没定更根本的一件事，得单独算一桩：
+        # `_cyl_claim` 在实线/虚线判不出来时给的是 GUESS+备选（孔还是凸台），
+        # 而它的 radius/depth 可能是实打实 PROJECTION 带证据的 —— 只说参数
+        # 会把它整个漏掉。实测 block_3view 的 4 个 r5 孔：类型未定却一条拦路
+        # 疑问都没有，`blocking()` 因此为空，发射闸门形同虚设。
+        if not f.type.is_settled and f"#{f.id}.type" not in seen:
+            # 文本里带全 `#<id>.type` —— 与参数那条同一套去重约定（上面 `seen`）
+            todo.insert(0, ("type",
+                            f"#{f.id}.type={f.type.value}({f.type.tier.name})，备选 "
+                            f"{[a.value for a in f.type.alternatives]}"))
         if not todo:
             continue
         rep.questions.add(Question(

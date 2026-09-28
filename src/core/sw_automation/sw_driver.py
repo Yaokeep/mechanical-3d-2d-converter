@@ -38,6 +38,7 @@ from .sw_constants import (
     swEndCondBlind,
     swStartSketchPlane,
     swRefPlaneOffset,
+    swRefPlaneOffsetFlip,
     SW_FILLET_OPTIONS,
     swSaveAsCurrentVersion,
     swSaveAsOptions_Silent,
@@ -682,20 +683,28 @@ class SolidWorksDriver:
         offset_mm: float,
         plane_name: str,
     ) -> bool:
-        """从已有基准面创建偏移参考基准面。
+        """从已有基准面创建偏移参考基准面（**正负偏移都支持**）。
 
         ⚠️ V45 验证: InsertRefPlane 必须使用中文基准面名!
            "上视基准面" ✅  "Top Plane" ❌
 
+        ⚠️ **负偏移必须走"翻向位"**（2026-09-28 实测，`_probe_sw_negplane.py`）：
+        `InsertRefPlane(8, −0.110, …)` **不报错**，但会静默把面建在**偏移 0 处**
+        （−50 → SW y=0、−110 → SW z=0）。面错位后特征画到空气里，SW 只回一个
+        `FeatureCut3 返回 None` —— 症状与"草图有问题"一模一样，极难反查
+        （新框架 bracket 就栽在这：基体该在 IR y[80,110]，面落 y=0，孔切空气）。
+        正确姿势 = 正距离 + `swRefPlaneOffsetFlip`(8|256)，实测落点精确对称。
+
         Args:
             base_plane_name: 源基准面名称，如 "上视基准面"。
-            offset_mm: 偏移距离（mm，正值向+方向偏移）。
+            offset_mm: 偏移距离（mm，正负均可用，方向沿源基准面法向）。
             plane_name: 新基准面名称。
 
         Returns:
             bool: 成功返回 True。
         """
-        offset_m = self.mm_to_m(offset_mm)
+        offset_m = self.mm_to_m(abs(offset_mm))
+        constraint = swRefPlaneOffset if offset_mm >= 0.0 else swRefPlaneOffsetFlip
         self.clear_selection()
         if not self.select_plane(base_plane_name):
             logger.error(f"无法选择基准面: {base_plane_name}")
@@ -703,15 +712,17 @@ class SolidWorksDriver:
 
         try:
             plane = self.sw_feat_mgr.InsertRefPlane(
-                swRefPlaneOffset,   # 约束类型 = 偏移距离
-                offset_m,           # 距离 (米)
+                constraint,         # 约束类型 = 偏移距离（负侧加翻向位）
+                offset_m,           # 距离 (米，恒正)
                 0, 0, 0, 0,
             )
             if plane is None:
                 logger.error(f"InsertRefPlane 返回 None (偏移={offset_mm}mm)")
                 return False
             plane.Name = plane_name
-            logger.success(f"  基准面已创建: {plane_name} (偏移 +{offset_mm}mm)")
+            side = "+" if offset_mm >= 0.0 else "−"
+            logger.success(f"  基准面已创建: {plane_name} "
+                           f"(偏移 {side}{abs(offset_mm)}mm{'' if offset_mm >= 0 else '，翻向位'})")
             return True
         except Exception as e:
             logger.error(f"创建基准面 {plane_name} 异常: {e}")

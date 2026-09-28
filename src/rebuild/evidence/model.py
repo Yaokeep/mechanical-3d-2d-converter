@@ -216,6 +216,10 @@ class Drawing:
     dimensions: list[Dimension] = field(default_factory=list)
     views: list[View] = field(default_factory=list)
     layers: list[str] = field(default_factory=list)
+    #: 被判定为**图纸外框**（A4/A3 边框）而排除出视图分离的图元 handle。
+    #: 记下来是为了可追溯：这些图元既不进任何 ``View.evidence`` 也不进
+    #: ``annotations``，不知道它们去哪了会让人以为读取器漏了图元。
+    sheet_frame: list[str] = field(default_factory=list)
 
     # ---- 查询辅助 ----
 

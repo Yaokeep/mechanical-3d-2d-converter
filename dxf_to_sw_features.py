@@ -24,6 +24,15 @@
     /c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe dxf_to_sw_features.py input.dxf output.sldprt
     --no-step: 跳过中间 STEP 导出（默认会导出供体积对比）
 
+两种模式（`--from-model` 切换）:
+  默认（CSG 切片）：先 CSG 重建出实体，再对实体 z 切片反推特征 —— 上面那条链。
+  --from-model     ：**新框架**（src/rebuild/）从图纸直接读出特征树（每个数字带
+                     依据与置信度），再逐条发射成 SW 原生特征，**不经过 CSG**。
+                     见 `_from_model`。两者输出形态相同（可编辑特征树），口径不同。
+  ⚠️ `--from-model` 目前**还不是生产路径**：轮廓只到"视图包围盒"（轮廓环未落地），
+     非矩形外形的零件会被建厚（bracket 三视图比基线厚 129%、PF60K 少 31%）。
+     六个简单靶子里 4 个体积逐位吻合（见 docs/ARCHITECTURE.md §8 阶段 4）。
+
 验证: 特征树特征数（SW COM FeatureManager 遍历）+ 体积对比
   （SW 导出 STEP → compare_models.py --dz 21.95 基准.step 重建.step）
 """
@@ -934,6 +943,64 @@ def _build_sw_model(driver, shape, outer_segs, hole_segs, shift):
 # ============================================================
 
 
+def _from_model(dxf_path: str, output_sldprt: str) -> int:
+    """新框架路径（阶段 4）：图纸 → 特征树 → SW 原生特征模型，**不经过 CSG**。
+
+    与上面那条 CSG 路径的根本区别在于特征从哪儿来：CSG 路径要先把图纸重建成
+    一个实体，再从实体的 z 切片里反猜"这里有个凸台、那里有个孔"—— 等于把
+    图纸里丢掉的信息再猜一遍（ARCHITECTURE §9 对旧脚本的判词）。这条路径直接
+    读图纸：视图分离 → 跨视图对应 → 制图约定 → 特征识别（每个数字是一个
+    `Claim`：值 + 依据 + 置信度 + 备选），发射器逐条建成 SW 特征。
+
+    `force=True` 放行"类型未定"的特征（逐条打 `[GUESS]`）—— 现阶段这是**有意的**：
+    拿未定型的树去跟旧管线基线做可比性测量。生产用应当去掉 force，让"知道拒绝"
+    真的拦住（`r.blocking()` 里每一条都是还没消解的疑问）。
+
+    ⚠️ 只连不关：建完的模型留在 SW 里给人看，收尾**不调** `disconnect()`
+    （那会把活动文档一起关掉，`CLAUDE.md` 记着这个坑）。
+    """
+    from src.rebuild import pipeline
+
+    print("=" * 60)
+    print("DXF → SW 特征模型（新框架路径 --from-model）v0.6.19")
+    print("=" * 60)
+    print(f"  输入: {dxf_path}")
+    print(f"  输出: {output_sldprt}（实际文件名带时间戳，避免覆盖 SW 已占用的文件）")
+
+    print("\n[1/2] 图纸理解：视图分离 → 跨视图对应 → 制图约定 → 特征识别 ...")
+    r = pipeline.rebuild(Path(dxf_path), sldprt=Path(output_sldprt), force=True)
+    n = len(r.part.features) if r.part else 0
+    print(f"  特征树: {n} 个特征（拦路疑问 {len(r.blocking())} 条）")
+    for note in r.notes:
+        print(f"    · {note}")
+    if r.errors:
+        print("\n[FAIL] 发射失败：")
+        for e in r.errors:
+            print(f"  ! {e}")
+        return 1
+    print(f"  发射成功: {r.sldprt}")
+
+    print("\n[2/2] SW 侧复核（模型已留在 SW 里，这里只连上去量一量，不关文档）...")
+    try:
+        from src.rebuild.emit import sw_builder as SB
+
+        d = SB.connect()
+        vol = SB.measure_sw_volume_mm3(d)
+        names = SB.list_sw_features(SB.active_doc(d), only_built=True)
+    except Exception as e:                       # noqa: BLE001
+        print(f"  复核失败（不影响已建好的模型）: {type(e).__name__}: {e}")
+        names, vol = [], float("nan")
+    print(f"  SW 特征树（{len(names)} 步）: {' | '.join(names)}")
+    print(f"  SW 体积: {vol:,.1f} mm³")
+
+    print("\n" + "=" * 60)
+    print(f"[OK] 特征模型完成: {r.sldprt}")
+    print("  对比验证: 用 SW 自带的质量属性核对体积；或 SW 导出 STEP 后")
+    print("           compare_models.py 基准.step 重建.step（注意对齐口径）")
+    print("=" * 60)
+    return 0
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
@@ -956,6 +1023,10 @@ def main():
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_sldprt = str(input_dir / f"{input_stem}_features_{ts}.sldprt")
+
+    if "--from-model" in flags:
+        # 新框架路径：不经 CSG，直接由图纸理解结果发射
+        sys.exit(_from_model(dxf_path, output_sldprt))
 
     print("=" * 60)
     print("通用 DXF → SW 原生特征模型转换器 v0.6.19")

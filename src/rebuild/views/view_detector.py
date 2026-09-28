@@ -111,6 +111,67 @@ def _probe_of_dim(dim: Dimension) -> Point2 | None:
     return dim.p3 or dim.p1 or dim.p2
 
 
+_FRAME_TOL = 0.5          # 边框线到图面外沿的容差（mm）
+_FRAME_SIDE_FRAC = 0.95   # 边框边必须覆盖该侧 ≥95% 的长度
+
+
+def _sheet_frame(geom: list[Evidence]) -> set[str]:
+    """识别**图纸外框**（A4/A3 边框矩形），返回要排除的 handle。
+
+    外框是视图分离的头号干扰源：它的四条边横跨整张图，二维间隙聚类
+    看到的是"所有图元都在它里面" ⇒ 整张图被聚成**一簇**，视图定性随之
+    全线失败。实测 `CAD/图形练习.dxf`：A4 外框 + 俯视图（正方形带对角线）
+    + 两个三角形视图被并成一个 256×297 的"视图"，而它其实是标准三视图。
+
+    判据（要求四侧俱全，避免把"零件本身就是个矩形"误判成外框）：
+    图面外沿的每一侧都有一条与之重合、且覆盖该侧 ≥95% 的**轴对齐直线**。
+    再加两道护栏：排除后必须还剩 ≥3 个图元；且外框内必须真圈着东西。
+    """
+    if len(geom) < 5:
+        return set()
+    boxes = [e.exact_bbox for e in geom]
+    gx0 = min(b.xmin for b in boxes)
+    gx1 = max(b.xmax for b in boxes)
+    gy0 = min(b.ymin for b in boxes)
+    gy1 = max(b.ymax for b in boxes)
+
+    out: set[str] = set()
+    # 四侧：(是否水平, 该侧所在的坐标, 该侧沿线方向的区间)
+    sides = ((True, gy0, (gx0, gx1)), (True, gy1, (gx0, gx1)),
+             (False, gx0, (gy0, gy1)), (False, gx1, (gy0, gy1)))
+    for horiz, at, (s_lo, s_hi) in sides:
+        best: tuple[float, str] | None = None
+        for e, b in zip(geom, boxes):
+            if horiz:
+                flat = b.ymax - b.ymin <= _FRAME_TOL and \
+                    abs((b.ymin + b.ymax) / 2.0 - at) <= _FRAME_TOL
+                span = (b.xmin, b.xmax)
+            else:
+                flat = b.xmax - b.xmin <= _FRAME_TOL and \
+                    abs((b.xmin + b.xmax) / 2.0 - at) <= _FRAME_TOL
+                span = (b.ymin, b.ymax)
+            if not flat:
+                continue
+            if span[0] - s_lo > _FRAME_TOL or s_hi - span[1] > _FRAME_TOL:
+                continue                                   # 没铺满这一侧
+            if (span[1] - span[0]) < _FRAME_SIDE_FRAC * (s_hi - s_lo):
+                continue
+            if best is None or (span[1] - span[0]) > best[0]:
+                best = (span[1] - span[0], e.handle)
+        if best is not None:
+            out.add(best[1])
+
+    if len(out) < 4:
+        return set()                                       # 四侧不齐 ⇒ 不是外框
+    rest = [e for e in geom if e.handle not in out]
+    if len(rest) < 3:
+        return set()                                       # 排除后没东西了 ⇒ 那是零件
+    inside = any(gx0 < (b.xmin + b.xmax) / 2.0 < gx1
+                 and gy0 < (b.ymin + b.ymax) / 2.0 < gy1 for b in
+                 [e.exact_bbox for e in rest])
+    return out if inside else set()                        # 框里得真圈着东西
+
+
 def detect_views(d: Drawing, params: DetectParams | None = None) -> list[View]:
     """把证据聚成视图，并把文字/尺寸/轴线归属到各视图。
 
@@ -137,6 +198,12 @@ def detect_views(d: Drawing, params: DetectParams | None = None) -> list[View]:
     if not geom:
         d.views = []
         return []
+
+    # 图纸外框先摘掉再聚类 —— 否则它一条边横跨全图，一切都被聚成一簇
+    frame = _sheet_frame(geom)
+    if frame:
+        d.sheet_frame = sorted(frame)
+        geom = [e for e in geom if e.handle not in frame]
 
     boxes = [e.exact_bbox for e in geom]
     span_y = max(b.ymax for b in boxes) - min(b.ymin for b in boxes)
@@ -169,25 +236,29 @@ def detect_views(d: Drawing, params: DetectParams | None = None) -> list[View]:
             bbox=_bbox_of(members),
         ))
 
-    _assign(d, views, clustered={m.handle for m in geom})
+    _assign(d, views, clustered={m.handle for m in geom}, excluded=frame)
 
     d.views = views
     return views
 
 
-def _assign(d: Drawing, views: list[View], clustered: set[str]) -> None:
+def _assign(d: Drawing, views: list[View], clustered: set[str],
+            excluded: set[str] | None = None) -> None:
     """把未参与聚类的图元归属到视图。
 
     归类：轴线 / 填充本体 / 剖切线 → ``evidence``；文字 / 尺寸 → ``annotations``。
     归属判据是**位置**（几何邻近），不是图层或命名 —— 与分离阶段同一套信号。
+    ``excluded`` 是已判定为图纸外框的 handle，**不**归属任何视图（否则外框
+    会以"离谁近算谁的"落到某个视图的 evidence 里，再次污染它的包围盒）。
     """
     if not views:
         return
+    excluded = excluded or set()
 
     # ---- 轴线、填充本体、剖切线：属于某个视图的图元 ----
     # 它们不参与聚类（会撑大包围盒或跨视图），故按自身几何中心就近归属
     for e in d.evidence:
-        if e.handle in clustered:
+        if e.handle in clustered or e.handle in excluded:
             continue
         v = _nearest_view(views, _center(e.exact_bbox))
         if v is not None:

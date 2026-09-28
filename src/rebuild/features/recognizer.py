@@ -41,7 +41,7 @@ from ..model.feature_tree import Feature, FeatureType, Part, SymmetryOp
 from ..model.geom import Axis3, Point3, Vector3
 from ..model.ids import FeatureId
 from ..model.questions import OpenQuestion, Question, QuestionList
-from ..views.correspondence import CorrespondenceResult, CylinderHint
+from ..views.correspondence import CorrespondenceResult, CylinderHint, ViewFrame
 from .library import ir_point, mk_claim
 from .solver import Conflict, SolveReport, merge_with_conflict, solve
 
@@ -56,6 +56,12 @@ _PLANE_AXES: dict[str, tuple[str, str]] = {
 
 def _dirs_parallel(a: Vector3, b: Vector3) -> bool:
     return max(abs(a.x - b.x), abs(a.y - b.y), abs(a.z - b.z)) < AXIS_DIR_TOL
+
+
+def _dirs_parallel_either_way(a: Vector3, b: Vector3) -> bool:
+    """同一条直线（方向可反）。识别的轴朝向由证据定，正负号不作区分。"""
+    return _dirs_parallel(a, b) or _dirs_parallel(
+        a, Vector3(-b.x, -b.y, -b.z))
 
 
 def axis_distance(a: Axis3, b: Axis3) -> float | None:
@@ -112,6 +118,201 @@ def _extents(frames) -> dict[str, float]:
     return out
 
 
+def _outer_circle(corr: CorrespondenceResult, frame: ViewFrame) -> CylinderHint | None:
+    """单视图里"顶到图面外沿"的那个圆 —— 它是**基体的外轮廓**，不是特征。
+
+    判据只有一条：直径 = 图面跨度（容差 2%）。不做同心性检查 ——
+    单视图里所有圆的轴都是图面法向，本来就同轴。
+    """
+    span = max(frame.u_span[1] - frame.u_span[0],
+               frame.v_span[1] - frame.v_span[0])
+    best: CylinderHint | None = None
+    for c in corr.cylinders():
+        h = c.mapping.value
+        if not isinstance(h, CylinderHint):
+            continue
+        if abs(h.radius * 2.0 - span) > max(1.0, 0.02 * span):
+            continue
+        if best is None or h.radius > best.radius:
+            best = h
+    return best
+
+
+def guess_single_depth(corr: CorrespondenceResult, frame: ViewFrame
+                       ) -> tuple[float, str, tuple[float, ...]]:
+    """单视图的**厚度猜测** —— 返回 (值, 依据串, 备选值)。
+
+    图纸只画了一个视图 ⇒ 垂直于图面的那一维**图上不存在**，任何数值都是
+    猜的。这里沿用旧管线 ``dxf_to_3d_general.py`` 的三档启发式（原样照抄，
+    因为三个单视图回归基线正是它给出的）：
+
+        估算深度（:7598）:  depth = 最大孔径×4 或 图面跨度×0.3，再 max(·, 10)
+        圆形主体修正(:8759):  外轮廓是圆且半径<100 ⇒ depth = max(depth×0.15, 10)
+
+    实测复现：plate_100x60 → 20、l_bracket → 18、flange_d80 → 24，
+    与 ``run_simple_regression.py`` 的金值逐位相同。
+
+    **降级成 GUESS 是本框架与旧管线的全部差别**：旧管线把这个数当成
+    ``projection`` 直接发射，调用方无从分辨"量出来的"与"编出来的"；
+    这里它是 ``Tier.GUESS``，备选值一并列出，并由调用方报成拦路待确认项。
+    """
+    radii = [c.mapping.value.radius for c in corr.cylinders()
+             if isinstance(c.mapping.value, CylinderHint)]
+    max_r = max(radii) if radii else 0.0
+    span = max(frame.u_span[1] - frame.u_span[0],
+               frame.v_span[1] - frame.v_span[0])
+    if max_r > 0:
+        base, method = max_r * 4.0, "guess:max_hole_dia_x4"
+        alts = (round(span * 0.3, 3), 10.0)
+    else:
+        base, method = span * 0.3, "guess:view_span_x0.3"
+        alts = (10.0,)
+    # 外轮廓是圆 ⇒ 圆形零件，实测该档才是基线值
+    outer = _outer_circle(corr, frame)
+    circular = outer is not None and outer.radius < 100.0
+    depth = max(base, 10.0)
+    if circular:
+        depth = max(depth * 0.15, 10.0)
+        method += "+circular_body_x0.15"
+    depth = round(depth, 6)
+    # 备选里不能重复主值（``Claim`` 会拒绝），圆形零件取 0.15 档后
+    # 恰好与主值撞车是常态（24 = 160×0.15 而 24 也在备选里）
+    return depth, method, tuple(a for a in alts if abs(a - depth) > 1e-9)
+
+
+def _revolve_base(dir_name: str, radius: float, length: float, centre: Point3,
+                  ev: tuple, source_view: str, method: str,
+                  dir_claim: Claim | None = None) -> Feature:
+    """圆轮廓的基体 = **回转体**（法兰/盘/套），不是棱柱。
+
+    ``radius_profile`` 按 ``library`` 的 REVOLVE 契约给：``[(沿轴坐标, 半径)]``，
+    整圆柱就是一条水平母线（两点的闭合由发射器补轴段，见 occ_builder）。
+    """
+    return Feature(
+        id=FeatureId(0),
+        type=Claim(FeatureType.REVOLVE, method, Tier.PROJECTION, evidence=ev),
+        params={
+            "dir": dir_claim or Claim(dir_name, "projection:view_normals",
+                                      Tier.PROJECTION, evidence=ev),
+            "angle_deg": Claim(360.0, "convention:full_revolve",
+                               Tier.CONVENTION, evidence=ev),
+            "radius_profile": Claim([(0.0, radius), (length, radius)],
+                                    "projection:circle_outline",
+                                    Tier.PROJECTION, evidence=ev),
+            "origin": Claim(centre, "projection:circle_center",
+                            Tier.PROJECTION, evidence=ev),
+        },
+        axis=Claim(Axis3(centre, _axis_vector(dir_name)), method,
+                   Tier.PROJECTION, evidence=ev),
+        placement=Claim(centre, "projection:circle_center", Tier.PROJECTION,
+                        evidence=ev),
+        source_view=source_view,
+        evidence=list(ev),
+    )
+
+
+def _profile_circle(corr: CorrespondenceResult, dir_name: str,
+                    lo1: float, hi1: float, lo2: float,
+                    hi2: float) -> CylinderHint | None:
+    """轮廓外沿是不是一个圆 —— 是则返回那个圆。
+
+    判据三条（全中才算）：轴与拉伸方向平行、直径 = 轮廓两个跨度、圆心在轮廓中心。
+    """
+    r_want = (hi1 - lo1) / 2.0
+    if abs((hi2 - lo2) / 2.0 - r_want) > max(0.5, 0.02 * r_want):
+        return None                      # 轮廓不是方的，先排除
+    c1, c2 = (lo1 + hi1) / 2.0, (lo2 + hi2) / 2.0
+    b1_axis, b2_axis = _PLANE_AXES[dir_name]
+    for c in corr.cylinders():
+        h = c.mapping.value
+        if not isinstance(h, CylinderHint):
+            continue
+        if abs(h.radius - r_want) > max(0.5, 0.02 * r_want):
+            continue
+        if not _dirs_parallel_either_way(h.axis.direction, _axis_vector(dir_name)):
+            continue
+        co = {"x": h.axis.origin.x, "y": h.axis.origin.y, "z": h.axis.origin.z}
+        if abs(co[b1_axis] - c1) > 0.5 or abs(co[b2_axis] - c2) > 0.5:
+            continue
+        return h
+    return None
+
+
+def _single_face_base(d, corr: CorrespondenceResult, frames,
+                      rep: RecognizeReport) -> Feature:
+    """单视图基体：看得见的那个面按实量，看不见的那一维按猜。
+
+    与 ``base_feature`` 的分工是"信息量的差别"，不是"代码的差别"：
+    三个视图齐了才能说"沿最薄的方向拉伸"（那是量出来的），只有一个
+    视图时连"哪一维是深度"都是约定 —— 故 ``dir`` 也是 GUESS。
+    """
+    frame = next(iter(frames.values()))
+    dir_name = frame.p_axis
+    b1_axis, b2_axis = _PLANE_AXES[dir_name]
+    ev = tuple(dict.fromkeys(e for v in d.views for e in v.evidence[:1]))
+    depth, method, alts = guess_single_depth(corr, frame)
+    same_normal = len({f.p_axis for f in frames.values()}) == 1
+    lo1, hi1 = frame.u_span
+    lo2, hi2 = frame.v_span
+    box = [(0.0, 0.0), (hi1 - lo1, 0.0), (hi1 - lo1, hi2 - lo2), (0.0, hi2 - lo2)]
+    origin = ir_point(Point3(0.0, 0.0, 0.0), dir_name, lo1, lo2, 0.0)
+    # 视图少了两个 ⇒ "哪个方向是深度"是**约定**（图面=xy 平面），
+    # 两个备选列出来：同一张图转 90° 也是自洽的读法
+    dir_claim = Claim(dir_name, "guess:drawing_plane_is_xy", Tier.GUESS,
+                      evidence=ev, alternatives=tuple(_PLANE_AXES[dir_name]))
+    outer = _outer_circle(corr, frame)
+    if outer is not None:
+        # 外轮廓是圆 ⇒ 基体是**回转体**（法兰/盘），不是棱柱。
+        # 按包围盒做棱柱会把圆盘做成方板：面积差 1−π/4 ≈ 21%，是"数字对得上
+        # 结构却错"的典型。
+        c = outer.axis.origin
+        f = _revolve_base(dir_name, outer.radius, depth,
+                          Point3(c.x, c.y, c.z), ev, frame.view_id,
+                          "projection:single_view_circle", dir_claim)
+        rep.notes.append(
+            f"基体（单视图）：外轮廓是圆 r{outer.radius:.2f} ⇒ 按**回转体**建"
+            f"（不是包围盒棱柱），沿 {dir_name} 高 {depth:.2f} —— **厚度是猜的**"
+            f"（{method}）")
+        rep.questions.add(Question(
+            OpenQuestion.MISSING_DIMENSION,
+            f"图纸只有 {len(frames)} 个视图口径可用，{dir_name} 向尺寸图上不存在 ⇒ "
+            f"圆盘厚度按「{method}」猜成 {depth:.2f}"
+            f"（备选 {'/'.join(f'{a:g}' for a in alts)}）",
+            view=frame.view_id, evidence=ev[:1]))
+        return f
+    f = Feature(
+        id=FeatureId(0),
+        type=Claim(FeatureType.BASE, "projection:single_view_outline",
+                   Tier.PROJECTION, evidence=ev),
+        params={
+            "dir": dir_claim,
+            "length": Claim(depth, method, Tier.GUESS, evidence=ev,
+                            alternatives=alts),
+            "profile": Claim(box, "projection:view_bounds", Tier.PROJECTION,
+                             evidence=ev),
+            "origin": Claim(origin, "projection:view_bounds", Tier.PROJECTION,
+                            evidence=ev),
+        },
+        placement=Claim(origin, "projection:view_bounds", Tier.PROJECTION,
+                        evidence=ev),
+        source_view=frame.view_id,
+        evidence=list(ev),
+    )
+    rep.notes.append(
+        f"基体（单视图）：轮廓 {hi1 - lo1:.2f}×{hi2 - lo2:.2f}（{b1_axis},{b2_axis} 面）"
+        f"沿 {dir_name} 拉伸 {depth:.2f} —— **厚度是猜的**（{method}）")
+    rep.questions.add(Question(
+        OpenQuestion.MISSING_DIMENSION,
+        f"图纸只有 {len(frames)} 个视图口径可用，{dir_name} 向尺寸图上不存在 ⇒ "
+        f"厚度按「{method}」猜成 {depth:.2f}"
+        f"（备选 {'/'.join(f'{a:g}' for a in alts)}）；"
+        "发射前需人确认（旧管线在此处直接当已知量用）",
+        view=frame.view_id, evidence=ev[:1]))
+    if same_normal:
+        rep.notes.append("所有视图法向一致 ⇒ 深度方向无歧义，只有长度是猜的")
+    return f
+
+
 def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature:
     """基体：按视图包围盒近似成一块拉伸体。
 
@@ -122,11 +323,15 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
     轮廓坐标是"垂直拉伸方向的那个平面"上的 (a, b)，按
     ``library.profile_plane`` 的右手基向量落位 —— 发射器用同一张表，
     所以沿 Y 拉伸的板不会被转 90°。
+
+    只有一个视图能定平面时走 ``_single_face_base``（那一维是猜的）。
     """
     frames = corr.frames
     ext = _extents(frames)
     if not ext:
         raise ValueError("没有任何视图给出可用跨度，无法定基体")
+    if len(ext) < 3:
+        return _single_face_base(d, corr, frames, rep)
     dir_name = min(ext, key=lambda a: ext[a])
     # 轮廓取"看不出的正是拉伸方向"的那个视图（它正对着这个平面）
     prof_view = next((f for f in frames.values() if f.p_axis == dir_name),
@@ -145,6 +350,20 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
                if f.model_span(dir_name) is not None)
     length = ext[dir_name]
     ev = tuple(dict.fromkeys(e for v in d.views for e in v.evidence[:1]))
+    # 轮廓外沿是个圆 ⇒ 回转体（法兰/盘），不是棱柱。实测「法兰练习」：
+    # 按包围盒做 80×80 的方板 = 128,000，而金值 94,248（圆盘）—— 差 35%。
+    circ = _profile_circle(corr, dir_name, lo1, hi1, lo2, hi2)
+    if circ is not None:
+        c = circ.axis.origin
+        prof_f = next((f for f in frames.values()
+                       if f.p_axis == dir_name), prof_view)
+        f = _revolve_base(dir_name, circ.radius, length,
+                          Point3(c.x, c.y, c.z), ev, prof_f.view_id,
+                          "projection:circle_outline")
+        rep.notes.append(
+            f"基体：轮廓外沿是圆 r{circ.radius:.2f} ⇒ 按**回转体**建"
+            f"（不是包围盒棱柱），沿 {dir_name} 高 {length:.2f}")
+        return f
     origin = ir_point(Point3(0.0, 0.0, 0.0), dir_name, lo1, lo2, t_lo)
     f = Feature(
         id=FeatureId(0),
@@ -200,13 +419,42 @@ def _cyl_claim(hint: CylinderHint) -> Claim[FeatureType]:
                  alternatives=(FeatureType.BOSS,))
 
 
+def _base_outline(base: Feature):
+    """基体自身的外轮廓圆 → 它**不是**特征，是基体本身。
+
+    单视图圆盘里最大的那个圆会被跨视图对应读成"沿轴的一个圆柱"；而
+    沿基体自己的轴、半径又等于基体半径的圆柱只可能是基体的轮廓线
+    （实测 flange_d80：Ø80 外圆被读成一个 r40 的孔、法兰练习里被读成
+    一个 r40 的凸台 —— 两者都是把零件本身又加/减了一遍）。
+    """
+    prof = base.params.get("radius_profile")
+    if prof is None or not isinstance(prof.value, (list, tuple)) or not prof.value:
+        return None
+    r_max = max(float(r) for _, r in prof.value)
+    ax = base.axis.value if base.axis is not None else None
+    if ax is None:
+        return None
+
+    def skip(hint: CylinderHint) -> bool:
+        if abs(hint.radius - r_max) > 0.05:
+            return False
+        if not _dirs_parallel_either_way(hint.axis.direction, ax.direction):
+            return False
+        d = axis_distance(hint.axis, ax)
+        return d is not None and d <= AXIS_POS_TOL
+
+    return skip
+
+
 def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
-                      next_id: int) -> list[Feature]:
-    """一个 ``CylinderHint`` 一条特征。"""
+                      next_id: int, skip=None) -> list[Feature]:
+    """一个 ``CylinderHint`` 一条特征。``skip`` 是基体外轮廓的判据（见上）。"""
     out: list[Feature] = []
     for c in corr.cylinders():
         hint = c.mapping.value
         assert isinstance(hint, CylinderHint)
+        if skip is not None and skip(hint):
+            continue
         ev = tuple(hint.axis.radius.evidence) if hint.axis.radius else ()
         t = _cyl_claim(hint)
         params: dict[str, Claim] = {}
@@ -318,9 +566,18 @@ def _material_extent(base: Feature) -> dict[str, float]:
     拉伸方向上是 ``length``；轮廓平面内的两轴上是轮廓的宽/高。写成一张表
     而不是"孔轴必须与拉伸方向同向才判"—— PF60K 的孔沿 z、基体沿 y 拉伸，
     孔轴与拉伸方向不同，但 z 向的材料厚度就是轮廓的 z 跨度，照样能判。
+
+    回转体（法兰/盘）走另一支：轴向厚度 = 母线沿轴的最大坐标，两个径向
+    尺寸 = 2×最大半径。**基体可能是 REVOLVE 而不是 BASE**（圆轮廓走
+    `_revolve_base`），只认 "base" 会让整张表取不出来 —— 实测 flange_d80 /
+    法兰练习 四个 Ø8 孔因此一个 `through` 都没挂上，发射器直接以缺参数拒绝。
     """
     dir_name = base.params["dir"].value
     b1, b2 = _PLANE_AXES[dir_name]
+    if base.type.value == FeatureType.REVOLVE.value:
+        prof = base.params["radius_profile"].value
+        r = max(float(rr) for _, rr in prof)
+        return {dir_name: max(float(t) for t, _ in prof), b1: 2.0 * r, b2: 2.0 * r}
     prof = base.params["profile"].value
     return {dir_name: base.params["length"].value,
             b1: max(a for a, _ in prof),
@@ -338,7 +595,8 @@ def derive_through(part: Part, rep: RecognizeReport) -> None:
     缺参数就抛异常。所以定不下来的地方给 GUESS 值 + 备选 + 缺口计数，
     而不是让字段缺席。
     """
-    base = next((f for f in part.features if f.type.value == "base"), None)
+    base = next((f for f in part.features
+                 if f.type.value in ("base", "revolve")), None)
     if base is None:
         return
     thick = _material_extent(base)
@@ -545,7 +803,7 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
 
     base = base_feature(d, corr, rep)
     part.add(base)
-    for f in cylinder_features(corr, rep, next_id=1):
+    for f in cylinder_features(corr, rep, next_id=1, skip=_base_outline(base)):
         part.add(f)
     merge_section_axes(corr, rep, part)
     for f in pattern_features(conv, corr, rep, part):

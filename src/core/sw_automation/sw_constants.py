@@ -16,6 +16,12 @@ swStartSketchPlane = 0  # 草图起始于基准面
 
 # ---- 基准面约束类型 ----
 swRefPlaneOffset = 8    # 偏移距离约束
+# 偏移"翻向"位（= 8 | 256）。**必须与距离约束相加**：单用 256、或错配 128
+# （那是 mid-plane 位）都会让 InsertRefPlane 返回 None（2026-09-28 实测）。
+# 用途：SW 的 InsertRefPlane **吃不下负距离**——传 −50 会静默把面建在 0 处
+# （_probe_sw_negplane.py 实测：−50 → SW y=0、−110 → SW z=0）。要做负侧的
+# 面只能"正距离 + 翻向位"：上视 +50/264 → SW y=−50、前视 +110/264 → z=−110 ✓
+swRefPlaneOffsetFlip = 8 + 256
 
 # ---- 倒角类型 ----
 swChamferDistanceDistance = 2  # 等距倒角

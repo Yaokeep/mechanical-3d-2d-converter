@@ -260,7 +260,32 @@ def solve_frames(d: Drawing, qs: QuestionList | None = None,
 
     typed = [v for v in d.views if v.bbox is not None and v.resolved_type]
     if not typed:
-        return {}, questions
+        # 视图形不成对（只有一个视图，或有视图但都没定性）—— 图纸并没有
+        # "什么都看不出来"，它仍然把**正对着的那个面**画全了。此时按
+        # "图面即 xy 平面、第三维沿 z" 建一个约定坐标系，让识别层能照常量
+        # 出轮廓与孔，只把**垂直于图面的那一维**留成未知（recognizer 会把
+        # 它降成 GUESS + 拦路待确认项）。返回空表则连轮廓都拿不到，是过度拒绝。
+        if not d.views:
+            return {}, questions
+        v = max((x for x in d.views if x.bbox is not None),
+                key=lambda x: (x.bbox.xmax - x.bbox.xmin)
+                * (x.bbox.ymax - x.bbox.ymin), default=None)
+        if v is None:
+            return {}, questions
+        assert v.bbox is not None
+        frame = ViewFrame(
+            view_id=v.id, view_type=v.resolved_type or v.type.value,
+            u_axis="x", v_axis="y", p_axis="z",
+            u_span=(v.bbox.xmin, v.bbox.xmax),
+            v_span=(v.bbox.ymin, v.bbox.ymax),
+        )
+        questions.add(Question(
+            OpenQuestion.AMBIGUOUS_VIEW,
+            f"{v.id} 是唯一可用的视图且未能定性 ⇒ 按「图面即 xy 平面」"
+            "建坐标（垂直于图面的一维留作未知，由特征层降级为猜测）",
+            view=v.id,
+        ))
+        return {v.id: frame}, questions
 
     # 先定各视图的 u/v/p 轴
     axis_of: dict[str, tuple[str, str]] = {}
@@ -884,9 +909,13 @@ def cylinders_from_circles(d: Drawing, frames: dict[str, ViewFrame],
                            qs: QuestionList) -> list[Correspondence]:
     """圆 ⇒ 圆柱轴；再拿正交视图里的轮廓对补上长度与"孔还是凸台"。
 
-    **同心圆合并**：同一个圆心上的多个圆是沉孔/倒角/同轴台阶，
-    它们描述**同一个圆柱特征**（外径取最大、内径取最小），
-    分开报会浪费后续求解器的算力，也会让特征树里出现一堆同轴假特征。
+    **同心圆不合并**：同一个圆心上的多个圆是**多条圆边**，可能读成
+    沉孔/倒角/台阶（同一根轴上的两个直径），也可能读成"盘 + 中心孔"、
+    "凸台 + 通孔"—— 它们是两种特征布局，图纸本身分不出来（§3 原则二：
+    歧义不提前消解）。这里每个半径各报一条，把"这是哪种"留给求解层与
+    待确认项。曾经的做法是只取最大半径（文档里写"外径取最大、内径取最小"
+    但代码只做了前半句），后果实测：flange_d80 的 Ø40 中心孔**整个消失**，
+    体积从 85,652 涨到 115,811（+35%）。
     """
     out: list[Correspondence] = []
     idx = _index(d)
@@ -899,77 +928,106 @@ def cylinders_from_circles(d: Drawing, frames: dict[str, ViewFrame],
             key = (round(center.x / MATCH_TOL), round(center.y / MATCH_TOL))
             merged.setdefault(key, []).append((handle, center, r))
         for group in merged.values():
-            handle, center, r = max(group, key=lambda it: it[2])
-            if len(group) > 1:
-                refs0 = [(v.id, h) for h, _, _ in group]
-                ev = tuple(h for h, _, _ in group)
-            else:
-                refs0, ev = [(v.id, handle)], (handle,)
-            origin = f.to_model(center.x, center.y)
-            dirs = {"x": Vector3(1, 0, 0), "y": Vector3(0, 1, 0),
-                    "z": Vector3(0, 0, 1)}
-            marker = f"circle:{v.id}" + ("(×%d)" % len(group) if len(group) > 1 else "")
-            radius_claim = Claim(r, marker, Tier.PROJECTION, evidence=ev)
-            hint = CylinderHint(Axis3(origin, dirs[f.p_axis], radius_claim), r,
-                                radius_method=marker)
-            refs: list[tuple[str, EvidenceRef]] = list(refs0)
-
-            # ---- 正交视图里的轮廓对：补长度 + 判孔/凸台 ----
-            # 圆柱轴向 = f.p_axis。在别的视图 w 里，它要么画在 w 的横向、
-            # 要么画在 w 的纵向 —— 两种情况下的"垂直方向"分别映射到 w.v_axis /
-            # w.u_axis，**必须过 frame 换算**才能和模型坐标比（直接拿图纸坐标比
-            # 模型坐标是错的，这里错过一次）。
-            best: tuple[_Pair, str, float] | None = None
-            for w in d.views:
-                if w.id == v.id or w.id not in frames or w.bbox is None:
-                    continue
-                wf = frames[w.id]
-                if wf.p_axis == f.p_axis:
-                    continue            # 同向视图给不出正交信息
-                if wf.u_axis == f.p_axis:
-                    along, perp_axis = "h", wf.v_axis
-                elif wf.v_axis == f.p_axis:
-                    along, perp_axis = "v", wf.u_axis
+            group.sort(key=lambda it: -it[2])          # 半径降序
+            # 同半径的多条圆边 = 同一条圆边被重复画了（重合图元）⇒ 并成一条；
+            # **半径不同**的才是"多条同心圆边"，各报一条（见 docstring）
+            uniq: list[list[tuple[EvidenceRef, Point2, float]]] = []
+            for item in group:
+                if uniq and abs(uniq[-1][-1][2] - item[2]) <= MATCH_TOL:
+                    uniq[-1].append(item)
                 else:
-                    continue
-                want = {"x": origin.x, "y": origin.y, "z": origin.z}[perp_axis]
-                for pr in _parallel_line_pairs(idx, w, along, 2 * r):
-                    got = (wf.u_to_model(pr.perp_mid) if perp_axis == wf.u_axis
-                           else wf.v_to_model(pr.perp_mid))
-                    if abs(got - want) > MATCH_TOL:
-                        continue
-                    if best is None or pr.length > best[0].length:
-                        best = (pr, w.id, got)
-            if best is not None:
-                pr, wid, _ = best
-                refs += [(wid, pr.h1), (wid, pr.h2)]
-                hint = CylinderHint(hint.axis, r, length=pr.length,
-                                    solid=pr.visible, radius_method=marker,
-                                    profile_method=f"outline:{wid}")
-                out.append(Correspondence(
-                    CorrKind.FEATURE, tuple(refs),
-                    Claim(hint, f"corr:circle+outline({v.id}+{wid})",
-                          Tier.PROJECTION,
-                          evidence=tuple(h for _, h in refs)),
-                    note=f"r{r:g} 圆柱，长 {pr.length:.2f}，"
-                         + ("凸台（轮廓实线）" if pr.visible else "孔（轮廓虚线）"),
-                ))
-            else:
-                out.append(Correspondence(
-                    CorrKind.FEATURE, tuple(refs),
-                    Claim(hint, f"corr:circle({v.id})", Tier.PROJECTION,
-                          evidence=(handle,)),
-                    note=f"r{r:g} 圆柱，轴沿 {f.p_axis.upper()}；"
-                         "正交视图里没找到匹配的轮廓对（长度与孔/凸台未定）",
-                ))
+                    uniq.append([item])
+            refs0 = [(v.id, h) for h, _, _ in group]
+            ev = tuple(h for h, _, _ in group)
+            if len(uniq) > 1:
                 qs.add(Question(
                     OpenQuestion.AMBIGUOUS_FEATURE,
-                    f"{v.id} 的 r{r:g} 圆在正交视图里找不到间距 2r 的轮廓对 —— "
-                    "无法确定它是孔还是凸台、也不知道轴向长度",
-                    view=v.id, evidence=(handle,),
-                    candidates=("hole", "boss"),
+                    f"{v.id} 同一圆心上有 {len(uniq)} 条同心圆边（"
+                    + " / ".join(f"r{g[0][2]:g}" for g in uniq)
+                    + "）—— 是沉孔/倒角/台阶（一根轴上两个直径），"
+                    "还是同一面上的两个独立圆边（如盘+中心孔）？"
+                    "每条圆边各建一个特征，交由约束裁剪",
+                    view=v.id, evidence=ev,
+                    candidates=("step", "counterbore", "independent"),
                 ))
+            origin = f.to_model(group[0][1].x, group[0][1].y)
+            dirs = {"x": Vector3(1, 0, 0), "y": Vector3(0, 1, 0),
+                    "z": Vector3(0, 0, 1)}
+            for same in uniq:
+                out.append(_circle_to_cylinder(
+                    d, idx, v, f, frames, qs, tuple(h for h, _, _ in same),
+                    same[0][2], origin, dirs[f.p_axis], refs0))
     return out
+
+
+def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
+                        qs: QuestionList, handles: tuple, r: float,
+                        origin: Point3, axis_dir: Vector3,
+                        refs0: list[tuple[str, EvidenceRef]]
+                        ) -> Correspondence:
+    """一条圆边 ⇒ 一个圆柱的对应（长度与"孔/凸台"靠正交视图的轮廓对补）。
+
+    ``handles`` 是这条圆边的全部图元（重合图元会有多条），``refs0`` 是同一
+    圆心上的**全部**圆边 —— 它们共同证明"这根轴在这里"。
+
+    圆柱轴向 = ``f.p_axis``。在别的视图 ``w`` 里，它要么画在 ``w`` 的横向、
+    要么画在 ``w`` 的纵向 —— 两种情况下的"垂直方向"分别映射到 ``w.v_axis`` /
+    ``w.u_axis``，**必须过 frame 换算**才能和模型坐标比（直接拿图纸坐标比
+    模型坐标是错的，这里错过一次）。
+    """
+    handle = handles[0]
+    marker = f"circle:{v.id}"
+    radius_claim = Claim(r, marker, Tier.PROJECTION, evidence=handles)
+    hint = CylinderHint(Axis3(origin, axis_dir, radius_claim), r,
+                        radius_method=marker)
+    refs: list[tuple[str, EvidenceRef]] = list(refs0)
+    best: tuple[_Pair, str, float] | None = None
+    for w in d.views:
+        if w.id == v.id or w.id not in frames or w.bbox is None:
+            continue
+        wf = frames[w.id]
+        if wf.p_axis == f.p_axis:
+            continue                # 同向视图给不出正交信息
+        if wf.u_axis == f.p_axis:
+            along, perp_axis = "h", wf.v_axis
+        elif wf.v_axis == f.p_axis:
+            along, perp_axis = "v", wf.u_axis
+        else:
+            continue
+        want = {"x": origin.x, "y": origin.y, "z": origin.z}[perp_axis]
+        for pr in _parallel_line_pairs(idx, w, along, 2 * r):
+            got = (wf.u_to_model(pr.perp_mid) if perp_axis == wf.u_axis
+                   else wf.v_to_model(pr.perp_mid))
+            if abs(got - want) > MATCH_TOL:
+                continue
+            if best is None or pr.length > best[0].length:
+                best = (pr, w.id, got)
+    if best is not None:
+        pr, wid, _ = best
+        refs += [(wid, pr.h1), (wid, pr.h2)]
+        hint = CylinderHint(hint.axis, r, length=pr.length, solid=pr.visible,
+                            radius_method=marker, profile_method=f"outline:{wid}")
+        return Correspondence(
+            CorrKind.FEATURE, tuple(refs),
+            Claim(hint, f"corr:circle+outline({v.id}+{wid})", Tier.PROJECTION,
+                  evidence=tuple(h for _, h in refs)),
+            note=f"r{r:g} 圆柱，长 {pr.length:.2f}，"
+                 + ("凸台（轮廓实线）" if pr.visible else "孔（轮廓虚线）"),
+        )
+    qs.add(Question(
+        OpenQuestion.AMBIGUOUS_FEATURE,
+        f"{v.id} 的 r{r:g} 圆在正交视图里找不到间距 2r 的轮廓对 —— "
+        "无法确定它是孔还是凸台、也不知道轴向长度",
+        view=v.id, evidence=(handle,),
+        candidates=("hole", "boss"),
+    ))
+    return Correspondence(
+        CorrKind.FEATURE, tuple(refs),
+        Claim(hint, f"corr:circle({v.id})", Tier.PROJECTION,
+              evidence=(handle,)),
+        note=f"r{r:g} 圆柱，轴沿 {f.p_axis.upper()}；"
+             "正交视图里没找到匹配的轮廓对（长度与孔/凸台未定）",
+    )
 
 
 # ---- 5) 特征点 ⇒ 3D 点（有界版） ----

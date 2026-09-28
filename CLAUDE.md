@@ -39,6 +39,13 @@ $PY convert_dwg_to_3d.py CAD/20160112-181116-09933.dxf output.step
 # DXF 工程图 → SW 原生特征模型 .sldprt（Boss/Cut 可编辑特征树，非 STEP 哑几何）
 # 需 SolidWorks 2025 已启动；输出时间戳 sldprt + 中间 CSG STEP
 $PY dxf_to_sw_features.py CAD/reducer.dxf [output.sldprt] [--no-step]
+# --from-model：改走新框架 src/rebuild/（图纸→特征树→SW），不经 CSG。
+# 旧 CSG 路径仍是默认——新路径的基体轮廓还只有"视图包围盒"一级（见下 [GAP]）
+$PY dxf_to_sw_features.py CAD/test_simple/flange_d80.dxf --from-model
+
+# 新框架 src/rebuild/ 验收表（回归入口，与 run_simple_regression.py 平行）
+PYTHONIOENCODING=utf-8 $PY run_rebuild_acceptance.py [靶子...]         # OCC 表
+PYTHONIOENCODING=utf-8 python run_rebuild_acceptance.py --sw [靶子...] # SW 表（需 SW 2025）
 
 # 简单模型回归套件 — 6 个已验证用例（体积精确匹配 + 逐轴 bbox + 实体数）
 # 报告输出 CAD/temp_output/regression_report.txt；--sw 附加 SW 时间戳模型生成
@@ -186,6 +193,11 @@ src/core/ (核心业务逻辑，与 GUI 完全解耦)
   │                   拉伸 Extrude、旋转 Revolve)
   ├─ annotation/     (自动尺寸标注：auto_dimension + dimension_calculator)
   └─ sw_automation/  (SolidWorks 2025 COM 自动化驱动 + 参数化建模，✅ 完整实现)
+
+src/rebuild/ (新框架——图纸理解与三维重建的重写，✅ 阶段 0~4 落地，见下方专节)
+  model/ ← evidence/ ← views/ ← conventions/ ← features/ ← verify/（单向依赖）
+  emit/ = 旁支，只依赖 model（occ_builder / sw_builder 两个独立发射器）
+  pipeline.py = 唯一入口；selftest.py / inspect.py / report.py / verify_legacy.py = 仪器
 
 src/utils/ (工具模块：配置管理、日志、线程工作器、单位换算)
 resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
@@ -342,6 +354,8 @@ x 平移伪影。补上 dx 后同一对模型是：三视图 多余 1,681.28 / �
 ⚠️ **GUI 骨架与根目录脚本是两套独立实现**：三视图投影、2D→3D 重建这些能力
 在根目录脚本里已生产可用，`src/` 里的同名模块是尚未接线的另一份。改算法请
 落在根目录脚本，不要误以为 `src/core/projection/` 是现役代码。
+（**`src/rebuild/` 是第三份，也是唯一在往前走的**：新框架，判据是"特征+尺寸"
+而不是几何交集；旧管线的精度收敛已到信息论天花板，新工作应该落在 `src/rebuild/`）
 
 ⚠️ **`src/core/reconstruction/` 已判定过时，不再续写**（2026-09-28）：
 `WireMaker`/`FaceBuilder`/`ExtrudeBuilder`/`RevolveBuilder` 的分解是**几何优先**
@@ -370,17 +384,44 @@ ezdxf+numpy，**跑默认 python**；`verify/step_probe.py`（读 STEP 量尺寸
 把整包的 import 绑死在 cad-occt 上，selftest 的 E 组会把这条拉回。
 阶段 1 的 `verify.reproject` 同样归 OCC 侧。
 
-阶段 0 已完成（2026-09-28）：`model/`（Claim/geom/feature_tree）、
-`evidence/`（dxf_reader + text_parser）、`views/`（view_detector + view_typer）、
-`verify/`（compare/coverage/gate/step_probe）、`report.py`、`inspect.py`、
-`selftest.py`、`verify_legacy.py`。
+阶段 0 ~ 4 全部落地（2026-09-28）。`src/rebuild/` 现有：`model/`（Claim/geom/
+feature_tree）、`evidence/`（dxf_reader + text_parser）、`views/`（view_detector +
+view_typer + correspondence 跨视图对应）、`conventions/`、`features/`（recognizer +
+solver + library）、`verify/`（compare/coverage/gate/step_probe）、`emit/`
+（occ_builder + sw_builder）、`report.py`、`inspect.py`、`rebuild.py`、
+**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf, step=|sldprt=, force=)`）**、
+`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
+顶部「新框架 src/rebuild/」段；`docs/ARCHITECTURE.md` §8 各阶段带 ✅ 状态行。
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--explain HANDLE]
-python -m src.rebuild.selftest       # 122 项自检，退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 272 项自检，退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
 ```
+阶段 4 实测（9 个靶子，两张表）：6 个简单靶子里 **4 个体积逐位吻合**（block_3view /
+plate_100x60 / flange_d80 / 法兰练习，bbox 差全 0.00；SW 表另核**特征步数 = 特征模型**），
+且 OCC 表与 SW 表在这 4 个上逐位相同——两个独立发射器（一 OCC 一 COM，无共享代码）
+互为交叉验证。其余 5 行标 `[GAP]`。
+⚠️ **`[GAP]` 是已知结构缺口、不是回归**，两条都不在发射器里：
+① **基体轮廓目前取视图包围盒**（矩形棱柱）⇒ `l_bracket` / `图形练习` / `bracket`
+   体积偏大（+227% / +200% / +130%），真实外轮廓是 L 形 / 台阶 / 回转体；
+② **多视图下的回转体识别未做** ⇒ `PF60K`（法兰盘）被按板类零件建（−31%）。
+**别为了让表变绿去调发射器**——那会把"没读到"变成"读错了"（体积对了结构全错，
+正是本框架要消灭的病）。表上红的地方就是还没读出来的地方，见
+`run_rebuild_acceptance.py` 顶部注释。
+SW 表比 OCC 表更严：三个大靶子**发射就被拒**（`FeatureCut3` 返回 None），根因
+同样是上面两条 —— PF60K 的 7 条同心圆被读成 7 个同轴通孔（第一个 Ø60 切完后
+第二个 Ø50 无材料可切，切除不幂等）；bracket 的 r12 圆（GUESS(hole|boss)）圆心
+(193.3, ·, 24) 与基体包围盒 x 上界 205.3 **恰好相切**（真身是臂端圆头）。
+验收表因此按"框架自己的 gate"判失败性质：`blocking()` 非空 ⇒ `[GAP] 按设计拒绝`
+（不计 FAIL、也不洗绿）；**一条阻塞疑问都没有却失败 ⇒ 疑似发射器 bug、计 FAIL**。
+另有一条已记账的静默默认：`BOSS/HOLE/POCKET/SLOT` 的 `axial_at` 参数缺省时
+两个发射器都按 **0** 起（不是图纸读数），并各打一行 `[emit] 特征 #n（…）没有
+axial_at ⇒ 沿轴按 0 起`。实测症状：bracket 基体自 z=2 起而凸台从 z=0 长出，
+整车 z 向 bbox 46 而基准 44（`bbox 差 +2.00`）。根因在识别侧（凸台轴向位置没读出来），
+不在发射器——发射器已尽力记账。
+
 阶段 0 关键成果：
 - **剖面标题的切平面与半径读出来了**。图纸里明写着
   `B—B  横剖 x=121.89（穿 r25.5 孔轴）`，而旧管线 `dxf_to_3d_general.py:618` 的
@@ -393,8 +434,14 @@ PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.ste
 - **验收③ 修正**：6 个回归用例里只有 `block_3view` 具三视图 ⇒ ACCEPT；其余 5 个是
   单视图零标注的极简 DXF，第三向尺寸**不在图上** ⇒ 正确判决是 NEEDS_CONFIRMATION
   （原写"6/6 ACCEPT"是把靶子当成真图纸了，见 `docs/ARCHITECTURE.md` §8 阶段 0）。
-未完成：`views/correspondence.py`（阶段 1：对应关系/3D 轴线）、`conventions/`、
-`features/`、`verify.predict`、`emit`。
+阶段 1 ~ 3 各留一条关键成果（细节见 `docs/CHANGELOG.md`）：
+- **阶段 1（跨视图对应）**：剖面标题 → 3D 轴线。`x=121.89（穿 r25.5 孔轴）`
+  这种**带描述的**剖面标题读得出来（旧管线只认整串恰好是标签的 `^([A-Z])[-—–]\1$`，
+  把带描述的一条整条丢弃）；bracket 两条剖面读通并报出坐标系镜像。
+- **阶段 2（制图约定）**：8 条约定 + 断裂视图识别，打通了视图坐标系。
+- **阶段 3（特征层）**：`R8.5` 首次被读出来（旧管线把 `R8_5` 当 `R8` 读，
+  即信息论局限表里那条"R8 vs R8.5 凹槽半径差"在新框架里有解了）。
+
 
 ### SolidWorks 自动化模块 (`src/core/sw_automation/`)
 
@@ -410,11 +457,31 @@ PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.ste
 - **单位约定**: 所有 SW API 参数使用**米 (meters)**，调用方负责 `mm / 1000` 转换。SW 内部单位设为 MMGS (毫米-克-秒)。**例外**：`SelectByID2` 使用**文档单位（MMGS 下为 mm）**。
 - `FeatureFillet3` 的 `Options` 参数在 SW2025 中必须为 `195`（`0` 和 `1` 均静默失败）
 - `SelectByID2` Type 大小写：中文 SW2025 中必须用 `"Edge"`（PascalCase），`"EDGE"` 全大写失败；`"FACE"`/`"PLANE"` 大小写不敏感
-- `InsertFeatureChamfer` Type=1 参数顺序：`Width=倒角距离(m)`, `OtherDist=角度(弧度)`——与直觉相反
+- `InsertFeatureChamfer` Type=1（角度-距离）参数顺序：`Width=角度(弧度)`, `OtherDist=倒角距离(m)`
+  （2026-09-28 复核更正：本节此前写作"Width=距离/OtherDist=角度"，与 `CAD/SW2025_API_REFERENCE.md:267`
+  的权威表相反；后者是 45 轮 VBA 验证的来源，且 `CAD/VerifySW2025_v45.bas:173` 的通过用例
+  正是 `(1, 1, 0.785, 0.0015, …)` = 45° × 1.5mm。`sw_driver.feature_chamfer_edge` 的实参顺序
+  与之一致，无需改。**尚未做"造件量体积"的独立实测**，若日后有倒角进特征树，按体积复核一次）
 - VBA 晚期绑定下 `On Error Resume Next` 会导致**假阳性**——每次调用前必须 `Set var = Nothing`
 - **VBScript 编码**: 必须使用 **GBK** (cscript 使用系统 ANSI 代码页 CP936)，UTF-8-BOM 会导致编译错误
 - **混合架构**: 旋转基体（Python COM）+ 倒角/圆角（VBScript 直接 COM）+ 键槽（Python COM FeatureCut3），各自使用最可靠的接口
 - **COM None 编组**: 需要 IDispatch* 参数处使用 `NULL_DISPATCH` / `_null_dispatch()` 而非 Python `None`
+- **晚期绑定下"属性 vs 方法"靠 `.Name` 认**（`emit/sw_builder._sw_member`）：win32com 的
+  动态对象**永远 `callable()`**，`hasattr(x,"Name")` 才是分界。属性（加括号就
+  `'NoneType' object is not callable`）：`GetDocuments`、`GetSketchSegments`、
+  `GetActiveSketch2`、`ActiveDoc`、`FirstFeature`、`GetTitle`、`GetSaveFlag`；
+  方法：`InsertRefPlane`、`FeatureCut3`。踩一次是半小时
+- **负偏移基准面静默落到 0**：`InsertRefPlane(8, −d)` 不报错、把面建在 0 位上
+  （实测：孔全切在错误高度）。正解 = **正距离 + 翻转位 `264`**（`8 + swRefPlaneOffsetFlip 256`；
+  128 是"中面"、用了会失败）
+- **切失败会留下开着的草图 → 后续切除连环失败**：`InsertSketch2(True)` 是**开关**，
+  特征建失败时草图仍开着，下一次 `start_sketch` 反而把它关掉。`sw_builder` 的对策是
+  `_dangling_sketch` / `_start_sketch` / `_require(driver, …)`——每个切除**必须**校验返回值
+- **切除不幂等**：对已经切掉的孔再切一次 → `FeatureCut3` 返回 `None`、整个构建失败。
+  这就是 `flange_d80` / `法兰练习` 早先发射失败的根因（阵列与 IR 特征建在同一处）；
+  正解是 `pattern_plan` 的覆盖语义（**IR 里已有的实例不重复发射**）
+- **`GetPartBox(True)`** 返回 `[xmin,ymin,zmin,xmax,ymax,zmax]`，单位米（不传 True 是米的
+  文档单位口径）；**空零件返回全 0**，且**基准面不算在内**——拿它当"有没有材料"的判据要小心
 - **SetAddToDB 两面性**（`dxf_to_sw_features.py` 实测，两个方向都会静默失败）:
   孔切除草图必须 `_sketch_loop(no_snap=True)`——SetAddToDB 绕过草图推理捕捉，
   否则键槽矩形角部距截面圆边 0.04mm 会被吸附畸变，致 `FeatureCut3` 返回 None；
