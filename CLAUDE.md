@@ -331,11 +331,10 @@ x 平移伪影。补上 dx 后同一对模型是：三视图 多余 1,681.28 / �
 阶跃过渡圆角 + 键槽切除）全部按 DXF 检测尺寸正确创建。
 
 **`src/` 内 GUI 与算法模块仍是骨架**——类结构和接口定义完整，核心算法标注
-`# TODO`，OCC API 调用已注释在代码中，待集成：
+`# TODO`，OCC API 调用已注释在代码中：
 
 - `gui/view3d/`（`display_shape`/`erase_all`/`fit_all` 已定义，等 `OCC.Display.qtDisplay`）
 - `core/projection/`（`HLRProjector`/`Orthographic`/`Axonometric`/`SectionView`，等 `HlrAlgo_Projector`）
-- `core/reconstruction/`（`WireMaker`/`FaceBuilder`/`ExtrudeBuilder`/`RevolveBuilder`）
 - `core/io/`（8 个导入/导出器；`FormatRegistry` 已完整，GUI 导入菜单已接
   `DxfImporter` 但当前返回空 Document）
 - `core/annotation/`（`AutoDimension`）
@@ -343,6 +342,43 @@ x 平移伪影。补上 dx 后同一对模型是：三视图 多余 1,681.28 / �
 ⚠️ **GUI 骨架与根目录脚本是两套独立实现**：三视图投影、2D→3D 重建这些能力
 在根目录脚本里已生产可用，`src/` 里的同名模块是尚未接线的另一份。改算法请
 落在根目录脚本，不要误以为 `src/core/projection/` 是现役代码。
+
+⚠️ **`src/core/reconstruction/` 已判定过时，不再续写**（2026-09-28）：
+`WireMaker`/`FaceBuilder`/`ExtrudeBuilder`/`RevolveBuilder` 的分解是**几何优先**
+思维（假定"先有线面、再有零件"），与 `docs/ARCHITECTURE.md` 定下的新框架入口
+（先有依据和 Claim）冲突。**不要去填它的 `# TODO`**，它应由 `src/rebuild/` 取代，
+最终删除。
+
+### 新框架 `src/rebuild/`（设计见 `docs/ARCHITECTURE.md`）
+
+图纸理解与三维重建的**重写**框架——不与 `dxf_to_3d_general.py` 共享代码。
+核心是换中间表示：**几何进几何出 → 经过"特征+尺寸"的符号层**。
+
+三条核心原则（`ARCHITECTURE.md` §3）：
+1. **系统里不存在裸数值**——每个数字都是 `Claim`（值+依据+方法+置信度+备选）。
+   由此"知道拒绝"塌缩成对 Claim 的查询，不是外加模块
+2. **歧义不提前消解**——"圆是孔还是凸台"在俯视图里同形，保留两个假设让约束剪枝
+3. **仪器先于引擎**——验证器先于重建器；阶段 0 刻意把验证器指向旧管线
+
+分层与依赖方向（单向，`ARCHITECTURE.md` §5）：
+`model`（零依赖纯数据）← `evidence` ← `views` ← `conventions` ← `features` ← `verify`；
+`verify` **不得依赖 `emit`**（验证须能只看特征树就预测形状）。
+
+解释器分层：`model`~`features` + `verify.predict/coverage` + `report` 只需
+ezdxf+numpy，**跑默认 python**；`verify.reproject` 与 `emit` 需要 OCC。
+
+阶段 0 已完成（2026-09-28）：`model/`（Claim/geom/feature_tree）、
+`evidence/`（dxf_reader + text_parser）、`report.py`、`inspect.py`、`selftest.py`。
+```bash
+python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--explain HANDLE]
+python -m src.rebuild.selftest       # 60 项自检，退出码 0 = 全过（项目无 pytest）
+```
+阶段 0 关键成果：**剖面标题的切平面与半径读出来了**。图纸里明写着
+`B—B  横剖 x=121.89（穿 r25.5 孔轴）`，而旧管线 `dxf_to_3d_general.py:618` 的
+正则 `^([A-Z])[-—–]\1$` 要求整串恰好是标签，把带描述的标题整条丢弃——
+**CLAUDE.md 记为"缺"的 B—B 圆心基准，一直在文件里**。
+未完成：`views/`（视图分离/投影制/对应关系）、`verify/`（compare/coverage/gate/
+predict）、`verify_legacy` CLI。
 
 ### SolidWorks 自动化模块 (`src/core/sw_automation/`)
 
