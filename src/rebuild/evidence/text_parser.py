@@ -207,12 +207,38 @@ class ParsedText:
 
 # ---- 解析 ----
 
+def strip_mtext_codes(s: str) -> str:
+    """去掉 MTEXT 的内联格式码 —— **先洗再解**。
+
+    ezdxf 读出的 MTEXT 带原始内联码，实测本项目 20160112 图上
+    每条标题栏文字都长这样：``\\T1.1;减速器Ⅰ轴`` / ``\\T1.1;F-F``。
+
+    不洗的后果是**静默的**：剖面标题 ``\\T1.1;F-F`` 不匹配 ``^F-F$``，
+    于是整条剖面信息丢掉（旧管线就是这么丢掉 `B—B 横剖 x=121.89` 的，
+    见 CLAUDE.md 阶段 0 关键成果）。这里洗掉：
+
+    - ``\\T<数字>;`` / ``\\A<数字>;`` / ``\\H<数字>;`` … 单字母+参数+分号
+    - ``\\P`` 段落换行 → 空格
+    - ``{\\... }`` 分组花括号
+    - ``\\~`` 不换行空格 → 空格；``%%d/%%p/%%c`` → °/±/φ（AutoCAD 老式转义）
+    """
+    if "\\" not in s and "{" not in s:
+        return s
+    out = re.sub(r"\\[A-Za-z][^;\\{}]{0,12};", "", s)   # \T1.1; \A2; …
+    out = re.sub(r"\\P", " ", out)
+    out = out.replace("\\~", " ")
+    out = out.replace("\\", "")
+    out = out.replace("{", "").replace("}", "")
+    out = out.replace("%%d", "°").replace("%%p", "±").replace("%%c", "φ")
+    return out.strip()
+
+
 def parse_text(
     text: str, handle: EvidenceRef, x: float, y: float, layer: str = ""
 ) -> ParsedText:
     """解析一条文字。**永不抛异常** —— 认不出就归 PLAIN/UNKNOWN 并留下残料。"""
     raw = text
-    t = (text or "").strip()
+    t = strip_mtext_codes((text or "").strip()).strip()
     if not t:
         return ParsedText(handle, raw, x, y, layer, TextKind.PLAIN)
 

@@ -19,7 +19,10 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.rebuild.evidence.dxf_reader import read_dxf                     # noqa: E402
+from src.rebuild.evidence.dxf_reader import (                            # noqa: E402
+    classify_role,
+    read_dxf,
+)
 from src.rebuild.evidence.model import ViewType                          # noqa: E402
 from src.rebuild.evidence.text_parser import (                           # noqa: E402
     TextKind,
@@ -27,7 +30,13 @@ from src.rebuild.evidence.text_parser import (                           # noqa:
     parse_text,
 )
 from src.rebuild.model import Claim, OpenQuestion, Tier, merge           # noqa: E402
-from src.rebuild.views import detect_views, type_views                   # noqa: E402
+from src.rebuild.model.geom import Axis3                                 # noqa: E402
+from src.rebuild.views import (                                          # noqa: E402
+    CorrKind,
+    build_correspondence,
+    detect_views,
+    type_views,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -204,6 +213,42 @@ def test_reader() -> None:
     check("B—B 切平面 = x=121.89",
           titles["B"].cut_axis == "x" and titles["B"].cut_pos == 121.89)
     check("B—B 半径 = 25.5", titles["B"].radius == 25.5)
+
+    # ---- C8 角色 → 种类：修复前 _kind_of 是死代码，中心线带 kind=edge 进包围盒 ----
+    deg = read_dxf(simple / "block_3view.dxf")
+    check("block_3view 中心线 6 条以 kind=AXIS 入账", len(deg.axes()) == 6,
+          str(len(deg.axes())))
+    check("中心线不再混作 EDGE（角色 AXIS ⇒ 种类 AXIS）",
+          all(e.kind.value == "axis" for e in deg.evidence
+              if e.role.value.value == "axis"),
+          str([(e.handle, e.kind.value) for e in deg.evidence
+               if e.role.value.value == "axis"][:4]))
+    d12 = read_dxf(ROOT / "CAD" / "20160112-181116-09933.dxf")
+    check("20160112 中心线层 13 条 ⇒ 13 条 AXIS", len(d12.axes()) == 13,
+          str(len(d12.axes())))
+    check("20160112 轴线全在中心线层",
+          {e.layer for e in d12.evidence if e.kind.value == "axis"}
+          == {"中心线层"})
+
+    # ---- C9 未展开的块引用如实入账（不许静默丢弃） ----
+    blocks = [e for e in d12.evidence if e.kind.value == "block"]
+    check("20160112 的 24 个块引用全部入账", len(blocks) == 24, str(len(blocks)))
+    check("块引用标明「未展开」",
+          all(e.role.method == "unexpanded:insert" for e in blocks),
+          str({e.role.method for e in blocks}))
+
+    # ---- C10 MTEXT 内联码**先洗后解**：不洗则标题整条丢掉（旧管线的病根） ----
+    fmark = [t for t in d12.texts if t.text.endswith("F-F")]
+    check("20160112 的 `\\T1.1;F-F` 被解成剖面标记",
+          bool(fmark) and all(t.kind == TextKind.SECTION_MARKER for t in fmark),
+          str([(t.handle, t.text, t.kind.value) for t in fmark]))
+
+    # ---- C11 尺寸线层上的几何不当作轮廓 ----
+    dim_role = classify_role("尺寸线层", "", "TEST")
+    check("尺寸线层 ⇒ Role.UNKNOWN（不参与轮廓）",
+          dim_role.value.value == "unknown"
+          and dim_role.method == "convention:dim_layer",
+          f"{dim_role.value.value} / {dim_role.method}")
 
 
 # ============ D. 视图分离与定性 ============
@@ -469,6 +514,118 @@ def test_verify() -> None:
           any("缺" in r for r in g_single.reasons), str(g_single.reasons))
 
 
+# ============ F. 跨视图对应（阶段 1） ============
+
+#: 6 个回归靶子 —— 阶段 1 验收要求"中心线共线匹配在 6 个回归用例上无误配"
+_CASES = (
+    ROOT / "CAD" / "temp_output" / "bracket_angker_图纸_20260922_剖面图.dxf",
+    ROOT / "CAD" / "temp_output" / "bracket_angker_三视图_v4.dxf",
+    ROOT / "CAD" / "20160112-181116-09933.dxf",
+    ROOT / "CAD" / "test_simple" / "block_3view.dxf",
+    ROOT / "CAD" / "test_simple" / "plate_100x60.dxf",
+    ROOT / "CAD" / "temp_output" / "spoon_三视图.dxf",
+)
+
+
+def _windows(frames: dict) -> dict[str, tuple[float, float]]:
+    """各模型轴上、全部视图共同给出的坐标窗口。"""
+    out: dict[str, tuple[float, float]] = {}
+    for f in frames.values():
+        for a in "xyz":
+            s = f.model_span(a)
+            if s is None:
+                continue
+            lo, hi = out.get(a, (s[0], s[1]))
+            out[a] = (min(lo, s[0]), max(hi, s[1]))
+    return out
+
+
+def test_correspondence() -> None:
+    section("F. 跨视图对应（阶段 1）")
+
+    # F1 阶段 1 验收①：bracket 剖面图纸的两条剖面轴 —— 与标题文字
+    #    （B—B x=121.89 穿 r25.5 / C—C x=-18.11 穿 r20）**逐项对上**。
+    #    切平面位置由几何圆配准得出（标题坐标与图面坐标不同源，见 F3）。
+    sec = read_dxf(ROOT / "CAD" / "temp_output"
+                   / "bracket_angker_图纸_20260922_剖面图.dxf")
+    detect_views(sec)
+    type_views(sec)
+    res = build_correspondence(sec)
+    # 键取**来源视图**（V4/V5），不取剖面标签 —— 标签是单个字母（B/C），
+    # 一张图上两个剖面可能同名不同位，用视图 id 才是唯一的
+    axes = {c.refs[0][0]: c.mapping.value
+            for c in res.by_kind(CorrKind.AXIS)
+            if isinstance(c.mapping.value, Axis3)}
+    check("剖面轴读数 2 条（V4 / V5）", set(axes) == {"V4", "V5"},
+          str(sorted(axes)))
+
+    b = axes.get("V4")
+    if b is not None:
+        check("B—B 轴沿 Z", b.direction.z == 1.0 and b.direction.x == 0.0,
+              str(b.direction))
+        check("B—B 半径 = 标题的 25.5",
+              abs(b.radius.value - 25.5) < 1e-9, str(b.radius.value))
+        check("B—B 切平面 x = 45.30（121.89 经图面镜像配准）",
+              abs(b.origin.x - 45.3025) < 0.01, f"{b.origin.x:.4f}")
+        check("B—B 孔心 y = 148.05", abs(b.origin.y - 148.0547) < 0.01,
+              f"{b.origin.y:.4f}")
+    c = axes.get("V5")
+    if c is not None:
+        check("C—C 轴沿 Z", c.direction.z == 1.0, str(c.direction))
+        check("C—C 半径 = 标题的 20", abs(c.radius.value - 20.0) < 1e-9,
+              str(c.radius.value))
+        check("C—C 切平面 x = 185.30（-18.11 经同一镜像常量配准）",
+              abs(c.origin.x - 185.3025) < 0.01, f"{c.origin.x:.4f}")
+
+    # F2 标题坐标与图面坐标**互为镜像**这件事必须报出来，而不是静默选一路：
+    #    两个剖面各自独立给出同一镜像常量 k=167.190，而平移解不存在
+    #    （偏移 -76.59 与 +203.41 互不相同）。这是出图侧俯视图画成仰视图的
+    #    直接后果（model_to_drawing.project_all_views 的 dx = up × dz）。
+    inc = res.questions.by_kind(OpenQuestion.INCONSISTENT_FRAME)
+    check("报出「标注坐标系与图面不一致」", len(inc) == 1, str(len(inc)))
+    if inc:
+        check("候选里带镜像常量 167.190",
+              any("mirror:167.190" in str(x) for x in inc[0].candidates),
+              str(inc[0].candidates))
+        check("两个平移候选都在（-76.59 / 203.41）",
+              any("-76.59" in str(x) for x in inc[0].candidates)
+              and any("203.41" in str(x) for x in inc[0].candidates),
+              str(inc[0].candidates))
+
+    # F3 中心线共线匹配：**6 个回归用例逐张跑，判据不是"看起来对"而是
+    #    "落在零件自己的坐标窗口里"** —— 误配必然把位置甩到窗口外。
+    n_center = 0
+    for path in _CASES:
+        if not path.exists():
+            check(f"{path.name} 存在", False)
+            continue
+        d = read_dxf(path)
+        detect_views(d)
+        type_views(d)
+        r = build_correspondence(d)
+        win = _windows(r.frames)
+        bad: list[str] = []
+        for corr in r.by_kind(CorrKind.AXIS):
+            val = corr.mapping.value
+            if not isinstance(val, Axis3) or val.radius is not None:
+                continue          # 只看中心线来的（无半径）
+            n_center += 1
+            # 同视图十字中心线定出的轴，**沿该视图投影方向的那一维本来就没信息**
+            # （图纸上不可见），代码按 0 占位 —— 那不是误配，跳过该维
+            skip = {r.frames[v].p_axis for v, _ in corr.refs if v in r.frames}
+            for a, coord in (("x", val.origin.x), ("y", val.origin.y),
+                             ("z", val.origin.z)):
+                if a in skip:
+                    continue
+                w = win.get(a)
+                if w is not None and not (w[0] - 1.0 <= coord <= w[1] + 1.0):
+                    bad.append(f"{a}={coord:.2f}∉[{w[0]:.2f},{w[1]:.2f}]")
+        check(f"{path.name}：中心线轴全落在零件坐标窗口内", not bad,
+              " / ".join(bad))
+    check("靶子里确有中心线被匹配上（否则 F3 是空转）", n_center > 0,
+          str(n_center))
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -480,6 +637,7 @@ def main() -> int:
     test_reader()
     test_views()
     test_verify()
+    test_correspondence()
 
     print("\n" + "=" * 72)
     if _failed:

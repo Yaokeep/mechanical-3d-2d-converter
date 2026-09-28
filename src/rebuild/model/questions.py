@@ -27,6 +27,9 @@ class OpenQuestion(StrEnum):
     MISSING_VIEW = "缺视图"
     UNREADABLE_NOTE = "标注无法解析"
     UNKNOWN_PROJECTION = "投影制未确定"      # 第一角/第三角判不出
+    #: 标注里的坐标与图面几何**不同源**（差镜像/坐标系不一致）——
+    #: 不是"缺信息"，是两路证据互相矛盾，必须报出来而不是悄悄选一路
+    INCONSISTENT_FRAME = "标注坐标系与图面不一致"
     UNKNOWN_VIEW = "视图未定性"
     OUT_OF_DOMAIN = "超出解释域"             # 自由曲面等（§12）
 

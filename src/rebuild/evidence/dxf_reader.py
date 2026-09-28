@@ -62,12 +62,26 @@ def classify_role(layer: str, linetype: str, handle: EvidenceRef) -> Claim[Role]
         return Claim(Role.BREAK_LINE, "convention:layer", Tier.CONVENTION, ref)
     if _match(_CUT_WORDS, layer, linetype):
         return Claim(Role.SECTION_CUT, "convention:layer", Tier.CONVENTION, ref)
+    if _match(_DIM_WORDS, layer):
+        # 尺寸线层上的几何是**标注的附属**（尺寸界线/箭头），不是零件轮廓：
+        # 让它当可见轮廓会污染视图包围盒与轮廓环提取
+        return Claim(Role.UNKNOWN, "convention:dim_layer", Tier.CONVENTION, ref)
     if _match(_HIDDEN_WORDS, layer, linetype):
         return Claim(Role.HIDDEN, "convention:linetype", Tier.CONVENTION, ref)
     return Claim(Role.VISIBLE, "default", Tier.GUESS, ref)
 
 
 def _kind_of(role: Role) -> Kind:
+    """角色 → 证据种类。
+
+    ⚠️ 2026-09-28 修：本函数此前是**死代码** —— 三个几何循环把 ``Kind.EDGE``
+    写死，从不问角色，于是 13 条中心线（图层"中心线层"）带着 ``kind=edge``
+    进了视图包围盒与间隙聚类（``d.axes()`` 永远是空的）。
+
+    正确的分工：**角色先判、种类跟着角色走**。中心线不是轮廓边
+    （它的两端要伸出零件外），混进包围盒会把视图尺寸撑大 ——
+    和 v0.6.15 剖切线撑大俯视图是同一类错。
+    """
     if role == Role.AXIS:
         return Kind.AXIS
     if role == Role.BREAK_LINE:
@@ -106,35 +120,47 @@ def read_dxf(path: str | Path) -> Drawing:
             layer=layer, linetype=linetype, pattern=pattern,
         ))
 
+    def add_edge(e, geom, layer: str, linetype: str) -> None:
+        """轮廓类图元：**先判角色，再由角色定种类**（见 _kind_of 的说明）。"""
+        ref = new_ref(e)
+        role = classify_role(layer, linetype, ref)
+        drawing.evidence.append(Evidence(
+            handle=ref, kind=_kind_of(role.value), geom=geom, role=role,
+            layer=layer, linetype=linetype,
+        ))
+
     # ---- 直线 / 弧 / 圆 ----
     for e in msp.query("LINE"):
-        add_geom(e, Line2(Point2(e.dxf.start.x, e.dxf.start.y),
+        add_edge(e, Line2(Point2(e.dxf.start.x, e.dxf.start.y),
                           Point2(e.dxf.end.x, e.dxf.end.y)),
-                 Kind.EDGE, e.dxf.layer, e.dxf.linetype)
+                 e.dxf.layer, e.dxf.linetype)
 
     for e in msp.query("ARC"):
-        add_geom(e, Arc2(Point2(e.dxf.center.x, e.dxf.center.y), e.dxf.radius,
+        add_edge(e, Arc2(Point2(e.dxf.center.x, e.dxf.center.y), e.dxf.radius,
                          _rad(e.dxf.start_angle), _rad(e.dxf.end_angle)),
-                 Kind.EDGE, e.dxf.layer, e.dxf.linetype)
+                 e.dxf.layer, e.dxf.linetype)
 
     for e in msp.query("CIRCLE"):
-        add_geom(e, Circle2(Point2(e.dxf.center.x, e.dxf.center.y), e.dxf.radius),
-                 Kind.EDGE, e.dxf.layer, e.dxf.linetype)
+        add_edge(e, Circle2(Point2(e.dxf.center.x, e.dxf.center.y), e.dxf.radius),
+                 e.dxf.layer, e.dxf.linetype)
 
     # ---- 多段线：炸成 LINE/ARC（bulge 转弧由 ezdxf 负责） ----
     # 图纸大量使用 LWPOLYLINE 画轮廓，不展开等于漏掉主体几何
     for e in msp.query("LWPOLYLINE POLYLINE"):
+        lay = e.dxf.layer
+        lt = getattr(e.dxf, "linetype", "")
         try:
             for sub in e.virtual_entities():
                 if sub.dxftype() == "LINE":
-                    add_geom(sub, Line2(Point2(sub.dxf.start.x, sub.dxf.start.y),
+                    add_edge(sub, Line2(Point2(sub.dxf.start.x, sub.dxf.start.y),
                                         Point2(sub.dxf.end.x, sub.dxf.end.y)),
-                             Kind.EDGE, e.dxf.layer, getattr(e.dxf, "linetype", ""))
+                             lay, lt)
                 elif sub.dxftype() == "ARC":
-                    add_geom(sub, Arc2(Point2(sub.dxf.center.x, sub.dxf.center.y),
+                    add_edge(sub, Arc2(Point2(sub.dxf.center.x, sub.dxf.center.y),
                                        sub.dxf.radius,
-                                       _rad(sub.dxf.start_angle), _rad(sub.dxf.end_angle)),
-                             Kind.EDGE, e.dxf.layer, getattr(e.dxf, "linetype", ""))
+                                       _rad(sub.dxf.start_angle),
+                                       _rad(sub.dxf.end_angle)),
+                             lay, lt)
         except Exception as exc:   # noqa: BLE001 —— 单条多段线坏掉不该毁掉整张图
             print(f"  [WARN] 多段线展开失败（handle={getattr(e.dxf, 'handle', '?')}）: {exc}")
 
@@ -158,6 +184,19 @@ def read_dxf(path: str | Path) -> Drawing:
                      role_override=Claim(Role.HATCH_BOUNDARY,
                                          "convention:hatch", Tier.CONVENTION, (ref,)))
 
+    # ---- 块引用：**记录但标明未展开** ----
+    # 不能假装没看见：INSERT 里可能有真几何（本项目 20160112 图上
+    # 粗实线层就有 2 个块引用），静默丢弃正是旧管线的病根。
+    # 展开需要递归处理块定义坐标变换，暂不做 —— 如实记一条 SUBGRAPH 证据，
+    # 由覆盖率报告把它摆到台面上（"有多少图元我们没看懂"）。
+    for e in msp.query("INSERT"):
+        ref = new_ref(e)
+        drawing.evidence.append(Evidence(
+            handle=ref, kind=Kind.BLOCK, geom=_insert_bbox_geom(e),
+            role=Claim(Role.UNKNOWN, "unexpanded:insert", Tier.GUESS, (ref,)),
+            layer=e.dxf.layer, linetype="",
+        ))
+
     # ---- 文字 ----
     for e in msp.query("TEXT MTEXT"):
         ref = new_ref(e)
@@ -178,6 +217,29 @@ def read_dxf(path: str | Path) -> Drawing:
 
 def _rad(deg: float) -> float:
     return math.radians(deg)
+
+
+def _insert_bbox_geom(e) -> Line2:
+    """块引用的占位几何：其插入点/包围盒对角。
+
+    只用来"知道它在图纸的哪个位置"（归属视图、算覆盖率），
+    **不参与视图包围盒**（Kind.BLOCK 不在 view_detector 的轮廓白名单里）——
+    否则一个跨越半张图的块会把视图撑变形。
+    """
+    try:
+        ins = e.dxf.insert
+        x, y = float(ins.x), float(ins.y)
+    except Exception:      # noqa: BLE001
+        return Line2(Point2(0.0, 0.0), Point2(0.0, 0.0))
+    try:
+        block = e.doc.blocks.get(e.dxf.name)
+        bb = block.block.dxf.extents if block else None
+        if bb is not None:
+            return Line2(Point2(x + float(bb[0]), y + float(bb[1])),
+                         Point2(x + float(bb[2]), y + float(bb[3])))
+    except Exception:      # noqa: BLE001 —— 块定义查不到就退化为插入点
+        pass
+    return Line2(Point2(x, y), Point2(x, y))
 
 
 def _hatch_bbox_geom(e) -> Line2:

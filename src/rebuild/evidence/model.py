@@ -27,6 +27,10 @@ class Kind(StrEnum):
     DIMENSION = "dimension"    # 尺寸标注
     NOTE = "note"              # 文字标注（含剖面标题）
     BREAK = "break"            # 波浪线：视图断裂
+    #: 块引用（INSERT）—— **记下来但没展开**。存在的意义是不静默丢弃：
+    #: 块里可能有真几何（本项目 20160112 图粗实线层就有 2 个），
+    #: 展开要做块定义的坐标变换，暂不做，改为让覆盖率把它摆出来。
+    BLOCK = "block"
 
 
 class Role(StrEnum):

@@ -119,16 +119,21 @@ def detect_views(d: Drawing, params: DetectParams | None = None) -> list[View]:
     """
     p = params or DetectParams()
 
-    # ---- 参与分离的几何：轮廓边与 HATCH 边界 ----
-    # 排除三类，各有理由：
-    #  - Kind.HATCH：本体的 geom 只是个占位对角线段（真实形状在它的边界图元里），
-    #    让它参与会把视图包围盒撑成对角线
+    # ---- 参与分离的几何：**只认轮廓**（白名单，不是黑名单） ----
+    # 三类进得来：可见轮廓、隐藏线、剖面线边界 —— 它们才是"零件在该视图里
+    # 占多大地方"的依据。其余一律排除，各有理由：
     #  - Role.SECTION_CUT：剖切线画在视图**外**（两端伸出并带箭头），
     #    实测把 bracket 俯视图的纵向尺寸从 51 撑到 67（+31%）
-    #  - Kind.AXIS / Kind.BREAK：轴线的 kind 不是 EDGE，天然排除
+    #  - Role.AXIS（kind=AXIS）：中心线两端伸出零件外，同理
+    #  - Role.UNKNOWN（尺寸线层上的界线/箭头）
+    #  - Kind.BLOCK：未展开的块引用，占位几何可能跨半张图
+    #  - Kind.HATCH：本体的 geom 只是个占位对角线段（真实形状在它的边界图元里）
+    # 用白名单而非黑名单：以后新增角色时默认**不参与**，宁可漏算也不虚胖
+    # （虚胖是静默的：它只让尺寸偏大，不报错）。
     # 这些图元仍归属到视图（见 _assign），只是不参与定包围盒。
+    _PROFILE_ROLES = {Role.VISIBLE, Role.HIDDEN, Role.HATCH_BOUNDARY}
     geom = [e for e in d.evidence
-            if e.kind == Kind.EDGE and e.role.value != Role.SECTION_CUT]
+            if e.kind == Kind.EDGE and e.role.value in _PROFILE_ROLES]
     if not geom:
         d.views = []
         return []
