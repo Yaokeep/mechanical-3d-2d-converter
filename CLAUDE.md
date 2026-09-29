@@ -86,11 +86,12 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
                                                # 用户目视标记缺陷的入口（v0.6.18 三缺陷即由此而来）。
                                                # 脚本内路径写死 bracket：换重建结果改 main() 里 read_step 的 _3d.step 路径
 # 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性脚本一律用 `_` 前缀，
-# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；现存 67 个（2026-09-28
-# 计数）分五类：`_probe_*.py` 几何探针（34 个：_probe_ysec 逐 y 层截面 / _probe_zsec
+# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；现存 90 个（2026-09-29
+# 计数）分六类：`_probe_*.py` 几何探针（38 个：_probe_ysec 逐 y 层截面 / _probe_zsec
 # 水平截面 / _probe_tor9 挂耳 / _probe_gap145 挂耳间隙）、`_diag_*.py` 根因诊断（14）、
 # `_csg_*.py` 代码版本备份、`_dump_*`/`_draw_*` 截面叠加工具链（见下方"截面叠加图"节）、
-# `_analyze_*`/`_dump_ear` 挂耳分析及杂项。其中两个常用：
+# `_analyze_*`/`_dump_ear` 挂耳分析及杂项、`_sw_*.py` SW COM API 探测（20 个：2026-09-28
+# 一轮 fillet/planes/cut/edge/circ 探针，`_sw_cleanup.py` 收尾）。其中两个常用：
 # `_run_rebuild.py` 受控实验/基线重跑（直接调 convert_dxf_to_3d，不经 CLI、不触发
 # SW 导入——单靶子重跑首选）、`_sw_show.py` 把 STEP 导入 SW 留给用户看（不调
 # disconnect()，绕开"收尾关活动文档"问题）。
@@ -505,7 +506,9 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   `main_window.py:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
   + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
   `dxf_to_sw_features.py` 的 docstring 与结尾 print）。
-  （2026-09-28 核对：tag 已与 HEAD 对齐，git describe 返回 v0.6.19）
+  （2026-09-29 核对：tag 落后 HEAD 9 个提交，git describe 返回
+  v0.6.19-9-g0a5abf7——9 个均为 v0.6.19 前缀的新框架阶段 0~4 提交；
+  是否前移 tag 或出 v0.6.20 待定）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。
@@ -515,7 +518,7 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
 ## Git 约定
 
 - **Commit 消息格式**: `<版本标签>: <简短描述>`，如 `v0.5.0: DXF→SW 全流程打通`
-- **Co-Authored-By**: 每次 commit 末尾添加 `Co-Authored-By: Claude <noreply@anthropic.com>`
+- **Co-Authored-By**: 每次 commit 末尾添加 `Co-Authored-By: Claude Code <noreply@anthropic.com>`（2026-09-29 更正：近 5 次提交实际署名均为 Claude Code，旧写 Claude 与现实践不符）
 - **自动推送**: 每次本地 commit 后自动 `git push`（用户偏好设置）
 - **每次建模使用新文件名**: SW 模型不能覆盖已有文件（防止 SW 进程占用导致保存失败），使用时间戳确保文件名唯一
 - **SW 同时只保留一个模型**: 建模/导入完成后**不要立即关闭**（模型留在 SW 里给用户查看）；下一次重建前先关掉上一个再建新的——防 SW 进程内模型堆积崩溃，同时保住可查看性。⚠️ **代码尚未落地（用户要求先不动）**：`sw_driver.py` 的 `disconnect()` 目前仍是收尾自动关活动文档（会把刚建好的模型也关掉），落地需改收尾逻辑为只关非本次构建的旧文档
