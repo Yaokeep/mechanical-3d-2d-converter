@@ -532,7 +532,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "关于 机械三维二维图互转",
-            "<h3>机械三维二维图互转 v0.6.18</h3>"
+            "<h3>机械三维二维图互转 v0.6.19</h3>"
             "<p>机械工程 3D ↔ 2D 双向互转桌面工具</p>"
             "<p>技术栈：PyQt6 + OpenCASCADE (PythonOCC) + SolidWorks COM</p>"
             "<hr>"

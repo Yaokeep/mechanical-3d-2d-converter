@@ -86,12 +86,13 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
                                                # 用户目视标记缺陷的入口（v0.6.18 三缺陷即由此而来）。
                                                # 脚本内路径写死 bracket：换重建结果改 main() 里 read_step 的 _3d.step 路径
 # 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性脚本一律用 `_` 前缀，
-# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；现存 91 个（2026-09-30
-# 计数）分六类：`_probe_*.py` 几何探针（38 个：_probe_ysec 逐 y 层截面 / _probe_zsec
+# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；现存 110 个（2026-10-01
+# 计数）分七类：`_probe_*.py` 几何探针（43 个：_probe_ysec 逐 y 层截面 / _probe_zsec
 # 水平截面 / _probe_tor9 挂耳 / _probe_gap145 挂耳间隙）、`_diag_*.py` 根因诊断（14）、
-# `_csg_*.py` 代码版本备份、`_dump_*`/`_draw_*` 截面叠加工具链（见下方"截面叠加图"节）、
-# `_analyze_*`/`_dump_ear` 挂耳分析及杂项、`_wx_build.py` 20230425 样本真值建模器、`_sw_*.py` SW COM API 探测（20 个：2026-09-28
-# 一轮 fillet/planes/cut/edge/circ 探针，`_sw_cleanup.py` 收尾）。其中两个常用：
+# `_csg_*.py` 代码版本备份（3）、`_dump_*`/`_draw_*` 截面叠加工具链（3，见下方"截面叠加图"节）、
+# `_analyze_*`/`_render_*`/`_run_*` 等杂项（14）、`_wx_*.py` 20230425 样本真值建模与诊断
+# （10：`_wx_build.py` 手工建模真值 + 8 个 `_wx_diag_*` + `_wx_verify_step` 诊断）、`_sw_*.py`
+# SW COM API 探测（23 个：2026-09-28 一轮 fillet/planes/cut/edge/circ 探针，`_sw_cleanup.py` 收尾）。其中两个常用：
 # `_run_rebuild.py` 受控实验/基线重跑（直接调 convert_dxf_to_3d，不经 CLI、不触发
 # SW 导入——单靶子重跑首选）、`_sw_show.py` 把 STEP 导入 SW 留给用户看（不调
 # disconnect()，绕开"收尾关活动文档"问题）。
@@ -112,6 +113,13 @@ $PY model_to_drawing.py input.step [out.dxf]             # STEP → 三视图 DX
 # ↑ 同时自动输出 <out>_剖面图.dxf：三视图 + 自动选位剖面 + HATCH + 剖切线标记。
 #   两个文件分开是必须的——闭环重建把 HATCH 当剖面材料信号、把多余视图簇
 #   当独立视图，混在一起会破坏重建。--no-section 可关闭
+# ⚠️ input.step 必须是**原始 STEP**（SW 导出 / 基准模型），**不要喂闭环重建产物**：
+#   重建模型带被布尔裁剪过的 B 样条/球面，精确 HLR 对它们**静默返回空**（不是报错、
+#   不是空文件——只是那个方向少几条线）。实测轴测量_3d.step（重建产物）side 视图
+#   83 线 → 5 线，剖面图闭环随之从 42,379.88 崩到 1,016,930（视图分离 5 区 → 3 区，
+#   top/side 凑不出封闭环）。同一份代码喂 三维/轴测量.STEP 逐位复现 42,379.88。
+#   判断法：生成日志里某个视图的线数明显偏少（如 side 5 线）就是它。
+#   注：剖面本身走 PolyAlgo（网格）不受影响，所以剖面视图照出——缺的是三视图那一路
 $PY model_to_drawing.py input.step out.dxf --no-section   # 只要三视图
 $PY dxf_to_3d_general.py out.dxf                         # DXF → 重建 STEP（末尾会尝试导入 SW）
 $PY compare_models.py 基准.step 重建.step                # 体积/bbox/布尔差定量对比
@@ -141,6 +149,19 @@ python CAD/temp_output/generate_engineering_drawing.py   # SW COM 生成工程�
 #   全剖 y=0.00"…）用的都是唯一文字样式 `Standard`，其 font='txt'（txt.shx，无 CJK
 #   字形）、无 bigfont → 在任何 CAD 里都渲染成方框；标注里的破折号 U+2014 同理。
 #   修法：给该样式补 bigfont='gbcbig.shx'（AutoCAD 经典组合），或改用中文 TTF
+# ⚠️ 该模块的 project_shape_to_2d / _dedup_lines 被 model_to_drawing.py 复用
+#   （HLR 投影的唯一实现），改这两个函数会同时影响两条出图路径。2026-10-01 修两处：
+#   ① `_dedup_lines` 丢弃**退化线段**（两端重合）：曲线离散在驻点处会吐出这种零长
+#      LINE，画不出东西却是图纸里的非法实体（选不中/删不掉）。D79307 三视图 8 条、
+#      IMU 5 条、轴测量 2 条
+#   ② 可见优先：HLR 会把**同一条棱同时塞进 VCompound 与 HCompound**（D79307 主视图
+#      160 条可见里 42 条也出现在隐藏集，26%；30 条来自 HLR、12 条来自
+#      _supplement_outline_lines）。隐藏线后画 → 把黑轮廓整片盖成蓝色（渲染实测
+#      主视图 35,595 蓝像素 vs 1,765 黑像素，等于整张图看不见可见轮廓）。现在按
+#      0.001mm 细键跨层比对，可见优先。注意**同层**去重（_dedup_lines）用 0.1mm 键、
+#      **跨层**比对用 0.001mm 键——混用会把真实短段吞掉
+#   判别图有没有这毛病：`_probe_layerlen.py <dxf>` 看某视图带的可见/隐藏总长，
+#   或直接渲染数像素。修完 D79307 主视图 19,507 黑 / 15,306 蓝
 ```
 
 ## 开发环境
@@ -205,7 +226,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 根目录独立脚本（不通过 main.py 调用，直接命令行运行）:
   dxf_to_sldprt.py       — DXF 阶梯轴 → SW .sldprt 原生文件（DXF 解析 + SW COM）
-  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，8957 行）
+  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，9296 行）
                            核心链: 边图构建→封闭环检测→视图分离(Y+X 间隙，v0.6.15 起含剖面行识别)
                            →CSG 体积求交 / 单视图轮廓拉伸
                            CSG: 各视图外轮廓拉伸为棱柱→布尔交集→内部特征布尔减(P0)→投影验证(P1)
@@ -219,6 +240,13 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
                            强移到原点 → bracket 0.4947mm 系统错位 = 用户标记的凸台右弧
                            空缺）；新增"整圆附加环"（挂线穿圆外的整圆 Union 回棱柱，
                            恢复被外环遍历淘汰的凸台圆；NO_EXTRAS=1 可关，受控实验用）
+                           v0.6.20: "隐藏斜断面刀"（_hidden_slant_cuts）——不可见斜切
+                           内腔（图纸只用隐藏**斜线**表达，旧版在 _is_skip_entity 处
+                           整条丢弃）。两条证据缺一不出刀：top 外环内隐藏斜线弦 + 该弦
+                           x 跨度映射到 front 帧内的隐藏水平线（给 z）。区域 = 外环被
+                           弦切成两半中 x 跨度 ⊆ 弦 x 跨度者；两半都合格/都不合格 →
+                           多义跳过。轴测量靶子由此从 +1,920 变 0 差（SLANT_DBG /
+                           SLANT_DBG2 为诊断打印开关）
   convert_dwg_to_3d.py   — DXF → STEP 3D 转换流水线（含 DXF 阶梯轴几何解析 + PythonOCC 建模）
   section_view.py        — 剖面图生成（结构分析自动选剖切位置 + 半空间裁剪 + 真 HATCH）。
                            被 model_to_drawing.py 调用。三条硬约束写在模块注释里：
@@ -229,7 +257,23 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
                               布尔裁剪后，精确 HLR 所有通道返回 0 边（形状本身有效）
                            ③ 剖面线取真实截面 face 的外环+内环 → HATCH，孔洞留白；
                               自检 2D 路径面积 vs OCC 实测面积（bracket 三剖面误差 <0.005%）
-  dxf_to_sw_features.py  — 通用 DXF 工程图 → SW 原生特征模型（1040 行，v0.6.6 新）。复用
+                           2026-10-01（D79307 出图）三处：
+                           · `_clamp_axis_pos`：候选剖面位置的轴坐标**必须夹进该圆柱面自身
+                             bbox 跨度**——`gp_Cylinder.Axis().Location()` 是无限轴上的
+                             任意点，实测 r12.39 那条轴落在 (21, 350, −37.08)（零件
+                             Z∈[−35.1, 4.9]），照搬就得到整片在零件外的"横剖"，剖空
+                           · 空剖面守卫（在 model_to_drawing）：实测截面面积 0 的剖面丢弃后
+                             按 SECTION_LABELS 重排编号。**判据取 OCC 实测面积，不能取
+                             2D 路径面积**——路径缺失时两者同为 0，自检会判 [OK]
+                           · project_section_poly **不再输出隐藏线**（键保留空列表）：
+                             剖视图按制图法不画虚线；且 PolyAlgo 的隐藏边是网格碎段
+                             （D79307 A—A：1270 条 / 238.5mm，均值 0.19mm），画上去只是
+                             把黑轮廓涂蓝。闭环那头也不受影响——HIDDEN 线型命中
+                             `dxf_to_3d_general.SKIP_LINETYPES` 本来就跳过
+                             （实测去掉后 剖面图闭环 42,379.87674077447 逐位不变）
+                           可见线仍要按 0.001mm 键去重（PolyAlgo 同一条棱同时进
+                           VCompound 与 OutLineVCompound）
+  dxf_to_sw_features.py  — 通用 DXF 工程图 → SW 原生特征模型（1111 行，v0.6.6 新）。复用
                            dxf_to_3d_general 的 CSG 重建结果，z 切片环提取→轨迹跟踪→分段
                            （const/cone/vary）→ SW COM 特征建模（凸台序列自底向上+孔切除+材料岛）。
                            关键修复: 方∩圆法兰轮廓（_normalize_loops 弧端点重合判据，防整圆误合成）、
@@ -285,7 +329,8 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 ## 项目当前状态
 
 版本 v0.6.19（git tag 为准）。代码内三处版本字符串（`app.py:15` /
-`main_window.py:28` / `main_window.py:535`）与 git 一致，已核对。
+`main_window.py:28` / `main_window.py:535`）与 git 一致，已核对
+（2026-10-01 复核：关于对话框 `main_window.py:535` 此前漏改仍写 v0.6.18，已补正）。
 **逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.19）——
 本节只留仍在影响决策的部分。
 
@@ -297,6 +342,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 | PF60K 法兰盘（SW 特征模型，18 特征） | 261,875 / 261,935（−0.02%） | 收敛 |
 | bracket angker（三视图） | 净差 +539.61（+0.28%），重合 **99.5%**（多余 903.16 / 缺失 935.28） | 收敛；**v0.6.19 删除"坐标归一化"**（dx 口径 63.65→63.56）：多余 2,898.96→**903.16**、缺失 2,356.21→**935.28**、重合 98.8%→**99.5%**——用户标记的"凸台右弧空缺"即该块引入的 0.4947mm 系统错位（盒内材料 32.9→25.0，基准 32.5）。v0.6.18 刀组修复连带改善（恢复被多切的弧端/球台/弦棱 → 比 v0.6.17 多留 252）。**2026-09-24 挂耳间隙修复后净差从 −267.38 变 +538.38 是修复的必然效应**（挂耳右半实心恢复 +805.6 的缺失减少，见下行；非回归）。遗留：挂耳左半盒外多余 ~457（修复前就有的旧问题，修复后微减至 456.9，基准左半无材料） |
 | bracket angker（三视图+剖面图纸） | 净差 +8,114.06（+4.23%），重合 **99.6%**（多余 8,183.39 / 缺失 698.10） | **v0.6.19 删除"坐标归一化"**（dx 口径 63.65→63.56）：多余 8,946.99→**8,183.39**、缺失 1,638.74→**698.10**、重合 99.1%→**99.6%**（净差本身是 +4.23% 的臂区方块 + 融合投影天花板，见本行末段）。用户三缺陷已修复（端头弧/薄壁/挂耳五保护体；净 +202.7 = 修复净加材料效应非回归）。**2026-09-24 用户两处挂耳间隙缺陷（基准(163.08,−9.42,26.09)/(164.80,7.90,23.96)）根因+修复**：`_tor9` 臂环盘 revolve 保护体三错——①轴边画在旋转轴上 MakeRevol 退化生成 53.7% 空心体（顶底圆盘丢、torus 外圈丢）→ 外带反刀（盒−残壳）把正体挂耳芯挖空+外圈切光；②直段画在管心 r9 应为外轮廓 r12；③弧 θ∈[π/2,3π/2] 经 (6,7) 是内轮廓，外轮廓应 θ∈[0,π/2] 经 (12,7)。修复 = ε=0.001 离轴边 + 外轮廓 wire → 实心 100.00%（体积 8,772.80 = 理论 8,772.58）；右半挂耳恢复（107.4→272.0 vs 基准 278.0、0.1→53.3 vs 58.4），净差 +805.0 = 缺失恢复的必然效应。**剩余误差已定位成一块**（2026-09-22 截面叠加图 + 盒探针）：臂区方块 x[96,162]×y[±25] z>27 存活——探针 z[27,33] 重建 2,382.3 vs 基准 1,772.7、z[38,42] 1,588.2 vs 1,181.8，而同区域三视图路径 1,770.1 / 1,180.1 精确。**v0.6.18 证明 `sec_B`/`sec_C` 部分剖面棱柱不可行**：剖面只携带剖切位置零厚度截面信息（B—B 截面 = 两片 9.8×44 壁 862.4，逐 SOLID 探针已证出图侧截面提取正确、无 bug），而管腔沿 x 处处渐变（x[96,106] 实心条 → x[122,128] 中空壁 → x[128,144] 渐实心），图纸不含窗口信号（剖切线只有箭头无贯通线）——任何窗口的全长拉伸都误裁真材料（实测 HATCH 兜底 Fuse 合并后净差 −68.93%）。门控"非全尺寸跳过"即正确行为：HATCH 兜底加面积门控（材料面积 <90% 父 bbox → 跳过），实际只有 `sec_A`(y=0) 生效 |
+| 轴测量（L 形底 + r20 半圆槽 + 三角楔形槽，`CSG_WELD=1`） | 42,380.18 / 42,380.18，**多余 0.00 / 缺失 0.00 / 重合 100.0%** | 完美吻合（v0.6.20）。图纸在 `CAD/temp_output/轴测量.dxf`（+ 剖面图版），基准 `三维/轴测量.STEP`，对比须 `--dx 20 --dy 22`（重建居中系）。**v0.6.20 前管线读不出三角楔形槽**（+1,920，只由隐藏斜线表达）——「隐藏斜断面刀」补上该词汇表后归零。剖面图纸路径 42,379.88（缺失 0.30 = 剖面路径固有差，与斜断面无关，覆盖同样 100.0%） |
 | 简单模型回归套件 | 6/6 | 绿 |
 
 基准模型在 `三维/`（gitignored，用户私有数据）。bracket 与历史数值对比
@@ -386,16 +432,17 @@ ezdxf+numpy，**跑默认 python**；`verify/step_probe.py`（读 STEP 量尺寸
 阶段 1 的 `verify.reproject` 同样归 OCC 侧。
 
 阶段 0 ~ 4 全部落地（2026-09-28）。`src/rebuild/` 现有：`model/`（Claim/geom/
-feature_tree）、`evidence/`（dxf_reader + text_parser）、`views/`（view_detector +
-view_typer + correspondence 跨视图对应）、`conventions/`、`features/`（recognizer +
-solver + library）、`verify/`（compare/coverage/gate/step_probe）、`emit/`
-（occ_builder + sw_builder）、`report.py`、`inspect.py`、`rebuild.py`、
-**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf, step=|sldprt=, force=)`）**、
-`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
+geom2d/ids/feature_tree/questions）、`evidence/`（dxf_reader/model + text_parser）、
+`views/`（view_detector + view_typer + correspondence 跨视图对应）、`conventions/`、
+`features/`（recognizer + solver + library + prior）、`verify/`（compare/coverage/
+gate/step_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
+`rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
+step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
 顶部「新框架 src/rebuild/」段；`docs/ARCHITECTURE.md` §8 各阶段带 ✅ 状态行。
 ```bash
-python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--explain HANDLE]
-python -m src.rebuild.selftest       # 272 项自检，退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
+python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
+python -m src.rebuild.selftest       # 272 项自检（2026-10-01 实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
@@ -448,8 +495,8 @@ axial_at ⇒ 沿轴按 0 起`。实测症状：bracket 基体自 z=2 起而凸�
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `sw_constants.py` | 39 | SW 2025 API 枚举常量（经验证的晚期绑定值），来源：`CAD/SW2025_API_REFERENCE.md` |
-| `sw_driver.py` | 901 | COM 驱动封装 — 连接/断开/新建零件/草图/特征/倒角/圆角/键槽/保存 |
+| `sw_constants.py` | 45 | SW 2025 API 枚举常量（经验证的晚期绑定值），来源：`CAD/SW2025_API_REFERENCE.md` |
+| `sw_driver.py` | 912 | COM 驱动封装 — 连接/断开/新建零件/草图/特征/倒角/圆角/键槽/保存 |
 | `sw_shaft_builder.py` | 1063 | 阶梯轴参数化建模 — 旋转基体 → VBScript（倒角+圆角）→ Python COM 键槽 |
 
 **SW 模块依赖**: `pywin32>=306` (Windows only)，通过 `win32com.client.Dispatch("SldWorks.Application")` 晚期绑定驱动 SW 2025。
@@ -506,8 +553,8 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   `main_window.py:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
   + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
   `dxf_to_sw_features.py` 的 docstring 与结尾 print）。
-  （2026-09-30 核对：tag 落后 HEAD 11 个提交，git describe 返回
-  v0.6.19-11-g63716e5——11 个均为 v0.6.19 前缀提交（新框架阶段 0~4、
+  （2026-10-01 核对：tag 落后 HEAD 12 个提交，git describe 返回
+  v0.6.19-12-g693d7d5——12 个均为 v0.6.19 前缀提交（新框架阶段 0~4、
   CLAUDE.md 同步、新图纸样本）；是否前移 tag 或出 v0.6.20 待定）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
