@@ -46,6 +46,9 @@ from OCC.Core.TopAbs import (  # noqa: E402
 from OCC.Core.TopExp import TopExp_Explorer  # noqa: E402
 from OCC.Core.TopoDS import topods  # noqa: E402
 
+# 剖面编号（A—A 留给纵向全剖，其余按特征量依次排）——丢弃空剖面后
+# 由 model_to_drawing 按本表重排，避免图纸上出现 "A—A / C—C" 这种空档
+SECTION_LABELS = ("A—A", "B—B", "C—C", "D—D")
 # 截面 face 判定容差（mm）——面上采样点到剖切面的距离
 _ON_PLANE_TOL = 1e-4
 # 轮廓离散弦高容差（mm）：0.05 在 R25 圆上约 2.6° 一段，肉眼已是圆
@@ -152,11 +155,16 @@ def analyze_structure(shape, verbose=True):
             ax, lo = c.Axis().Direction(), c.Axis().Location()
             fp = GProp_GProps()
             brepgprop.SurfaceProperties(f, fp)
+            fb = Bnd_Box()
+            brepbndlib.Add(f, fb)
             cyls.append({
                 "r": c.Radius(),
                 "axis": (abs(round(ax.X(), 3)), abs(round(ax.Y(), 3)),
                          abs(round(ax.Z(), 3))),
                 "loc": (lo.X(), lo.Y(), lo.Z()),
+                # 面自身的 bbox——用于把"轴位置"夹回零件的真实跨度内，
+                # 见 _clamp_axis_pos
+                "bb": fb.Get(),
                 "area": fp.Mass(),
             })
         ex.Next()
@@ -164,9 +172,10 @@ def analyze_structure(shape, verbose=True):
     groups = {}
     for c in cyls:
         k = (c["axis"], round(c["r"], 2))
-        g = groups.setdefault(k, {"area": 0.0, "locs": [], "n": 0})
+        g = groups.setdefault(k, {"area": 0.0, "locs": [], "bbs": [], "n": 0})
         g["area"] += c["area"]
         g["locs"].append(c["loc"])
+        g["bbs"].append(c["bb"])
         g["n"] += 1
 
     info = {
@@ -193,6 +202,26 @@ def _axis_name(ax):
     return "斜"
 
 
+def _clamp_axis_pos(pos, lo, hi, inset=0.05):
+    """把"轴位置沿剖切法向的坐标"夹进该圆柱面自身的 bbox 跨度内。
+
+    `BRepAdaptor_Surface.Cylinder().Axis().Location()` 是**无限轴上随便一点**，
+    OCC 常把它放在离零件很远的地方：D79307 实测 `轴Y r=12.39` 的
+    `lo=(21.00, 350.00, −37.08)`，而模型是 X[−17.5,17.5] Y[141.2,161.2]
+    Z[−35.1,4.9] —— 照搬这个 z 得到的"横剖"整片落在零件外，剖面图剖空
+    （面积 0、0 块）。真孔（材料围着轴）的轴坐标必在面跨度内，此处是恒等
+    变换；只有**轴线落在零件外**的凸圆角/球鼻才会被拉回，落点内缩 5%
+    避免正好压在面的边界（边界处断面退化成一条线）。
+    """
+    if hi - lo <= 1e-9:
+        return pos
+    if pos < lo:
+        return lo + (hi - lo) * inset
+    if pos > hi:
+        return hi - (hi - lo) * inset
+    return pos
+
+
 def suggest_sections(info, max_n=3):
     """按内部特征推荐剖切面。
 
@@ -215,8 +244,10 @@ def suggest_sections(info, max_n=3):
                     "view_dir": (0, -1, 0), "up": (0, 0, 1),
                     "parent": "top", "desc": f"纵向全剖 y={cy:.2f}（中截面）"})
     elif longest == 1:    # Y 最长 → 从侧面看，剖在 x=cx
+        # view_dir 必须与法向**反向**：keep_negative 移去 +x 侧，观察者在
+        # 被移去的一侧朝 -x 看。写成 +x 得到的是镜像图（2026-10-01 修）
         out.append({"label": "A—A", "origin": (cx, 0, 0), "normal": (1, 0, 0),
-                    "view_dir": (1, 0, 0), "up": (0, 0, 1),
+                    "view_dir": (-1, 0, 0), "up": (0, 0, 1),
                     "parent": "top", "desc": f"纵向全剖 x={cx:.2f}（中截面）"})
     else:                 # Z 最长 → 从前面看，剖在 y=cy
         out.append({"label": "A—A", "origin": (0, cy, 0), "normal": (0, 1, 0),
@@ -235,8 +266,11 @@ def suggest_sections(info, max_n=3):
         if ai == longest:
             continue                      # 与纵向同轴的孔，纵剖已表达
         per_face = g["area"] / max(1, g["n"])
-        for lo in g["locs"]:
-            cands.append({"pos": lo[longest], "r": r, "area": per_face})
+        for lo, bb in zip(g["locs"], g["bbs"]):
+            cands.append({
+                "pos": _clamp_axis_pos(lo[longest],
+                                       bb[longest], bb[longest + 3]),
+                "r": r, "area": per_face})
 
     clusters = []
     for c in sorted(cands, key=lambda c: c["pos"]):
@@ -250,7 +284,7 @@ def suggest_sections(info, max_n=3):
             clusters.append({"pos": c["pos"], "r": c["r"],
                              "area": c["area"], "n": 1})
 
-    labels = ["B—B", "C—C", "D—D"]
+    labels = list(SECTION_LABELS[1:])
     picked = []
     for cl in sorted(clusters, key=lambda c: -c["area"]):
         pos, r = cl["pos"], cl["r"]
@@ -262,11 +296,18 @@ def suggest_sections(info, max_n=3):
         nrm = [0.0, 0.0, 0.0]
         nrm[longest] = 1.0
         vd = [0.0, 0.0, 0.0]
-        vd[longest] = 1.0
+        # 同上：keep_negative 移去 +法向侧，视线沿 −法向（写 + 会得到镜像图，
+        # 实测 B—B 窄条落在与俯视图相反的一侧，2026-10-01 修）
+        vd[longest] = -1.0
+        # up 必须与 view_dir 正交——最长方向为 Z 时视线也沿 Z，硬编码
+        # up=(0,0,1) 与视线平行 → _proj_axes 叉积零向量、gp_Dir 抛
+        # Standard_ConstructionError（轴测量.STEP 实测，2026-10-01）。
+        # 沿 Z 看时 up 取 +Y，与俯视图约定一致。
+        up = (0.0, 1.0, 0.0) if longest == 2 else (0.0, 0.0, 1.0)
         out.append({
             "label": labels[len(picked) - 1],
             "origin": tuple(org), "normal": tuple(nrm),
-            "view_dir": tuple(vd), "up": (0, 0, 1),
+            "view_dir": tuple(vd), "up": up,
             "parent": "front",
             "desc": f"横剖 {'xyz'[longest]}={pos:.2f}（穿 r{r:.1f} 孔轴）",
         })
@@ -432,11 +473,19 @@ def project_section_poly(shape, view_dir, up, deflection=0.05):
     ts = HLRBRep_PolyHLRToShape()
     ts.Update(algo)
 
+    # ---- 隐藏线不取：剖视图一律不画虚线 ----
+    # ① 制图法：GB/T 4458.6 剖视图一般不画虚线（虚线是"看不见但存在"的
+    #    表达，剖视图已经把内部结构剖开了）。② 这版输出本就是网格边：
+    #    PolyAlgo 逐三角面片吐边，D79307 的 A—A 实测 1,270 条隐藏边总长
+    #    238.5mm（均值 0.19mm），和可见轮廓几乎重合，画上去只是把黑轮廓
+    #    涂成蓝色——渲染实测整片蓝色。③ 闭环重建那头也**用不上**：这层
+    #    线型是 HIDDEN（BYLAYER），dxf_to_3d_general._is_skip_entity 命中
+    #    SKIP_LINETYPES 直接跳过（实测 LINE_SKIPPED 206 条全在这里），
+    #    去掉后 剖面图闭环基线逐位不变（轴测量 42,379.87674077447）。
+    # 键保留空列表：_draw_view_elements / bbox_2d 都要按键取。
     out = {"lines": [], "circles": [], "hidden_lines": [], "hidden_circles": []}
     for method, key in (("VCompound", "lines"),
-                        ("OutLineVCompound", "lines"),
-                        ("HCompound", "hidden_lines"),
-                        ("OutLineHCompound", "hidden_lines")):
+                        ("OutLineVCompound", "lines")):
         try:
             comp = getattr(ts, method)()
         except Exception:
@@ -453,6 +502,24 @@ def project_section_poly(shape, view_dir, up, deflection=0.05):
             except Exception:
                 pass
             ex.Next()
+
+    # ---- 可见线去重 ----
+    # PolyAlgo 会把同一条棱同时塞进 VCompound 与 OutLineVCompound（后者是
+    # 前者的子集），不去重则每段画两遍。键取 0.001mm——网格离散的相邻段端点
+    # 常有微米级浮点尾差，取整到 0.1mm 会把剖面里大量真实的短段一并吞掉。
+    def _fine(x1, y1, x2, y2):
+        if (x1, y1) > (x2, y2):
+            x1, y1, x2, y2 = x2, y2, x1, y1
+        return (round(x1, 3), round(y1, 3), round(x2, 3), round(y2, 3))
+
+    seen = set()
+    uniq = []
+    for s in out["lines"]:
+        k = _fine(*s)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(s)
+    out["lines"] = uniq
     return out
 
 
@@ -574,6 +641,23 @@ def setup_layers(doc):
             pass
 
 
+CJK_STYLE = "中文字体"
+
+
+def setup_text_style(doc):
+    """建中文文字样式（TTF 黑体）——图纸中文标注统一用它。
+
+    默认 Standard 的 font='txt'（txt.shx）无 CJK 字形、无 bigfont，
+    中文标注在任何 CAD 里都渲染成方框（CLAUDE.md 记录的出图侧缺陷）。
+    经典修法是补 bigfont='gbcbig.shx'，但它依赖 CAD 端装了该字体、
+    且 ezdxf 渲染链不认 SHX；改用 Windows 自带 TTF 两侧都有字形。
+    （2026-10-01 实测 simsun.ttc 在 matplotlib 预览里「图」字有填充
+    伪影，simhei/simkai/msyh/Deng 干净；取工程图常用的黑体。）
+    """
+    if CJK_STYLE not in doc.styles:
+        doc.styles.add(CJK_STYLE, font="simhei.ttf")
+
+
 def draw_hatch(msp, hatch_paths, ox, oy, scale=2.0):
     """截面 → DXF HATCH 实体（真剖面线，孔洞留白）。
 
@@ -601,9 +685,13 @@ def draw_hatch(msp, hatch_paths, ox, oy, scale=2.0):
 def draw_cut_marker(msp, spec, parent_view, ox, oy, bb, mirror_x=False):
     """在父视图上画剖切线：粗短划 + 箭头 + 字母。
 
-    父视图 2D 映射决定剖切面画成横线还是竖线：
-      top 视图 (DXF_X=-3D_X, DXF_Y=3D_Y)：法向 Y → 横线 y=origin_y；
-                                          法向 X → 竖线 x=-origin_x
+    剖切面必须标在"它在视图里是一条线"的父视图上：
+      法向 X → 俯视图上竖线 x=-origin_x（mirror_x 镜像坐标系）
+      法向 Y → 俯视图上横线 y=origin_y
+      法向 Z → 主视图上横线 y=origin_z（水平剖在俯视图里是平行面，
+               标不出位置；2026-10-01 轴测量.STEP 实测补上）
+    横线取 origin[ai] 定位，(ox, oy, bb) 由调用方按上表传对应视图的
+    偏移与 bbox（X/Y 法向传 top，Z 法向传 front）。
     """
     nrm = spec["normal"]
     ai = max(range(3), key=lambda i: abs(nrm[i]))
@@ -612,19 +700,7 @@ def draw_cut_marker(msp, spec, parent_view, ox, oy, bb, mirror_x=False):
     seg = 8.0        # 端部粗短划长度
     label = spec["label"]
 
-    if ai == 1:      # 法向 Y → 父视图上是横线
-        yy = spec["origin"][1] + oy
-        xa, xb = x1 + ox - ext, x2 + ox + ext
-        msp.add_line((xa, yy), (xa + seg, yy), dxfattribs={"layer": "剖切线"})
-        msp.add_line((xb - seg, yy), (xb, yy), dxfattribs={"layer": "剖切线"})
-        for xe, sgn in ((xa, 1), (xb, -1)):
-            # 箭头指向观察方向（-Y 看 → 图纸上向下）
-            msp.add_line((xe, yy), (xe + sgn * 4, yy - 6),
-                         dxfattribs={"layer": "剖切线"})
-            msp.add_text(label, height=5.0,
-                         dxfattribs={"layer": "标注"}).set_placement(
-                             (xe + sgn * 2, yy + 3))
-    else:            # 法向 X → 父视图上是竖线
+    if ai == 0:      # 法向 X → 俯视图上是竖线
         v = spec["origin"][0]
         xx = (-v if mirror_x else v) + ox
         ya, yb = y1 + oy - ext, y2 + oy + ext
@@ -634,11 +710,26 @@ def draw_cut_marker(msp, spec, parent_view, ox, oy, bb, mirror_x=False):
             msp.add_line((xx, ye), (xx + 6, ye + sgn * 4),
                          dxfattribs={"layer": "剖切线"})
             msp.add_text(label, height=5.0,
-                         dxfattribs={"layer": "标注"}).set_placement(
+                         dxfattribs={"layer": "标注",
+                                     "style": CJK_STYLE}).set_placement(
                              (xx + 3, ye + sgn * 2))
+    else:            # 法向 Y（俯视图）/ 法向 Z（主视图）→ 横线
+        yy = spec["origin"][ai] + oy
+        xa, xb = x1 + ox - ext, x2 + ox + ext
+        msp.add_line((xa, yy), (xa + seg, yy), dxfattribs={"layer": "剖切线"})
+        msp.add_line((xb - seg, yy), (xb, yy), dxfattribs={"layer": "剖切线"})
+        for xe, sgn in ((xa, 1), (xb, -1)):
+            # 箭头指向观察方向（-Y 看 → 俯视图上向下；-Z 俯视 → 主视图上向下）
+            msp.add_line((xe, yy), (xe + sgn * 4, yy - 6),
+                         dxfattribs={"layer": "剖切线"})
+            msp.add_text(label, height=5.0,
+                         dxfattribs={"layer": "标注",
+                                     "style": CJK_STYLE}).set_placement(
+                             (xe + sgn * 2, yy + 3))
 
 
 def draw_label(msp, text, cx, cy, height=6.0):
     msp.add_text(text, height=height,
-                 dxfattribs={"layer": "标注"}).set_placement(
+                 dxfattribs={"layer": "标注",
+                             "style": CJK_STYLE}).set_placement(
                      (cx, cy), align=__import__("ezdxf").enums.TextEntityAlignment.MIDDLE_CENTER)

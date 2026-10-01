@@ -160,6 +160,7 @@ def create_full_drawing(views, sections, output_path: Path, hatch_scale=2.0):
 
     doc = ezdxf.new()
     sv.setup_layers(doc)
+    sv.setup_text_style(doc)
     doc.header["$MEASUREMENT"] = 1
     doc.header["$INSUNITS"] = 4
     msp = doc.modelspace()
@@ -203,9 +204,16 @@ def create_full_drawing(views, sections, output_path: Path, hatch_scale=2.0):
         n_hatch += sv.draw_hatch(msp, sec["hatch"], ox, oy, scale=hatch_scale)
         sv.draw_label(msp, f"{sec['label']}  {sec['desc']}",
                       FX + w / 2, cur_y - h - 16)
-        # 剖切线标在能看出剖切位置的父视图上（俯视图同时含 X 和 Y）
-        sv.draw_cut_marker(msp, sec["spec"], "top", t_off[0], t_off[1],
-                           t_bb, mirror_x=True)
+        # 剖切线标在"剖切面在视图里退化成一条线"的父视图上：
+        # 法向 X/Y → 俯视图（含 X 和 Y 方向）；法向 Z（水平剖）在俯视图里
+        # 是平行面标不出位置，改标主视图横线 y=origin_z（2026-10-01 实测）
+        spec = sec["spec"]
+        ai = max(range(3), key=lambda i: abs(spec["normal"][i]))
+        if ai == 2:
+            sv.draw_cut_marker(msp, spec, "front", f_off[0], f_off[1], f_bb)
+        else:
+            sv.draw_cut_marker(msp, spec, "top", t_off[0], t_off[1],
+                               t_bb, mirror_x=True)
         cur_y -= h + 55.0
 
     doc.saveas(str(output_path))
@@ -255,6 +263,20 @@ def main() -> int:
 
     specs = sv.suggest_sections(info)
     sections = [sv.generate_section(fused, s) for s in specs]
+    # 空剖面守卫：剖切面落在零件外（或整片是空腔）时 OCC 实测截面面积为 0，
+    # 这种"剖面"画到图纸上只有标题没有图形。判据取实测面积（不是 2D 路径
+    # 面积——路径面积缺失时两者同为 0，自检反而判 [OK]，D79307 的 B—B
+    # 就是这么混过去的）。丢弃后按 SECTION_LABELS 重排编号。
+    kept = []
+    for s in sections:
+        if s["area"] <= 1e-6:
+            print(f"  [{s['label']}] 断面无材料（实测面积 0）——丢弃："
+                  f"{s['spec']['desc']}")
+            continue
+        kept.append(s)
+    for i, s in enumerate(kept):
+        s["label"] = s["spec"]["label"] = sv.SECTION_LABELS[i]
+    sections = kept
     # 图纸上的三视图也用融合形状：重叠体内部交界线在图纸上是不存在的
     # 假线，读图时是干扰（闭环链另走上面未融合那份）
     sheet_views = project_all_views(fused)

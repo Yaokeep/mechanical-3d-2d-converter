@@ -56,7 +56,6 @@ from OCC.Core.BRepClass3d import BRepClass3d_SolidClassifier
 from OCC.Core.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
 from OCC.Core.HLRAlgo import HLRAlgo_Projector
 
-
 OUTPUT_DIR = Path(__file__).parent
 STEP_OUTPUT = OUTPUT_DIR / "motor_3d_model.step"
 DXF_OUTPUT = OUTPUT_DIR / "motor_engineering.dxf"
@@ -722,24 +721,56 @@ def project_shape_to_2d(shape, view_dir, view_up=(0, 0, 1)):
     hid_circles = _dedup_arcs(hid_arcs)
 
     # 直线去重（去除完全相同的线段）
+    def _line_key(x1, y1, x2, y2):
+        if (x1, y1) > (x2, y2):
+            x1, y1, x2, y2 = x2, y2, x1, y1
+        return (round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1))
+
     def _dedup_lines(lines):
         seen = set()
         result = []
         for x1, y1, x2, y2 in lines:
-            # 规范化方向
-            if (x1, y1) > (x2, y2):
-                x1, y1, x2, y2 = x2, y2, x1, y1
-            key = (round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1))
+            # 退化线段：曲线离散在驻点处会吐出两端重合的线段，画不出任何
+            # 东西，却是图纸里的非法实体（选不中/删不掉）。D79307 实测
+            # 三视图里 8 条，IMU 5 条、轴测量 2 条，全部来自此处。
+            if abs(x1 - x2) < 1e-6 and abs(y1 - y2) < 1e-6:
+                continue
+            key = _line_key(x1, y1, x2, y2)
             if key not in seen:
                 seen.add(key)
                 result.append((x1, y1, x2, y2))
         return result
 
+    vis = _dedup_lines(vis_lines + _supplement_outline_lines(
+        shape, dz, v_up, dx))
+    hid = _dedup_lines(hid_lines)
+
+    # ---- 可见优先：同一条线被 HLR 同时判为可见与隐藏时只留可见 ----
+    # HLR 会把同一条棱同时塞进 VCompound 与 HCompound（D79307 主视图实测：
+    # 160 条可见里有 42 条同时出现在隐藏集，占 26%；其中 30 条来自 HLR
+    # 本身，12 条来自 _supplement_outline_lines 的补线）。画到图纸上是
+    # 同位置两条实体，先画的可见线被后画的隐藏线盖住——主视图整体变成
+    # 蓝色隐藏线（渲染实测 35,595 蓝像素 vs 1,765 黑像素），读图时
+    # 完全分不出哪里可见。制图上一条棱只能二选一，可见优先。
+    # 跨层比对用 0.001mm 的细键（_dedup_lines 的 0.1mm 键是**同层**去重口径，
+    # 拿来比跨层会误删离可见线 0.1mm 内的另一条隐藏线）
+    def _fine(x1, y1, x2, y2):
+        if (x1, y1) > (x2, y2):
+            x1, y1, x2, y2 = x2, y2, x1, y1
+        return (round(x1, 3), round(y1, 3), round(x2, 3), round(y2, 3))
+
+    vis_keys = {_fine(*s) for s in vis}
+    hid = [s for s in hid if _fine(*s) not in vis_keys]
+    vis_circle_keys = {(round(c[0], 2), round(c[1], 2), round(c[2], 3))
+                       for c in vis_circles}
+    hid_circles = [c for c in hid_circles
+                   if (round(c[0], 2), round(c[1], 2), round(c[2], 3))
+                   not in vis_circle_keys]
+
     return {
-        "lines": _dedup_lines(vis_lines + _supplement_outline_lines(
-            shape, dz, v_up, dx)),
+        "lines": vis,
         "circles": vis_circles,
-        "hidden_lines": _dedup_lines(hid_lines),
+        "hidden_lines": hid,
         "hidden_circles": hid_circles,
     }
 
