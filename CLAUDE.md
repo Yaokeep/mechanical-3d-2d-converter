@@ -86,13 +86,15 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
                                                # 用户目视标记缺陷的入口（v0.6.18 三缺陷即由此而来）。
                                                # 脚本内路径写死 bracket：换重建结果改 main() 里 read_step 的 _3d.step 路径
 # 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性脚本一律用 `_` 前缀，
-# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；现存 110 个（2026-10-01
-# 计数）分七类：`_probe_*.py` 几何探针（43 个：_probe_ysec 逐 y 层截面 / _probe_zsec
-# 水平截面 / _probe_tor9 挂耳 / _probe_gap145 挂耳间隙）、`_diag_*.py` 根因诊断（14）、
-# `_csg_*.py` 代码版本备份（3）、`_dump_*`/`_draw_*` 截面叠加工具链（3，见下方"截面叠加图"节）、
-# `_analyze_*`/`_render_*`/`_run_*` 等杂项（14）、`_wx_*.py` 20230425 样本真值建模与诊断
-# （10：`_wx_build.py` 手工建模真值 + 8 个 `_wx_diag_*` + `_wx_verify_step` 诊断）、`_sw_*.py`
-# SW COM API 探测（23 个：2026-09-28 一轮 fillet/planes/cut/edge/circ 探针，`_sw_cleanup.py` 收尾）。其中两个常用：
+# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；根目录现存 144 个（2026-10-02
+# 计数）分八类：`_probe_*.py` 几何探针（59：_probe_ysec 逐 y 层截面 / _probe_zsec
+# 水平截面 / _probe_tor9 挂耳 / _probe_gap145 挂耳间隙）、`_sw_*.py` SW COM API 探测
+# （24：2026-09-28 一轮 fillet/planes/cut/edge/circ 探针，`_sw_cleanup.py` 收尾）、
+# `_diag_*.py` 根因诊断（14）、`_wx_*.py` 20230425 样本真值建模与诊断（10：`_wx_build.py`
+# 手工建模真值 + 8 个 `_wx_diag_*` + `_wx_verify_step` 诊断）、`_d79_*.py` D79307 探针（5：
+# `_d79_scan/loops/edgeq/slab/text`）、`_analyze_*`/`_render_*`/`_run_*` 等杂项（22）、
+# `_csg_*`/`_bak_*` 代码版本备份（各 3；`_bak_ged/mtd/sv.py` = v0.6.20 出图侧三文件
+# 修复前快照）、`_dump_*`/`_draw_*` 截面叠加工具链（见下方"截面叠加图"节）。其中两个常用：
 # `_run_rebuild.py` 受控实验/基线重跑（直接调 convert_dxf_to_3d，不经 CLI、不触发
 # SW 导入——单靶子重跑首选）、`_sw_show.py` 把 STEP 导入 SW 留给用户看（不调
 # disconnect()，绕开"收尾关活动文档"问题）。
@@ -226,7 +228,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 根目录独立脚本（不通过 main.py 调用，直接命令行运行）:
   dxf_to_sldprt.py       — DXF 阶梯轴 → SW .sldprt 原生文件（DXF 解析 + SW COM）
-  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，9296 行）
+  dxf_to_3d_general.py   — 通用 DXF 工程图 → 3D STEP + SW .sldprt（任意零件图，9821 行）
                            核心链: 边图构建→封闭环检测→视图分离(Y+X 间隙，v0.6.15 起含剖面行识别)
                            →CSG 体积求交 / 单视图轮廓拉伸
                            CSG: 各视图外轮廓拉伸为棱柱→布尔交集→内部特征布尔减(P0)→投影验证(P1)
@@ -290,10 +292,10 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 | 目录 | 用途 |
 |------|------|
-| `docs/` | `CHANGELOG.md` — v0.5.4~v0.6.19 逐版本根因叙事，三段倒序（主线 v0.6.11~v0.6.19 / dxf_to_3d_general 精度收敛链 v0.5.4~v0.6.10 / dxf_to_sw_features v0.6.6~v0.6.7）。查"某阈值为何是 0.1"这类历史依据时看它 |
+| `docs/` | `CHANGELOG.md` — v0.5.4~v0.6.20 逐版本根因叙事，三段倒序（主线 v0.6.11~v0.6.20 / dxf_to_3d_general 精度收敛链 v0.5.4~v0.6.10 / dxf_to_sw_features v0.6.6~v0.6.7）。查"某阈值为何是 0.1"这类历史依据时看它 |
 | `.claude/` | `settings.local.json` — 预授权的 Bash 权限列表；`skills/` — 项目级启用的技能符号链接 |
 | `.agents/skills/` | 4 个技能：`mechanical-engineer`、`solidworks-cad`（泵叶轮参数化）、`python-code-review`（含 5 个参考文件）、`python-packaging`；仅前两个经符号链接在项目级启用。根目录 `skills-lock.json` 锁定 `mechanical-engineer` 来源 |
-| `CAD/` | 51 个 VBA 宏 `.bas`（本目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代；另 4 个在仓库根 `soldwork/`），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`、`20230425-160012-85913` 尼龙王 φ19×100 + 夹紧环 φ60×30——PDF 矢量化来源：线条双线、圆弧打成 LWPOLYLINE 折线（2138 条）、0 文字标注，解析须读折线顶点；`_wx_build.py`（gitignored）是按图手工建模的真值参照）、`temp_output/` 闭环验证链工作区（图纸 DXF 迭代样本——`bracket_angker_三视图_v4.dxf` 与 `bracket_angker_图纸_20260922_剖面图.dxf` 是当前两个 bracket 基线、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf`、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例 |
+| `CAD/` | 51 个 VBA 宏 `.bas`（本目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代；另 4 个在仓库根 `soldwork/`），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`、`20230425-160012-85913` 尼龙王 φ19×100 + 夹紧环 φ60×30——PDF 矢量化来源：线条双线、圆弧打成 LWPOLYLINE 折线（2138 条）、0 文字标注，解析须读折线顶点；`YZYX95.4-20齿箱上盖零件图.dwg`（φ220 大件新靶子，与 D79307 无关，尚未重建）；`_wx_build.py`（gitignored）是按图手工建模的真值参照）、`temp_output/` 闭环验证链工作区（图纸 DXF 迭代样本——`bracket_angker_三视图_v4.dxf` 与 `bracket_angker_图纸_20260922_剖面图.dxf` 是当前两个 bracket 基线、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf`、`D79307A264FCA6D8EC32E95B1B11BDBD.dxf`/`IMU.dxf`/`轴测量.dxf`（各配 `_剖面图.dxf`；轴测量是唯一 100% 覆盖靶子）、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例 |
 | `PDF/` | 空目录（预留放参考 PDF 文档） |
 | `三维/` | 闭环验证参考模型（gitignored）：`麒浚传动_PF60K-14-50-70-M4-L2-12.SLDPRT`、`bracket angker.stp`、`spoon.SLDPRT` / `spoon.STEP`、`勺子/`（勺子参考图 + STEP/STL 副本） |
 | `soldwork/` | SW VBA 宏工作区：`.bas` 测试宏（入库）+ `.swp` 工程文件（**未入库**，被 `.gitignore` 的 vim-swap 规则误伤，见下方"路径与平台注意事项"） |
@@ -328,10 +330,11 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.19（git tag 为准）。代码内三处版本字符串（`app.py:15` /
-`main_window.py:28` / `main_window.py:535`）与 git 一致，已核对
-（2026-10-01 复核：关于对话框 `main_window.py:535` 此前漏改仍写 v0.6.18，已补正）。
-**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.19）——
+版本 v0.6.20（git tag 为准）。代码内三处版本字符串（`app.py:15` /
+`main_window.py:28` / `main_window.py:535`）、README 与两个转换器脚本横幅
+已于 2026-10-02 统一 bump（此前 4 个 `v0.6.20:` 提交先落地、版本簿记后收口，
+tag 曾落后 HEAD 16 个提交，见下方"版本号同步"）。
+**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.20）——
 本节只留仍在影响决策的部分。
 
 ### 当前精度断点
@@ -548,14 +551,15 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**（发版时全部要改，当前均为 `0.6.19`，已核对一致）:
+- **版本号同步**（发版时全部要改，当前均为 `0.6.20`，已核对一致）:
   `app.py:15` `APP_VERSION` / `main_window.py:28` `setWindowTitle` /
   `main_window.py:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
   + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
   `dxf_to_sw_features.py` 的 docstring 与结尾 print）。
-  （2026-10-01 核对：tag 落后 HEAD 12 个提交，git describe 返回
-  v0.6.19-12-g693d7d5——12 个均为 v0.6.19 前缀提交（新框架阶段 0~4、
-  CLAUDE.md 同步、新图纸样本）；是否前移 tag 或出 v0.6.20 待定）
+  （2026-10-02：v0.6.20 曾"先提交、后收口"——4 个 `v0.6.20:` 前缀提交落地时
+  版本字符串仍写 0.6.19、tag 落后 HEAD 16 个提交（`v0.6.19-16-g99c832c` =
+  12 个 v0.6.19 前缀 + 4 个 v0.6.20 前缀）；当日统一 bump 到 v0.6.20 并打
+  tag `v0.6.20`，CHANGELOG/README 叙事随之补齐）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。
