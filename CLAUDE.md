@@ -95,7 +95,7 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
 # `_d79_scan/loops/edgeq/slab/text`）、`_analyze_*`/`_render_*`/`_run_*` 等杂项（22）、
 # `_csg_*`/`_bak_*` 代码版本备份（各 3；`_bak_ged/mtd/sv.py` = v0.6.20 出图侧三文件
 # 修复前快照）、`_dump_*`/`_draw_*` 截面叠加工具链（见下方"截面叠加图"节）、
-# `_yz_*.py` YZYX95.4-20 齿箱上盖（φ220 大件，2026-10-02~05 四轮 58 个）：
+# `_yz_*.py` YZYX95.4-20 齿箱上盖（φ220 大件，2026-10-02~05 四轮 65 个）：
 # `_yz_build.py` 按图纸逐尺寸手工参数化建模（v14，fuse/cut 图元拼装 → `_yz_3d.step`，
 # 体积 7,835,148.4；五视图评分 TL/BL/TR 零缺、DR 缺16（r84.5，图纸 A—A 与 DR
 # 不自洽）/多14（含 #4 沉窝口缘 r75 弧——图纸 DR 画了同视线路径的内缘 r48.25
@@ -103,8 +103,13 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
 # v13 #3 东壁中央 |y|<50 是槽非墙（TL x19..20.5 z<80 HATCH 无剖面线实锤）、
 # v13 #5 孔口 1.5×45° 倒角改直切锥体（旧「柱−锥」内外反留三角残唇）、
 # v14 #4 缝由 y±50 矩形改 Ø150 r75 绕主轴半圆柱沉窝（x=−9.5 竖线精确止于
-# z=75.000 实锤；西壁面成 r48.25..75 环形面）、#1/#2 证据判口袋=侧向开口窗
-# +眉板覆盖、图纸不支持通槽，保持）、`_yz_sw.py` 导入 SW + 时间戳另存、
+# z=75.000 实锤；西壁面成 r48.25..75 环形面）、#1/#2 反事实验证定案——用户
+# 疑"槽顶应开口通出去"（点 (±95,±68,123) 落在槽顶斜肩面），按该假说造删顶壁
+# 反事实模型（`_yz_nc_build.py`）评分立即冲突：BL 丢 y=±75 外壁线（差15mm）、
+# TR 丢两条斜肩线（差5mm），而现模型（顶壁下隧道 + 侧壁 y=±75 窗口）全视图
+# 零缺；C—C 剖面 x=−96.5 正穿用户两点、斜肩线上方 4 条剖面线 = 顶壁材料；
+# `_yz_probe_mat.py` 材料探针：用户点正上 IN / 正下 OUT / 贴壁 y=±74.9 OUT
+# （窗口本就通），模型不改）、`_yz_sw.py` 导入 SW + 时间戳另存、
 # `_yz_dump*.py` 图纸实体逐轮 dump（22）、其余为模型↔图纸核对工具——`_yz_hlr`（模型 HLR
 # → `_yz_hlr.json`）→ `_yz_match`（评分，THRESH 首参）/`_yz_win`（图纸窗口 dump）、
 # `_yz_seccheck`（模型截面导出）、`_yz_rayprobe`（沿轴射线材料区间探针，查遮挡）。
@@ -309,7 +314,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 | `docs/` | `CHANGELOG.md` — v0.5.4~v0.6.20 逐版本根因叙事，三段倒序（主线 v0.6.11~v0.6.20 / dxf_to_3d_general 精度收敛链 v0.5.4~v0.6.10 / dxf_to_sw_features v0.6.6~v0.6.7）。查"某阈值为何是 0.1"这类历史依据时看它 |
 | `.claude/` | `settings.local.json` — 预授权的 Bash 权限列表；`skills/` — 项目级启用的技能符号链接 |
 | `.agents/skills/` | 4 个技能：`mechanical-engineer`、`solidworks-cad`（泵叶轮参数化）、`python-code-review`（含 5 个参考文件）、`python-packaging`；仅前两个经符号链接在项目级启用。根目录 `skills-lock.json` 锁定 `mechanical-engineer` 来源 |
-| `CAD/` | 51 个 VBA 宏 `.bas`（本目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代；另 4 个在仓库根 `soldwork/`），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`、`20230425-160012-85913` 尼龙王 φ19×100 + 夹紧环 φ60×30——PDF 矢量化来源：线条双线、圆弧打成 LWPOLYLINE 折线（2138 条）、0 文字标注，解析须读折线顶点；`YZYX95.4-20齿箱上盖零件图.dwg`（φ220 大件靶子，与 D79307 无关；2026-10-05 手工参数化重建 v14——用户 5 缺陷标记闭环（#3/#4/#5 改模、#1/#2 证据判保持），转换副本 `CAD/temp_output/_yz.dxf`，建模脚本根目录 `_yz_build.py`，相关脚本见 `_` 脚本节 `_yz_*` 族）；`_wx_build.py`（gitignored）是按图手工建模的真值参照）、`temp_output/` 闭环验证链工作区（图纸 DXF 迭代样本——`bracket_angker_三视图_v4.dxf` 与 `bracket_angker_图纸_20260922_剖面图.dxf` 是当前两个 bracket 基线、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf`、`D79307A264FCA6D8EC32E95B1B11BDBD.dxf`/`IMU.dxf`/`轴测量.dxf`（各配 `_剖面图.dxf`；轴测量是唯一 100% 覆盖靶子）、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例 |
+| `CAD/` | 51 个 VBA 宏 `.bas`（本目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代；另 4 个在仓库根 `soldwork/`），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`、`20230425-160012-85913` 尼龙王 φ19×100 + 夹紧环 φ60×30——PDF 矢量化来源：线条双线、圆弧打成 LWPOLYLINE 折线（2138 条）、0 文字标注，解析须读折线顶点；`YZYX95.4-20齿箱上盖零件图.dwg`（φ220 大件靶子，与 D79307 无关；2026-10-05 手工参数化重建 v14——用户 5 缺陷标记闭环（#3/#4/#5 改模、#1/#2 反事实验证定案=顶壁下隧道+侧壁窗口，删顶壁反事实模型与图纸冲突），转换副本 `CAD/temp_output/_yz.dxf`，建模脚本根目录 `_yz_build.py`，相关脚本见 `_` 脚本节 `_yz_*` 族）；`_wx_build.py`（gitignored）是按图手工建模的真值参照）、`temp_output/` 闭环验证链工作区（图纸 DXF 迭代样本——`bracket_angker_三视图_v4.dxf` 与 `bracket_angker_图纸_20260922_剖面图.dxf` 是当前两个 bracket 基线、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf`、`D79307A264FCA6D8EC32E95B1B11BDBD.dxf`/`IMU.dxf`/`轴测量.dxf`（各配 `_剖面图.dxf`；轴测量是唯一 100% 覆盖靶子）、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例 |
 | `PDF/` | 空目录（预留放参考 PDF 文档） |
 | `三维/` | 闭环验证参考模型（gitignored）：`麒浚传动_PF60K-14-50-70-M4-L2-12.SLDPRT`、`bracket angker.stp`、`spoon.SLDPRT` / `spoon.STEP`、`勺子/`（勺子参考图 + STEP/STL 副本） |
 | `soldwork/` | SW VBA 宏工作区：`.bas` 测试宏（入库）+ `.swp` 工程文件（**未入库**，被 `.gitignore` 的 vim-swap 规则误伤，见下方"路径与平台注意事项"） |
