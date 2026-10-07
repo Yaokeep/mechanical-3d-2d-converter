@@ -25,23 +25,27 @@ r25.5 圆说的是同一个凸台，合并后证据有两条。
 
 ## 不做的事（写下来是为了以后别顺手加）
 
-- **不做轮廓环提取**：基体按视图包围盒近似（tier=PROJECTION，
-  并如实报一条待确认）。旧管线那套"边图→封闭环"是 8957 行里最重的一块，
-  塞到这里会让本模块变成第二个它；正确做法是让它作为独立证据通道进来
+- **环提取不在本模块里**（2026-10-07 起已接线）：轮廓环是独立的证据通道
+  ``views/ring.py``（旧管线"边图→封闭环"那块的最重分量），本模块只负责
+  把它换算成发射器契约挂到基体上；**提到环就按环建基体**，提不到才退回
+  视图包围盒近似（并如实报一条待确认）
 - **不把"未注圆角"塞进特征树**：那是全局技术条件，不是可定位的特征。
   它已经在约定层（``simplification.fillets``）报出来了，重复一遍只会
   让发射器收到建不出来的特征
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from ..model.claim import Claim, Tier
 from ..model.feature_tree import Feature, FeatureType, Part, SymmetryOp
 from ..model.geom import Axis3, Point3, Vector3
+from ..model.geom2d import Point2, Profile2, ProfileSeg2, profile_span
 from ..model.ids import FeatureId
 from ..model.questions import OpenQuestion, Question, QuestionList
 from ..views.correspondence import CorrespondenceResult, CylinderHint, ViewFrame
+from ..views.ring import extract_ring
 from .library import ir_point, mk_claim
 from .solver import Conflict, SolveReport, merge_with_conflict, solve
 
@@ -52,6 +56,13 @@ AXIS_DIR_TOL = 1e-3      # 方向余弦差（轴向必须几乎一致）
 #: 拉伸方向 → 轮廓平面的两个模型轴（与 ``library.profile_plane`` 同一张表）
 _PLANE_AXES: dict[str, tuple[str, str]] = {
     "x": ("y", "z"), "y": ("z", "x"), "z": ("x", "y")}
+
+#: 基体外轮廓环的**跨度覆盖率**下限：环的几何 bbox 必须铺满轮廓跨度。
+#: ring.py 自身的 0.75 门控只保证"这个环像外轮廓"，应付不了"内部子环"：
+#: 实测 PF60K 的 V1 提出一个 48 段台阶区子环，覆盖率 1.00×0.76 恰好过门，
+#: 基体因此丢 24% 高度（体积 −31.4% → −71.5%）。真外轮廓在四张验证图上
+#: 全是 1.00×1.00，空隙干净，0.98 只是留出浮点与出图抖动。
+RING_SPAN_MIN = 0.98
 
 
 def _dirs_parallel(a: Vector3, b: Vector3) -> bool:
@@ -238,6 +249,86 @@ def _profile_circle(corr: CorrespondenceResult, dir_name: str,
     return None
 
 
+def _outline_ring_profile(d, frame: ViewFrame, dir_name: str,
+                          lo1: float, hi1: float, lo2: float, hi2: float
+                          ) -> tuple[Profile2 | None, str]:
+    """正对轮廓平面的那个视图 → (a, b) 系的 ``Profile2``（轮廓环通道）。
+
+    证据链：视图可见轮廓边 → ``views.ring.extract_ring``（含覆盖率门控）
+    → 视图 2D 坐标过 ``ViewFrame`` 平移到模型系 → 按 ``_PLANE_AXES``
+    转置 → 相对轮廓角点 (lo1, lo2) 的 (a, b) 坐标（与包围盒路径**同一
+    套坐标口径**，只是形状从矩形换成真轮廓）。
+
+    坐标转置时**弧的旋向可能翻转**：视图的 (u, v) 与平面的 (b1, b2)
+    顺序未必一致（沿 y 拉伸的平面是 (z, x)，而前视图 u=x、v=z 恰好
+    对调），故弧的 ``ccw``/``sa``/``ea`` 一律在 (a, b) 系里**重判重算**
+    ——判据与 SW 发射器同一套（弧中点弦叉积符号），不搬运视图系角度。
+
+    返回 ``(profile, 说明)``；不可用时 profile=None，说明串写明原因供
+    报告与待确认项引用。注意**跨度覆盖率门控**（``RING_SPAN_MIN``）：
+    环的 bbox 必须铺满 (lo1..hi1, lo2..hi2) 给的轮廓跨度，否则它是
+    内部子环（实测 PF60K V1 的台阶区子环 0.76 覆盖率），不是外轮廓。
+    """
+    b1_axis, b2_axis = _PLANE_AXES[dir_name]
+    if frame.p_axis != dir_name:
+        return None, f"{frame.view_id} 的投影方向不是 {dir_name}（看不到该轮廓面）"
+    if {b1_axis, b2_axis} & set(frame.broken_axes):
+        return None, "视图沿轮廓轴断裂，跨度残缺"
+    view = next((v for v in d.views if v.id == frame.view_id), None)
+    if view is None:
+        return None, "视图对象缺失"
+    res = extract_ring(d, view)
+    if res.ring is None:
+        return None, res.note or "环提取无结果"
+
+    def fwd(p: Point2) -> Point2:
+        m = {frame.u_axis: p.x + frame.u_off, frame.v_axis: p.y + frame.v_off}
+        return Point2(m[b1_axis] - lo1, m[b2_axis] - lo2)
+
+    segs: list[ProfileSeg2] = []
+    for s in res.ring.segs:
+        p1, p2 = fwd(s.p1), fwd(s.p2)
+        if s.kind != "arc":
+            segs.append(ProfileSeg2("line", p1, p2))
+            continue
+        if s.center is None or s.radius <= 0:
+            return None, "弧段缺圆心/半径（环数据不完整）"
+        c = fwd(s.center)
+        # 弧中点：先按视图系 sa/ea/ccw 取参数中点，跟着端点一起映射
+        tau = 2.0 * math.pi
+        span = ((s.ea - s.sa) if s.ccw else (s.sa - s.ea)) % tau
+        thm = s.sa + span / 2.0 if s.ccw else s.sa - span / 2.0
+        pm = fwd(Point2(s.center.x + s.radius * math.cos(thm),
+                        s.center.y + s.radius * math.sin(thm)))
+        cross = ((pm.x - p1.x) * (p2.y - pm.y)
+                 - (pm.y - p1.y) * (p2.x - pm.x))
+        if abs(cross) < 1e-9:
+            return None, "弧段旋向不可判（弦叉积为零）"
+        segs.append(ProfileSeg2(
+            "arc", p1, p2, c, s.radius, cross > 0.0,
+            math.atan2(p1.y - c.y, p1.x - c.x),
+            math.atan2(p2.y - c.y, p2.x - c.x)))
+    prof = Profile2(tuple(segs))
+    if prof.chain_break() is not None:
+        return None, "映射后段链断开（已被守卫拒绝）"
+    if prof.signed_area() < 0.0:
+        # 转置对调轴 ⇒ 环翻成 CW，统一回契约的 CCW 正面积
+        prof = prof.reversed()
+    # 跨度覆盖率门控（见 ``RING_SPAN_MIN``）：外轮廓必须铺满轮廓跨度，
+    # 内部子环（台阶区/局部轮廓）在 ring.py 的 0.75 门控下会漏网
+    bb = prof.bbox()
+    w, h = hi1 - lo1, hi2 - lo2
+    if w > 0.0 and h > 0.0:
+        cw, ch = bb.width / w, bb.height / h
+        if min(cw, ch) < RING_SPAN_MIN:
+            return None, (f"环只覆盖轮廓跨度 {cw:.2f}×{ch:.2f}"
+                          f"（< {RING_SPAN_MIN}）—— 疑似内部子环，弃用")
+    note = (f"{len(prof.segments)} 段（面积 {res.ring.area:.2f}，"
+            f"覆盖率 {res.ring.coverage[0]:.2f}×{res.ring.coverage[1]:.2f}，"
+            f"rule={res.ring.rule}）")
+    return prof, note
+
+
 def _single_face_base(d, corr: CorrespondenceResult, frames,
                       rep: RecognizeReport) -> Feature:
     """单视图基体：看得见的那个面按实量，看不见的那一维按猜。
@@ -252,8 +343,16 @@ def _single_face_base(d, corr: CorrespondenceResult, frames,
     ev = tuple(dict.fromkeys(e for v in d.views for e in v.evidence[:1]))
     depth, method, alts = guess_single_depth(corr, frame)
     same_normal = len({f.p_axis for f in frames.values()}) == 1
-    lo1, hi1 = frame.u_span
-    lo2, hi2 = frame.v_span
+    # 跨度按**轴名**取而不是按 u/v 顺序：p=y 的前视图 (u,v)=(x,z) 与轮廓
+    # 平面 (b1,b2)=(z,x) 恰好对调，按顺序取会把轮廓转 90°
+    if (frame.u_axis, frame.v_axis) == (b1_axis, b2_axis):
+        (lo1, hi1), (lo2, hi2) = frame.u_span, frame.v_span
+    elif (frame.u_axis, frame.v_axis) == (b2_axis, b1_axis):
+        (lo1, hi1), (lo2, hi2) = frame.v_span, frame.u_span
+    else:
+        raise ValueError(
+            f"{frame.view_id} 的可见轴 ({frame.u_axis},{frame.v_axis}) 与 "
+            f"{dir_name} 向轮廓平面 ({b1_axis},{b2_axis}) 不相配")
     box = [(0.0, 0.0), (hi1 - lo1, 0.0), (hi1 - lo1, hi2 - lo2), (0.0, hi2 - lo2)]
     origin = ir_point(Point3(0.0, 0.0, 0.0), dir_name, lo1, lo2, 0.0)
     # 视图少了两个 ⇒ "哪个方向是深度"是**约定**（图面=xy 平面），
@@ -280,6 +379,16 @@ def _single_face_base(d, corr: CorrespondenceResult, frames,
             f"（备选 {'/'.join(f'{a:g}' for a in alts)}）",
             view=frame.view_id, evidence=ev[:1]))
         return f
+    # 轮廓环通道：视图轮廓边 → 闭合环 → (a, b) 系 Profile2。提得到就用
+    # 真轮廓，提不到（环失败/断裂/纯圆/子环）才退回包围盒矩形并如实登记
+    ring_prof, ring_note = _outline_ring_profile(d, frame, dir_name,
+                                                 lo1, hi1, lo2, hi2)
+    if ring_prof is not None:
+        profile_claim = Claim(ring_prof, "projection:view_outline_ring",
+                              Tier.PROJECTION, evidence=ev)
+    else:
+        profile_claim = Claim(box, "projection:view_bounds", Tier.PROJECTION,
+                              evidence=ev)
     f = Feature(
         id=FeatureId(0),
         type=Claim(FeatureType.BASE, "projection:single_view_outline",
@@ -288,8 +397,7 @@ def _single_face_base(d, corr: CorrespondenceResult, frames,
             "dir": dir_claim,
             "length": Claim(depth, method, Tier.GUESS, evidence=ev,
                             alternatives=alts),
-            "profile": Claim(box, "projection:view_bounds", Tier.PROJECTION,
-                             evidence=ev),
+            "profile": profile_claim,
             "origin": Claim(origin, "projection:view_bounds", Tier.PROJECTION,
                             evidence=ev),
         },
@@ -298,9 +406,17 @@ def _single_face_base(d, corr: CorrespondenceResult, frames,
         source_view=frame.view_id,
         evidence=list(ev),
     )
-    rep.notes.append(
-        f"基体（单视图）：轮廓 {hi1 - lo1:.2f}×{hi2 - lo2:.2f}（{b1_axis},{b2_axis} 面）"
-        f"沿 {dir_name} 拉伸 {depth:.2f} —— **厚度是猜的**（{method}）")
+    if ring_prof is not None:
+        rep.notes.append(
+            f"基体（单视图）：轮廓取**轮廓环** —— {ring_note}；视图包围盒 "
+            f"{hi1 - lo1:.2f}×{hi2 - lo2:.2f}（{b1_axis},{b2_axis} 面）沿 "
+            f"{dir_name} 拉伸 {depth:.2f} —— **厚度是猜的**（{method}）")
+    else:
+        rep.notes.append(
+            f"基体（单视图）：轮廓 {hi1 - lo1:.2f}×{hi2 - lo2:.2f}"
+            f"（{b1_axis},{b2_axis} 面）沿 {dir_name} 拉伸 {depth:.2f} —— "
+            f"**厚度是猜的**（{method}）；按视图包围盒近似（环不可用："
+            f"{ring_note}）")
     rep.questions.add(Question(
         OpenQuestion.MISSING_DIMENSION,
         f"图纸只有 {len(frames)} 个视图口径可用，{dir_name} 向尺寸图上不存在 ⇒ "
@@ -314,7 +430,11 @@ def _single_face_base(d, corr: CorrespondenceResult, frames,
 
 
 def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature:
-    """基体：按视图包围盒近似成一块拉伸体。
+    """基体：正对轮廓平面的视图 → **轮廓环** → 一块拉伸体。
+
+    轮廓优先取视图轮廓环（``views/ring`` 通道，允许圆弧段）；环不可用
+    （覆盖率不足/断裂/纯圆视图）才退回视图包围盒矩形，并报一条拦路
+    待确认项说明缺口。
 
     **选哪条轴拉伸**：取零件最小的那个正跨度 —— 板类零件的自然读法是
     "沿最薄的方向拉伸"。这条是启发式（tier=PROJECTION 而非 CONVENTION），
@@ -365,10 +485,19 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
             f"（不是包围盒棱柱），沿 {dir_name} 高 {length:.2f}")
         return f
     origin = ir_point(Point3(0.0, 0.0, 0.0), dir_name, lo1, lo2, t_lo)
+    # 轮廓环通道（同 _single_face_base）：提得到真轮廓就用，提不到才退回
+    # 包围盒矩形 + 拦路待确认（"包围盒近似"的登记在这些靶子上就此消失）
+    ring_prof, ring_note = _outline_ring_profile(d, prof_view, dir_name,
+                                                 lo1, hi1, lo2, hi2)
+    if ring_prof is not None:
+        pmethod = "projection:view_outline_ring"
+        profile_claim = Claim(ring_prof, pmethod, Tier.PROJECTION, evidence=ev)
+    else:
+        pmethod = "projection:view_bounds"
+        profile_claim = Claim(box, pmethod, Tier.PROJECTION, evidence=ev)
     f = Feature(
         id=FeatureId(0),
-        type=Claim(FeatureType.BASE, "projection:view_bounds", Tier.PROJECTION,
-                   evidence=ev),
+        type=Claim(FeatureType.BASE, pmethod, Tier.PROJECTION, evidence=ev),
         params={
             "dir": Claim(dir_name, "projection:thinnest_extent", Tier.PROJECTION,
                          evidence=ev),
@@ -376,8 +505,7 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
                             evidence=ev),
             # 轮廓**相对 origin**（发射器按 ir_point(origin, dir, a, b, t) 落位）；
             # 写成绝对坐标会与 origin 叠加一次，造出双倍偏移的零件
-            "profile": Claim(box, "projection:view_bounds", Tier.PROJECTION,
-                             evidence=ev),
+            "profile": profile_claim,
             "origin": Claim(origin, "projection:view_bounds", Tier.PROJECTION,
                             evidence=ev),
         },
@@ -386,17 +514,24 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
         source_view=prof_view.view_id,
         evidence=list(ev),
     )
-    rep.notes.append(
-        f"基体：轮廓 {hi1 - lo1:.2f}×{hi2 - lo2:.2f}（{b1_axis},{b2_axis} 面）"
-        f"沿 {dir_name} 拉伸 {length:.2f}，角点在 "
-        f"({origin.x:.2f},{origin.y:.2f},{origin.z:.2f})")
-    rep.questions.add(Question(
-        OpenQuestion.AMBIGUOUS_FEATURE,
-        f"基体目前只按视图包围盒近似（{b1_axis},{b2_axis} 面上的矩形 "
-        f"{hi1 - lo1:.2f}×{hi2 - lo2:.2f} 沿 {dir_name} 拉伸 {length:.2f}）—— "
-        "轮廓内的台阶/缺口**没有**被解释；真实轮廓需要环提取通道，本阶段刻意不做",
-        view=prof_view.view_id, evidence=ev[:1],
-    ))
+    if ring_prof is not None:
+        rep.notes.append(
+            f"基体：轮廓取**轮廓环**（{prof_view.view_id}）—— {ring_note}；"
+            f"沿 {dir_name} 拉伸 {length:.2f}，角点在 "
+            f"({origin.x:.2f},{origin.y:.2f},{origin.z:.2f})")
+    else:
+        rep.notes.append(
+            f"基体：轮廓 {hi1 - lo1:.2f}×{hi2 - lo2:.2f}（{b1_axis},{b2_axis} 面）"
+            f"沿 {dir_name} 拉伸 {length:.2f}，角点在 "
+            f"({origin.x:.2f},{origin.y:.2f},{origin.z:.2f})；"
+            f"按视图包围盒近似（环不可用：{ring_note}）")
+        rep.questions.add(Question(
+            OpenQuestion.AMBIGUOUS_FEATURE,
+            f"基体只按视图包围盒近似（{b1_axis},{b2_axis} 面上的矩形 "
+            f"{hi1 - lo1:.2f}×{hi2 - lo2:.2f} 沿 {dir_name} 拉伸 {length:.2f}）—— "
+            f"轮廓内的台阶/缺口**没有**被解释；轮廓环通道不可用（{ring_note}）",
+            view=prof_view.view_id, evidence=ev[:1],
+        ))
     return f
 
 
@@ -561,11 +696,13 @@ def _absorb(f: Feature, axis: Axis3, c, rep: RecognizeReport) -> None:
 
 
 def _material_extent(base: Feature) -> dict[str, float]:
-    """基体在三个模型轴上的"材料厚度"（当前是包围盒口径）。
+    """基体在三个模型轴上的"材料厚度"（轮廓环/包围盒同一口径：轮廓跨度）。
 
-    拉伸方向上是 ``length``；轮廓平面内的两轴上是轮廓的宽/高。写成一张表
-    而不是"孔轴必须与拉伸方向同向才判"—— PF60K 的孔沿 z、基体沿 y 拉伸，
-    孔轴与拉伸方向不同，但 z 向的材料厚度就是轮廓的 z 跨度，照样能判。
+    拉伸方向上是 ``length``；轮廓平面内的两轴上是轮廓的宽/高
+    （``profile_span`` —— 点列取 max、Profile2 取 bbox，见 geom2d）。
+    写成一张表而不是"孔轴必须与拉伸方向同向才判"—— PF60K 的孔沿 z、
+    基体沿 y 拉伸，孔轴与拉伸方向不同，但 z 向的材料厚度就是轮廓的
+    z 跨度，照样能判。
 
     回转体（法兰/盘）走另一支：轴向厚度 = 母线沿轴的最大坐标，两个径向
     尺寸 = 2×最大半径。**基体可能是 REVOLVE 而不是 BASE**（圆轮廓走
@@ -578,10 +715,8 @@ def _material_extent(base: Feature) -> dict[str, float]:
         prof = base.params["radius_profile"].value
         r = max(float(rr) for _, rr in prof)
         return {dir_name: max(float(t) for t, _ in prof), b1: 2.0 * r, b2: 2.0 * r}
-    prof = base.params["profile"].value
-    return {dir_name: base.params["length"].value,
-            b1: max(a for a, _ in prof),
-            b2: max(b for _, b in prof)}
+    w1, w2 = profile_span(base.params["profile"].value)
+    return {dir_name: base.params["length"].value, b1: w1, b2: w2}
 
 
 def derive_through(part: Part, rep: RecognizeReport) -> None:

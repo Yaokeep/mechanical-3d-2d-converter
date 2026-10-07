@@ -51,6 +51,7 @@ from src.rebuild.model.feature_tree import (                             # noqa:
     Part,
 )
 from src.rebuild.model.geom import Axis3, Point3, Vector3                # noqa: E402
+from src.rebuild.model.geom2d import profile_span                        # noqa: E402
 from src.rebuild.model.ids import FeatureId                              # noqa: E402
 from src.rebuild.features import (                                       # noqa: E402
     PARAMS,
@@ -1085,7 +1086,7 @@ def test_pipeline() -> None:
     rep = trees["block_3view"]
     base = rep.part.features[0]
     prof = base.params["profile"].value
-    ext = (max(a for a, _ in prof), max(b for _, b in prof))
+    ext = profile_span(prof)
     check("基体 100×60 沿 y 拉伸 30（= 黄金 bbox 100/30/60）",
           base.params["dir"].value == "y"
           and base.params["length"].value == 30.0
@@ -1111,9 +1112,9 @@ def test_pipeline() -> None:
         """基体在某轴上的材料厚度（与 recognizer._material_extent 同口径）。"""
         b1, b2 = {"x": ("y", "z"), "y": ("z", "x"), "z": ("x", "y")}[
             base.params["dir"].value]
-        prof = base.params["profile"].value
+        w1, w2 = profile_span(base.params["profile"].value)
         return {base.params["dir"].value: base.params["length"].value,
-                b1: max(a for a, _ in prof), b2: max(b for _, b in prof)}[axis_name]
+                b1: w1, b2: w2}[axis_name]
 
     box = 100.0 * 30.0 * 60.0
     cut = sum(math.pi * (f.params["radius"].value ** 2)

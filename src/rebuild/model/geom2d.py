@@ -234,3 +234,34 @@ class Profile2:
 
     def to_point_tuples(self) -> list[tuple[float, float]]:
         return [(p.x, p.y) for p in self.corner_points()]
+
+    def reversed(self) -> "Profile2":
+        """反向遍历（段序倒转，每段 ``p1 ↔ p2``；弧同步换向）。
+
+        用途：坐标映射时轴对调（行列式 −1）会把环翻成 CW —— 用它把
+        轮廓统一回"纸面 CCW 正面积"的契约（``Ring`` 层同理，
+        view frame 的 u/v 与轮廓平面 (b1, b2) 未必同序）。
+        """
+        out = []
+        for s in reversed(self.segments):
+            if s.kind == "line":
+                out.append(ProfileSeg2("line", s.p2, s.p1))
+            else:
+                out.append(ProfileSeg2("arc", s.p2, s.p1, s.center,
+                                       s.radius, not s.ccw, s.ea, s.sa))
+        return Profile2(tuple(out))
+
+
+def profile_span(profile: "Profile2 | list[tuple[float, float]]"
+                 ) -> tuple[float, float]:
+    """轮廓在 (a, b) 两轴上的跨度 —— 两种表示的统一口径。
+
+    点列（历史路径）：取 ``max`` 口径（多项式轮廓锚定在原点角，
+    ``max`` 即宽度，与 v0.5 起的既有语义一致）；Profile2：取几何
+    bbox 宽高（含弧的四象限极值，不是弦端——臂端圆头算直径）。
+    """
+    if isinstance(profile, Profile2):
+        bb = profile.bbox()
+        return bb.width, bb.height
+    return (max(float(p[0]) for p in profile),
+            max(float(p[1]) for p in profile))

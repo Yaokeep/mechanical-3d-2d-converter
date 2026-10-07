@@ -17,7 +17,8 @@
 - 长度一律 mm，角度一律度（`*_deg`）
 - 位置一律"沿轴自零件原点起"（`axial_at`），**不写绝对图纸坐标**
 - `axis` 走 `Feature.axis`（`Claim[Axis3]`），不进 params
-- `profile` 是闭合环 `list[(a, b)]`（mm），a/b 是垂直于 `dir` 的那个平面
+- `profile` 是闭合环：``Profile2``（可含圆弧段，轮廓环通道的产物）或
+  历史兼容的 `list[(a, b)]` 点列（mm）；a/b 是垂直于 `dir` 的那个平面
   内的两个坐标，顺序沿右手法则为正
 - 缺参数就报 `KeyError`，**绝不默认 0**（§3 原则一的反面：静默默认值
   正是旧管线 53.7% 空心体的成因）
@@ -37,6 +38,7 @@ from typing import Any
 from ..model.claim import Claim, Tier
 from ..model.feature_tree import Feature, FeatureType
 from ..model.geom import Axis3, Point3, Vector3
+from ..model.geom2d import Profile2
 from ..model.ids import FeatureId
 
 #: 轴向名 → 单位向量（与 model/geom.AXIS_BY_NAME 同源，此处仅为方便）
@@ -297,14 +299,28 @@ def _predict_slot(f: Feature, view_type: str) -> list[Prim3]:
     return []
 
 
+def _profile_ab(value: Any) -> list[tuple[float, float]] | None:
+    """轮廓参数 → (a, b) 点列；两种表示（点列 / Profile2）统一。
+
+    Profile2 的弧退化为弦端（段起点折线）：预测器只做**图元级粗对准**，
+    精确弧由发射器消费 Profile2 本体，这里不重复离散化。
+    """
+    if isinstance(value, (list, tuple)):
+        return [(float(p[0]), float(p[1])) for p in value]
+    if isinstance(value, Profile2):
+        return value.to_point_tuples()
+    return None
+
+
 def _predict_pocket(f: Feature, view_type: str) -> list[Prim3]:
     ax = _dir_of(f)
     o = _origin_of(f)
     dir_name = _name_of_dir(ax)
     prof = f.params.get("profile")
-    if prof is None or not isinstance(prof.value, (list, tuple)):
+    ab = _profile_ab(prof.value) if prof is not None else None
+    if not ab:
         return []
-    pts = [ir_point(o, dir_name, float(p[0]), float(p[1]), 0.0) for p in prof.value]
+    pts = [ir_point(o, dir_name, a, b, 0.0) for a, b in ab]
     if is_along(view_type, ax):
         out = []
         for i, a in enumerate(pts):
@@ -330,9 +346,10 @@ def _predict_base(f: Feature, view_type: str) -> list[Prim3]:
     o = _origin_of(f)
     prof = f.params.get("profile")
     ln = _num(f, "length")
-    if prof is None or not isinstance(prof.value, (list, tuple)) or ln is None:
+    ab = _profile_ab(prof.value) if prof is not None else None
+    if not ab or ln is None:
         return []
-    pts = [ir_point(o, dir_name, float(p[0]), float(p[1]), 0.0) for p in prof.value]
+    pts = [ir_point(o, dir_name, a, b, 0.0) for a, b in ab]
     if is_along(view_type, d):
         out = []
         for i, a in enumerate(pts):
@@ -342,10 +359,15 @@ def _predict_base(f: Feature, view_type: str) -> list[Prim3]:
                              of_param="profile"))
         return out
     if is_across(view_type, d):
-        aa = [float(p[0]) for p in prof.value]
-        bb = [float(p[1]) for p in prof.value]
-        corners = [(min(aa), min(bb)), (max(aa), min(bb)),
-                   (max(aa), max(bb)), (min(aa), max(bb))]
+        if isinstance(prof.value, Profile2):
+            # bbox 含弧的四象限极值（点列的 min/max 会漏弧顶）
+            bb2 = prof.value.bbox()
+            alo, ahi, blo, bhi = bb2.xmin, bb2.xmax, bb2.ymin, bb2.ymax
+        else:
+            aa = [a for a, _ in ab]
+            bb = [b for _, b in ab]
+            alo, ahi, blo, bhi = min(aa), max(aa), min(bb), max(bb)
+        corners = [(alo, blo), (ahi, blo), (ahi, bhi), (alo, bhi)]
         pts3 = [ir_point(o, dir_name, a, b, 0.0) for a, b in corners]
         far = d * ln
         out = []
