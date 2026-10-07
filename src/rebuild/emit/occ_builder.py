@@ -85,6 +85,8 @@ from OCC.Core.BRepCheck import BRepCheck_Analyzer
 from OCC.Core.BRepExtrema import BRepExtrema_DistShapeShape
 from OCC.Core.BRepFilletAPI import BRepFilletAPI_MakeChamfer, BRepFilletAPI_MakeFillet
 from OCC.Core.BRepGProp import brepgprop
+from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_ThruSections
+from OCC.Core.BRepTools import breptools
 from OCC.Core.BRepPrimAPI import (BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakePrism,
                                   BRepPrimAPI_MakeRevol)
 from OCC.Core.GC import GC_MakeArcOfCircle
@@ -100,7 +102,7 @@ from ..features import library
 from ..model.claim import Claim, Tier
 from ..model.feature_tree import Feature, FeatureType, Part
 from ..model.geom import Axis3, Point3, Vector3
-from ..model.geom2d import Profile2
+from ..model.geom2d import Point2, Profile2, ProfileSeg2
 from ..model.ids import FeatureId
 
 __all__ = ["OccBuildError", "OccUnavailable", "build_shape", "build_step",
@@ -651,11 +653,104 @@ def _profile_desc(profile: Any) -> str:
     return f"{len(profile)} 点轮廓"
 
 
+def _profile_bbox_ab(profile: Any) -> tuple[float, float, float, float]:
+    """轮廓在 (a, b) 系里的 bbox —— ``Profile2`` 含弧的四象限极值，点列取端点包围盒。"""
+    if isinstance(profile, Profile2):
+        bb = profile.bbox()
+        return bb.xmin, bb.ymin, bb.xmax, bb.ymax
+    xs = [float(p[0]) for p in profile]
+    ys = [float(p[1]) for p in profile]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _scaled_profile(f: Feature, profile: Any, sa: float, sb: float,
+                    what: str) -> Any | None:
+    """轮廓相对 bbox 中心按 (sa, sb) 缩放；两轴都缩到 0 时返回 None（收敛成一点）。
+
+    弧在**非等比**缩放下会变成椭圆（``ProfileSeg2`` 表达不了）⇒ 显式拒绝；
+    等比缩放（sa == sb > 0）时半径与圆心同步缩放、角度与走向不变。
+    """
+    if sa < 0.0 or sb < 0.0:
+        raise OccBuildError(
+            f"特征 #{f.id}（{f.type.value}）{what}：锥化缩放系数不能为负"
+            f"（({sa:g},{sb:g})；负系数 = 翻面镜像，不在契约内）")
+    x0, y0, x1, y1 = _profile_bbox_ab(profile)
+    ca, cb = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    # ⚠️ 缩放系数是**无量纲**的，不能用 _EPS = 0.5（那是切割余量 mm）：
+    # 0.3 的锥化在它眼里会变成"退化到一点"
+    if abs(sa) < 1e-9 and abs(sb) < 1e-9:
+        return None
+    if isinstance(profile, Profile2):
+        if abs(sa - sb) > 1e-9 and any(s.kind == "arc" for s in profile.segments):
+            raise OccBuildError(
+                f"特征 #{f.id}（{f.type.value}）{what}：含弧轮廓不支持非等比锥化"
+                f"（({sa:g},{sb:g}) 会把弧缩成椭圆，轮廓契约表达不了）")
+        out = []
+        for s in profile.segments:
+            c = s.center
+            out.append(ProfileSeg2(
+                s.kind,
+                Point2(ca + sa * (s.p1.x - ca), cb + sb * (s.p1.y - cb)),
+                Point2(ca + sa * (s.p2.x - ca), cb + sb * (s.p2.y - cb)),
+                None if c is None else Point2(ca + sa * (c.x - ca),
+                                              cb + sb * (c.y - cb)),
+                s.radius * sa if s.kind == "arc" else 0.0,
+                s.ccw, s.sa, s.ea))
+        return Profile2(tuple(out))
+    return [(ca + sa * (float(p[0]) - ca), cb + sb * (float(p[1]) - cb))
+            for p in profile]
+
+
+def _loft_taper(f: Feature, profile: Any, length: float,
+                sa: float, sb: float) -> Any:
+    """底面轮廓（t=0）+ 顶部缩放截面（t=length）放样成锥化体。
+
+    两个截面走同一条 `BRepOffsetAPI_ThruSections`：顶面退化（sa=sb=0）时
+    改喂 ``AddVertex``（实测：60×60 底 + 顶点 = 棱锥实体，体积与解析值
+    逐位一致 72,000.0；截锥路径 126,000.0 亦为解析值）。
+    """
+    if length <= 0.0:
+        raise OccBuildError(f"特征 #{f.id}（{f.type.value}）锥化拉伸长度必须为正，实得 {length}")
+    o, d = _axis_of(f)
+    b1, b2 = basis_of(d)
+    bottom = _profile_face(f, profile, 0.0, "基体底面")
+    bw = breptools.OuterWire(bottom)
+    if bw.IsNull():
+        raise OccBuildError(f"特征 #{f.id}（{f.type.value}）基体底面取外环失败")
+    mk = BRepOffsetAPI_ThruSections(True, True)     # isSolid, ruled（直纹面）
+    mk.AddWire(bw)
+    top_profile = _scaled_profile(f, profile, sa, sb, "基体顶面")
+    if top_profile is None:
+        x0, y0, x1, y1 = _profile_bbox_ab(profile)
+        apex = _at(o, b1, b2, d, (x0 + x1) / 2.0, (y0 + y1) / 2.0, length)
+        mk.AddVertex(BRepBuilderAPI_MakeVertex(_pnt(apex)).Vertex())
+    else:
+        top = _profile_face(f, top_profile, length, "基体顶面")
+        tw = breptools.OuterWire(top)
+        if tw.IsNull():
+            raise OccBuildError(f"特征 #{f.id}（{f.type.value}）基体顶面取外环失败")
+        mk.AddWire(tw)
+    return _built(mk, f, "锥化拉伸")
+
+
 def _build_base(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
-    """BASE：闭合轮廓沿轴拉伸成基体（零件的第一块材料）。"""
+    """BASE：闭合轮廓沿轴拉伸成基体（零件的第一块材料）。
+
+    ``taper_scale``（可选）给顶部截面的缩放 (sa, sb)：缺省 / ``(1, 1)`` 走
+    直棱柱（``_extrude``），否则走 ``_loft_taper`` 放样 —— ``(0, 0)`` 是
+    收敛到一点的棱锥（``图形练习`` 的四棱锥）。
+    """
     o, d = _axis_of(f)
     length = float(_param(f, "length"))
     profile = _param(f, "profile")
+    taper = _opt(f, "taper_scale", None)
+    if taper is not None and not (abs(float(taper[0]) - 1.0) < 1e-12
+                                  and abs(float(taper[1]) - 1.0) < 1e-12):
+        sa, sb = float(taper[0]), float(taper[1])
+        tool = _loft_taper(f, profile, length, sa, sb)
+        return _add_material(shape, tool, f, validate), \
+            (f"base 锥化拉伸 {_profile_desc(profile)} h={length:g}mm "
+             f"顶部缩放 ({sa:g},{sb:g}) 沿 ({d.x:g},{d.y:g},{d.z:g})")
     face = _profile_face(f, profile, 0.0, "基体轮廓")
     tool = _extrude(face, d, length, f, "基体拉伸")
     return _add_material(shape, tool, f, validate), \

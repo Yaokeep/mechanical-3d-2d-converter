@@ -103,7 +103,9 @@ PARAMS: dict[FeatureType, tuple[str, ...]] = {
 
 #: 可选参数 + 语义（供 emitters 识别"有就给、没有就按默认"）
 OPTIONAL_PARAMS: dict[FeatureType, dict[str, str]] = {
-    FeatureType.BASE: {"origin": "零件原点在图纸系的位置（mm）"},
+    FeatureType.BASE: {"origin": "零件原点在图纸系的位置（mm）",
+                       "taper_scale": "锥化拉伸：顶部截面 = 轮廓相对 bbox 中心按 (sa, sb) "
+                                      "缩放；缺省 = 直棱柱，(0, 0) = 收敛到一点（棱锥）"},
     FeatureType.BOSS: {"axial_at": "凸台起始处沿轴的坐标（mm）"},
     FeatureType.HOLE: {"depth": "盲孔深度（mm）；through=True 时忽略",
                        "axial_at": "孔口沿轴的坐标（mm）",
@@ -336,6 +338,9 @@ def _predict_pocket(f: Feature, view_type: str) -> list[Prim3]:
 def _predict_base(f: Feature, view_type: str) -> list[Prim3]:
     """基体：顺拉伸方向看 = 轮廓环；横着看 = 轮廓的包围矩形（4 条线）。
 
+    锥化拉伸（``taper_scale``）时横着看的两端截面不同：远端按缩放后的角点
+    预（退化成一点时改预"四条斜棱汇到顶点"）。
+
     轮廓 (a, b) 按 ``profile_plane(dir)`` 落到 3D —— **不能写死 (x, y)**：
     沿 Y 拉伸的板（本仓库大多数零件）轮廓在 (z, x) 面上，写死会把零件转 90°。
     """
@@ -369,15 +374,31 @@ def _predict_base(f: Feature, view_type: str) -> list[Prim3]:
             alo, ahi, blo, bhi = min(aa), max(aa), min(bb), max(bb)
         corners = [(alo, blo), (ahi, blo), (ahi, bhi), (alo, bhi)]
         pts3 = [ir_point(o, dir_name, a, b, 0.0) for a, b in corners]
-        far = d * ln
+        # 锥化拉伸（taper_scale）：远端截面 = 近端角点相对 bbox 中心缩放。
+        # 退化到一点时远端"四条边"不存在，改成四条斜棱汇到顶点（棱锥）。
+        tp = f.params.get("taper_scale")
+        sa, sb = (float(tp.value[0]), float(tp.value[1])) if tp is not None else (1.0, 1.0)
+        ca, cb = (alo + ahi) / 2.0, (blo + bhi) / 2.0
+        degenerate = abs(sa) < 1e-9 and abs(sb) < 1e-9
+        far3 = ([ir_point(o, dir_name, ca, cb, ln)] if degenerate else
+                [ir_point(o, dir_name, ca + sa * (a - ca), cb + sb * (b - cb), ln)
+                 for a, b in corners])
         out = []
         for i, a in enumerate(pts3):
             b = pts3[(i + 1) % len(pts3)]
             out.append(Prim3("segment", f.id, a + (b - a) * 0.5, start=a, end=b,
                              direction=d, visible=True, of_param="profile"))
-            out.append(Prim3("segment", f.id, a + far + (b - a) * 0.5,
-                             start=a + far, end=b + far, direction=d,
-                             visible=True, of_param="length"))
+            if degenerate:
+                out.append(Prim3("segment", f.id, a + (far3[0] - a) * 0.5,
+                                 start=a, end=far3[0], direction=d,
+                                 visible=True, of_param="taper_scale"))
+            else:
+                out.append(Prim3("segment", f.id, a + (far3[i] - a) * 0.5,
+                                 start=a, end=far3[i], direction=d,
+                                 visible=True, of_param="taper_scale"))
+                out.append(Prim3("segment", f.id, far3[i] + (far3[(i + 1) % 4] - far3[i]) * 0.5,
+                                 start=far3[i], end=far3[(i + 1) % 4], direction=d,
+                                 visible=True, of_param="length"))
         return out
     return []
 

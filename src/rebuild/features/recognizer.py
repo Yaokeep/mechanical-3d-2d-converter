@@ -329,6 +329,109 @@ def _outline_ring_profile(d, frame: ViewFrame, dir_name: str,
     return prof, note
 
 
+#: 锥化剪影判据的容差（比例口径，相对视图跨度）
+TAPER_TOL = 0.02
+
+
+@dataclass(frozen=True)
+class _Taper:
+    """锥化体判据的结论：沿 ``axis`` 自低端收敛到一点（宽端在 t_lo 一侧）。"""
+
+    axis: str
+    views: tuple[str, ...]
+
+
+def _detect_taper(d, frames, ext: dict[str, float],
+                  rep: RecognizeReport) -> "_Taper | None":
+    """锥化体（棱锥）判据：侧看轮廓是**干净的三角形**（``图形练习`` 的四棱锥）。
+
+    词汇很窄，五条全中才算（读不出的形状宁可不说，不许猜）：
+    1. 某视图的可见轮廓环恰好 3 条直线段；
+    2. 底边是**唯一**一条平行于视图 u/v 轴的边（等腰三角形的斜边比底长，
+       不能拿"最长边"当底）⇒ 锥化轴 = 该视图的另一条轴；
+    3. 顶点在底边中垂线上（偏移 ≤ 2% 跨度）——与"绕轴缩到中心一点"同一读法；
+    4. 底边长度 = 底面视图（``p_axis`` = 锥化轴）沿同一条模型轴的跨度 ——
+       这条把"三角棱柱"的读法排除在外（棱柱的底面视图跨度对不上底边宽）；
+    5. 底/顶分别落在锥化轴跨度的两端，且**宽端在低端**（倒锥不在词汇表，
+       检出即记账但不采用）。
+
+    多视图报出不同锥化轴 ⇒ 判无 + 记账（互相矛盾的证据不强行调和）。
+    """
+    found: list[_Taper] = []
+    for frame in frames.values():
+        view = next((v for v in d.views if v.id == frame.view_id), None)
+        if view is None:
+            continue
+        res = extract_ring(d, view)
+        if res.ring is None or len(res.ring.segs) != 3:
+            continue
+        segs = res.ring.segs
+        if any(s.kind != "line" for s in segs):
+            continue
+        span = max(frame.u_span[1] - frame.u_span[0],
+                   frame.v_span[1] - frame.v_span[0])
+        tol = max(0.5, TAPER_TOL * span)
+        # 底边 = **唯一**一条与视图轴平行的边（不能取"最长边"：等腰三角形的
+        # 斜边比底边长，图形练习里 67.08 > 60，取最长会取到斜边）
+        base_edges = [(s.p1, s.p2) for s in segs
+                      if abs(s.p1.y - s.p2.y) <= tol or abs(s.p1.x - s.p2.x) <= tol]
+        if len(base_edges) != 1:
+            continue
+        a, bpt = base_edges[0]
+        apex = next((s.p1 for s in segs
+                     if s.p1.distance_to(a) > 1e-9
+                     and s.p1.distance_to(bpt) > 1e-9), None)
+        if apex is None:
+            continue
+        if abs(a.y - bpt.y) <= tol:               # 水平底边 ⇒ 沿 v 轴锥化
+            axis_name, edge_axis = frame.v_axis, frame.u_axis
+            base_pos, apex_pos = (a.y + bpt.y) / 2.0, apex.y
+            base_len = abs(a.x - bpt.x)
+            centred = abs(apex.x - (a.x + bpt.x) / 2.0) <= tol
+            to_model = frame.v_to_model
+        elif abs(a.x - bpt.x) <= tol:             # 竖直底边 ⇒ 沿 u 轴锥化
+            axis_name, edge_axis = frame.u_axis, frame.v_axis
+            base_pos, apex_pos = (a.x + bpt.x) / 2.0, apex.x
+            base_len = abs(a.y - bpt.y)
+            centred = abs(apex.y - (a.y + bpt.y) / 2.0) <= tol
+            to_model = frame.u_to_model
+        else:
+            continue
+        if not centred or axis_name not in ext:
+            continue
+        mspan = frame.model_span(axis_name)
+        if mspan is None:
+            continue
+        m_lo, m_hi = mspan
+        base_m, apex_m = to_model(base_pos), to_model(apex_pos)
+        if abs(base_m - m_hi) <= tol and abs(apex_m - m_lo) <= tol:
+            rep.notes.append(
+                f"锥化剪影（{frame.view_id}）：三角形朝 −{axis_name} 收敛 —— "
+                "倒锥不在本词汇表内，该视图不作数")
+            continue
+        if abs(base_m - m_lo) > tol or abs(apex_m - m_hi) > tol:
+            continue                              # 两端没顶满跨度 ⇒ 不是收敛到端点
+        plan = next((f2 for f2 in frames.values() if f2.p_axis == axis_name), None)
+        if plan is None:
+            continue
+        pspan = plan.model_span(edge_axis)
+        if pspan is None or abs(base_len - (pspan[1] - pspan[0])) > tol:
+            continue
+        found.append(_Taper(axis_name, (frame.view_id,)))
+    if not found:
+        return None
+    axes = {t.axis for t in found}
+    if len(axes) > 1:
+        rep.notes.append(
+            f"锥化剪影出现在多个轴上（{sorted(axes)}），互相矛盾 ⇒ 不认定锥化")
+        return None
+    views = tuple(dict.fromkeys(v for t in found for v in t.views))
+    rep.notes.append(
+        f"锥化剪影：{', '.join(views)} 的可见轮廓是三角形（顶点居中、两端顶满跨度）"
+        f"⇒ 基体读作沿 {found[0].axis} 自低端**收敛到一点**（锥化拉伸）")
+    return _Taper(found[0].axis, views)
+
+
 def _single_face_base(d, corr: CorrespondenceResult, frames,
                       rep: RecognizeReport) -> Feature:
     """单视图基体：看得见的那个面按实量，看不见的那一维按猜。
@@ -439,6 +542,8 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
     **选哪条轴拉伸**：取零件最小的那个正跨度 —— 板类零件的自然读法是
     "沿最薄的方向拉伸"。这条是启发式（tier=PROJECTION 而非 CONVENTION），
     且必须报出来，因为"最薄方向不是拉伸方向"的零件（如长轴套）会被读错。
+    三角形剪影（``_detect_taper``）优先于它：那直接给出锥化轴与收敛方向
+    （图形练习的四棱锥），此时基体带 `taper_scale` 参数、按锥化拉伸发射。
 
     轮廓坐标是"垂直拉伸方向的那个平面"上的 (a, b)，按
     ``library.profile_plane`` 的右手基向量落位 —— 发射器用同一张表，
@@ -452,7 +557,14 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
         raise ValueError("没有任何视图给出可用跨度，无法定基体")
     if len(ext) < 3:
         return _single_face_base(d, corr, frames, rep)
-    dir_name = min(ext, key=lambda a: ext[a])
+    tap = _detect_taper(d, frames, ext, rep)
+    if tap is not None:
+        # 锥化轴优先于"最薄方向"：三角形剪影是更强的证据（它直接给出收敛
+        # 方向与底/顶两端），且三向跨度并列时"最薄"本来就无从选起
+        # （图形练习三向都是 60，按 min 取到的是字典序首位的 x）
+        dir_name = tap.axis
+    else:
+        dir_name = min(ext, key=lambda a: ext[a])
     # 轮廓取"看不出的正是拉伸方向"的那个视图（它正对着这个平面）
     prof_view = next((f for f in frames.values() if f.p_axis == dir_name),
                      next(iter(frames.values())))
@@ -472,7 +584,10 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
     ev = tuple(dict.fromkeys(e for v in d.views for e in v.evidence[:1]))
     # 轮廓外沿是个圆 ⇒ 回转体（法兰/盘），不是棱柱。实测「法兰练习」：
     # 按包围盒做 80×80 的方板 = 128,000，而金值 94,248（圆盘）—— 差 35%。
-    circ = _profile_circle(corr, dir_name, lo1, hi1, lo2, hi2)
+    # 锥化剪影已成立时不走这条：底面的圆外沿 + 三角形侧影是**圆锥**，按
+    # 回转体建会得到平顶圆柱（形状错），而锥化拉伸正是对它的读法
+    circ = None if tap is not None else _profile_circle(
+        corr, dir_name, lo1, hi1, lo2, hi2)
     if circ is not None:
         c = circ.axis.origin
         prof_f = next((f for f in frames.values()
@@ -495,30 +610,50 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
     else:
         pmethod = "projection:view_bounds"
         profile_claim = Claim(box, pmethod, Tier.PROJECTION, evidence=ev)
+    params: dict[str, Claim] = {
+        "dir": Claim(dir_name,
+                     "projection:taper_axis" if tap is not None
+                     else "projection:thinnest_extent",
+                     Tier.PROJECTION, evidence=ev),
+        "length": Claim(length, "projection:view_bounds", Tier.PROJECTION,
+                        evidence=ev),
+        # 轮廓**相对 origin**（发射器按 ir_point(origin, dir, a, b, t) 落位）；
+        # 写成绝对坐标会与 origin 叠加一次，造出双倍偏移的零件
+        "profile": profile_claim,
+        "origin": Claim(origin, "projection:view_bounds", Tier.PROJECTION,
+                        evidence=ev),
+    }
+    taper_on = tap is not None and ring_prof is not None
+    if taper_on:
+        # 锥化拉伸契约（见 library.OPTIONAL_PARAMS）：顶部截面 = 底面轮廓
+        # 相对 bbox 中心按 (sa, sb) 缩放；(0, 0) = 收敛到一点（棱锥）。
+        # 只在底面环可用时给 —— 拿包围盒矩形当底面再收锥是另一种错形状
+        params["taper_scale"] = Claim((0.0, 0.0), "projection:taper_silhouette",
+                                      Tier.PROJECTION, evidence=ev)
     f = Feature(
         id=FeatureId(0),
         type=Claim(FeatureType.BASE, pmethod, Tier.PROJECTION, evidence=ev),
-        params={
-            "dir": Claim(dir_name, "projection:thinnest_extent", Tier.PROJECTION,
-                         evidence=ev),
-            "length": Claim(length, "projection:view_bounds", Tier.PROJECTION,
-                            evidence=ev),
-            # 轮廓**相对 origin**（发射器按 ir_point(origin, dir, a, b, t) 落位）；
-            # 写成绝对坐标会与 origin 叠加一次，造出双倍偏移的零件
-            "profile": profile_claim,
-            "origin": Claim(origin, "projection:view_bounds", Tier.PROJECTION,
-                            evidence=ev),
-        },
+        params=params,
         placement=Claim(origin, "projection:view_bounds", Tier.PROJECTION,
                         evidence=ev),
         source_view=prof_view.view_id,
         evidence=list(ev),
     )
-    if ring_prof is not None:
+    if taper_on:
+        rep.notes.append(
+            f"基体：底面轮廓取**轮廓环**（{prof_view.view_id}）—— {ring_note}；"
+            f"沿 {dir_name} 自低端**锥化拉伸**收敛到一点"
+            f"（依据 {'、'.join(tap.views)} 的三角形剪影），角点在 "
+            f"({origin.x:.2f},{origin.y:.2f},{origin.z:.2f})")
+    elif ring_prof is not None:
+        extra = ""
+        if tap is not None:
+            extra = (f"；**检出锥化剪影（{'、'.join(tap.views)}）但底面视图的"
+                     "轮廓环不可用 ⇒ 未按锥化建**，形状存疑")
         rep.notes.append(
             f"基体：轮廓取**轮廓环**（{prof_view.view_id}）—— {ring_note}；"
             f"沿 {dir_name} 拉伸 {length:.2f}，角点在 "
-            f"({origin.x:.2f},{origin.y:.2f},{origin.z:.2f})")
+            f"({origin.x:.2f},{origin.y:.2f},{origin.z:.2f}){extra}")
     else:
         rep.notes.append(
             f"基体：轮廓 {hi1 - lo1:.2f}×{hi2 - lo2:.2f}（{b1_axis},{b2_axis} 面）"

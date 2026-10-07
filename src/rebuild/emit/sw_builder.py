@@ -490,8 +490,69 @@ def _require(driver: Any, feat: Any, f: Feature, what: str) -> None:
 # 逐特征建模
 # ---------------------------------------------------------------------------
 
+def _profile_bbox_ab(profile: Any) -> tuple[float, float, float, float]:
+    """轮廓在 (a, b) 系里的 bbox（``Profile2`` 含弧的四象限极值；点列取端点盒）。"""
+    if isinstance(profile, Profile2):
+        bb = profile.bbox()
+        return bb.xmin, bb.ymin, bb.xmax, bb.ymax
+    xs = [float(p[0]) for p in profile]
+    ys = [float(p[1]) for p in profile]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _boss_taper(driver: Any, f: Feature, profile: Any, depth_mm: float,
+                sa: float, sb: float) -> None:
+    """带拔模的凸台拉伸（草图上画的是**底面**轮廓，向内收锥）。
+
+    SW 的拔模角对所有侧壁是**同一个值**，因此两个方向的锥角必须一致；
+    不一致（两向异角的锥化）一个 `FeatureExtrusion2` 表达不了 ⇒ 直接拒绝，
+    不做"取平均"之类的近似。实测（``_sw_probe_taper.py``）：``Dchk1=True``
+    （拔模开）、``Ddir1=False``（向内）、``Dang1=atan((w/2)(1−s)/h)`` ——
+    60×60 底、h=60、s=0 得体积 **72000.0 逐位**（向外那支 504,000，正是
+    反面的读法）。含弧轮廓在非等比缩放下会变椭圆 ⇒ 同样拒绝。
+    """
+    if sa < 0.0 or sb < 0.0:
+        raise SwBuildError(
+            f"特征 #{f.id}（base）锥化缩放系数不能为负（({sa:g},{sb:g})）")
+    if isinstance(profile, Profile2) and abs(sa - sb) > 1e-9 \
+            and any(s.kind == "arc" for s in profile.segments):
+        raise SwBuildError(
+            f"特征 #{f.id}（base）含弧轮廓不支持非等比锥化（({sa:g},{sb:g})）")
+    x0, y0, x1, y1 = _profile_bbox_ab(profile)
+    wa, wb = x1 - x0, y1 - y0
+    if wa <= 0.0 or wb <= 0.0:
+        raise SwBuildError(f"特征 #{f.id}（base）轮廓空（{wa:g}×{wb:g}）")
+    ang_a = math.atan2(0.5 * wa * (1.0 - sa), depth_mm)
+    ang_b = math.atan2(0.5 * wb * (1.0 - sb), depth_mm)
+    if abs(ang_a - ang_b) > 1e-6:
+        raise SwBuildError(
+            f"特征 #{f.id}（base）锥化两向异角（{math.degrees(ang_a):.3f}° vs "
+            f"{math.degrees(ang_b):.3f}°）：SW 拔模对所有侧壁是同一个角，"
+            "一次拉伸表达不了 —— 拒绝而不是取近似")
+    feat = driver.sw_feat_mgr.FeatureExtrusion2(
+        True, False, False,                       # Sd, Flip, Dir
+        0, 0,                                     # T1 = 盲拉, T2
+        driver.mm_to_m(depth_mm), driver.mm_to_m(depth_mm),
+        True, False,                              # Dchk1 = 拔模开, Dchk2
+        False, False,                             # Ddir1 = 不向外（向内收锥）
+        ang_a, 0.0,                               # Dang1, Dang2（弧度）
+        False, False, False, False,               # OffsetReverse1/2, TranslateSurface1/2
+        True, True, True,                         # Merge, UseFeatScope, UseAutoSelect
+        0, 0.0, False,                            # T0, StartOffset, FlipStartOffset
+    )
+    if feat is None:
+        raise SwBuildError(
+            f"特征 #{f.id}（base）拔模拉伸返回 None（锥角 "
+            f"{math.degrees(ang_a):.3f}°、深度 {depth_mm:g}mm）")
+    feat.Name = f"Base{f.id}"
+
+
 def _build_base(driver: Any, f: Feature) -> str:
-    """BASE：把闭合轮廓沿轴拉伸成基体（零件的第一块材料）。"""
+    """BASE：把闭合轮廓沿轴拉伸成基体（零件的第一块材料）。
+
+    ``taper_scale``（可选）非 (1, 1) 时按**拔模拉伸**发射（见 ``_boss_taper``）：
+    ``(0, 0)`` = 收敛到一点的棱锥（``图形练习`` 的四棱锥）。
+    """
     o, d, name = _axis_of(f)
     frame = _FRAMES[name]
     length = float(_param(f, "length"))
@@ -509,6 +570,13 @@ def _build_base(driver: Any, f: Feature) -> str:
         # 轮廓坐标 (a,b) 是"垂直 dir 的平面内"的两个坐标 → 换算成 IR 点再取草图局部坐标
         pts = [frame.local(frame.ir_point(o, float(a), float(b), 0.0)) for a, b in profile]
         _sketch_polygon(driver, pts)
+    taper = _opt(f, "taper_scale", None)
+    if taper is not None and not (abs(float(taper[0]) - 1.0) < 1e-12
+                                  and abs(float(taper[1]) - 1.0) < 1e-12):
+        sa, sb = float(taper[0]), float(taper[1])
+        _boss_taper(driver, f, profile, depth, sa, sb)
+        return (f"base 锥化拉伸 {_profile_desc(profile)} h={depth:g}mm "
+                f"顶部缩放 ({sa:g},{sb:g}) 于 {plane}")
     if not driver.feature_boss_extrude(depth, feat_name=f"Base{f.id}"):
         raise SwBuildError(f"特征 #{f.id}（base）拉伸失败（{_profile_desc(profile)}）")
     return f"base 拉伸 {_profile_desc(profile)} h={depth:g}mm 于 {plane}"
