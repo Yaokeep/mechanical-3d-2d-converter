@@ -383,6 +383,56 @@ def _profile_desc(profile: Any) -> str:
     return f"{len(profile)} 点轮廓"
 
 
+def _merge_collinear_segs(segs: list[ProfileSeg2]) -> list[ProfileSeg2]:
+    """把"精确共线且首尾相接"的连续直线段并成一条（弧段原样保留）。
+
+    **合并是无损的**，判据 = 相邻方向向量叉积 ≤ 1e-9·|a||b|（旋转角 ≤1e-9 rad），
+    bracket 微链实测垂偏 0.000µm、合并前后环解析面积逐位相同（8347.756mm²）。
+    SW 草图求解器对 30+ 段首尾相接的碎片线链会**静默拒绝**——2026-10-07 bisect
+    实测：同一条 U 形槽两排碎片链，任一排合并、另一排保留碎片即可通过拉伸；
+    两排都碎片时 5 个变体全败；122 实体（未合并）连纯折线环都拉不出来。
+    环起点旋转到"非共线断点"保证不跨环接缝误并（全环共线时 k0=0 兜底）。
+    """
+    n = len(segs)
+    if n < 2:
+        return segs
+
+    def _dir(s: ProfileSeg2) -> tuple[float, float]:
+        return (s.p2.x - s.p1.x, s.p2.y - s.p1.y)
+
+    def _coll(a: tuple[float, float], b: tuple[float, float]) -> bool:
+        return abs(a[0] * b[1] - a[1] * b[0]) <= \
+            1e-9 * (abs(a[0]) + abs(a[1])) * (abs(b[0]) + abs(b[1]) + 1e-30)
+
+    k0 = 0
+    for k in range(1, n + 1):
+        i, j = (k - 1) % n, k % n
+        if (segs[i].kind != "line" or segs[j].kind != "line"
+                or not _coll(_dir(segs[i]), _dir(segs[j]))):
+            k0 = k % n
+            break
+    rot = segs[k0:] + segs[:k0]
+    out: list[ProfileSeg2] = []
+    i = 0
+    while i < len(rot):
+        s = rot[i]
+        if s.kind != "line":
+            out.append(s)
+            i += 1
+            continue
+        j = i
+        while (j + 1 < len(rot) and rot[j + 1].kind == "line"
+               and _coll(_dir(rot[j]), _dir(rot[j + 1]))):
+            j += 1
+        if math.hypot(rot[j].p2.x - rot[i].p1.x,
+                      rot[j].p2.y - rot[i].p1.y) <= 1e-9:
+            i = j + 1                        # 零净长链（退化产物）：整条丢弃
+            continue
+        out.append(ProfileSeg2("line", rot[i].p1, rot[j].p2))
+        i = j + 1
+    return out
+
+
 def _sketch_profile(driver: Any, frame: _Frame, o: Point3, profile: Profile2,
                     f: Feature, what: str) -> None:
     """画带圆弧的闭合轮廓（``Profile2``，段序 = 遍历序）到活动草图。
@@ -393,6 +443,18 @@ def _sketch_profile(driver: Any, frame: _Frame, o: Point3, profile: Profile2,
     ``(pm−p1)×(p2−pm)`` 符号——映射含反射时符号自动翻转，一条式子覆盖三轴。
     段序连续性由 ``Profile2.chain_break`` 把关（SW 的草图比 OCC 的 MakeWire
     更不能容忍乱序：乱序边在草图里就是一堆断开的曲线，拉伸静默失败）。
+
+    直线部分先过 ``_merge_collinear_segs``（无损）：SW 求解器会拒绝
+    30+ 段首尾相接的碎片线链（bracket 三视图实测，122 实体拉伸全败）。
+
+    ⚠️ 弧的 SW 调用语义（2026-10-07 四点实验 + bisect 定死，与文档不同）：
+    ``direction=True`` 实测 = **顺时针**；``direction=False`` 实测 = **取劣弧**
+    （与 CCW 同向时等价，CCW 走优弧时会把劣弧画出来——cwF 反例）。故
+    **span ≤ π 的弧一律传 False**（任何走向都得到那条劣弧本身；bracket r3
+    顺时针劣弧传 True 会静默拒绝拉伸、传 False 通过且几何正确）；**优弧**
+    必须用"顺时针 + 正确端点序"表达：局部系顺时针走向的（``cross<0``）直接
+    传 True，逆时针走向的换端点序——顺时针从 p2 画到 p1 即同一条优弧。
+    恰好 π 的弧两端点对径、两条半圆都合法，此处按劣弧分支取其一（未遇靶子）。
     """
     segs = profile.segments
     if len(segs) < 2:
@@ -407,6 +469,7 @@ def _sketch_profile(driver: Any, frame: _Frame, o: Point3, profile: Profile2,
             f"({s0.p2.x:.3f},{s0.p2.y:.3f}) 与段 {(brk + 1) % len(segs)} 起点 "
             f"({s1.p1.x:.3f},{s1.p1.y:.3f}) 相距 {s0.p2.distance_to(s1.p1):.3f}mm"
             "（段序必须是遍历序）")
+    segs = _merge_collinear_segs(list(segs))
 
     def loc(a: float, b: float) -> tuple[float, float]:
         return frame.local(frame.ir_point(o, a, b, 0.0))
@@ -433,7 +496,15 @@ def _sketch_profile(driver: Any, frame: _Frame, o: Point3, profile: Profile2,
                 f"特征 #{f.id}（{f.type.value}）{what}：弧段方向不可判"
                 f"（弧中点两侧弦近共线，r={s.radius:g}）")
         cx, cy = loc(s.center.x, s.center.y)
-        driver.draw_arc(cx, cy, 0.0, x1, y1, 0.0, x2, y2, 0.0, clockwise=cross < 0.0)
+        if span <= math.pi:
+            driver.draw_arc(cx, cy, 0.0, x1, y1, 0.0, x2, y2, 0.0,
+                            clockwise=False)
+        elif cross < 0.0:                     # 优弧且局部系顺时针：端点序即遍历序
+            driver.draw_arc(cx, cy, 0.0, x1, y1, 0.0, x2, y2, 0.0,
+                            clockwise=True)
+        else:                                 # 优弧且局部系逆时针：换序走顺时针
+            driver.draw_arc(cx, cy, 0.0, x2, y2, 0.0, x1, y1, 0.0,
+                            clockwise=True)
 
 
 def _sketch_circles(driver: Any, circles: list[tuple[tuple[float, float], float]]) -> None:

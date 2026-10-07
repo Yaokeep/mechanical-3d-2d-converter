@@ -468,10 +468,12 @@ ezdxf+numpy，**跑默认 python**；`verify/step_probe.py`（读 STEP 量尺寸
 把整包的 import 绑死在 cad-occt 上，selftest 的 E 组会把这条拉回。
 阶段 1 的 `verify.reproject` 同样归 OCC 侧。
 
-阶段 0 ~ 4 全部落地（2026-09-28）。`src/rebuild/` 现有：`model/`（Claim/geom/
-geom2d/ids/feature_tree/questions）、`evidence/`（dxf_reader/model + text_parser）、
-`views/`（view_detector + view_typer + correspondence 跨视图对应）、`conventions/`、
-`features/`（recognizer + solver + library + prior）、`verify/`（compare/coverage/
+阶段 0 ~ 4 全部落地（2026-09-28），**阶段 5（轮廓环 + 锥化）2026-10-07 落地**。
+`src/rebuild/` 现有：`model/`（Claim/geom/geom2d/ids/feature_tree/questions）、
+`evidence/`（dxf_reader/model + text_parser）、
+`views/`（view_detector + view_typer + correspondence 跨视图对应 + **ring 轮廓环仪器**）、
+`conventions/`、
+`features/`（recognizer + solver + library + prior + taper_scale 锥化）、`verify/`（compare/coverage/
 gate/step_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
 step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
@@ -479,26 +481,30 @@ step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 272 项自检（2026-10-01 实测），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 331 项自检（2026-10-07 实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
 ```
-阶段 4 实测（9 个靶子，两张表）：6 个简单靶子里 **4 个体积逐位吻合**（block_3view /
-plate_100x60 / flange_d80 / 法兰练习，bbox 差全 0.00；SW 表另核**特征步数 = 特征模型**），
-且 OCC 表与 SW 表在这 4 个上逐位相同——两个独立发射器（一 OCC 一 COM，无共享代码）
-互为交叉验证。其余 5 行标 `[GAP]`。
+阶段 4 实测（2026-09-28）→ **阶段 5 当前表（2026-10-07，9 靶子两表）**：
+6 个简单靶子**全部体积逐位吻合**（block_3view / plate_100x60 / flange_d80 /
+法兰练习 原 4 绿 + **l_bracket 19,800 / 图形练习 72,000** 阶段 5 转绿，bbox 差全 0.00；
+SW 表另核**特征步数 = 特征模型**），且 OCC 表与 SW 表在这 8 个绿行上逐位相同——
+两个独立发射器（一 OCC 一 COM，无共享代码）互为交叉验证。bracket 三视图/
+剖面图**发射成功**（361,044.7 +88.06% / 318,983.4 +66.15%）；PF60K 仍 −63.05%。
 ⚠️ **`[GAP]` 是已知结构缺口、不是回归**，两条都不在发射器里：
-① **基体轮廓目前取视图包围盒**（矩形棱柱）⇒ `l_bracket` / `图形练习` / `bracket`
-   体积偏大（+227% / +200% / +130%），真实外轮廓是 L 形 / 台阶 / 回转体；
-② **多视图下的回转体识别未做** ⇒ `PF60K`（法兰盘）被按板类零件建（−31%）。
+① **高度分解未做**——基体 = 俯视外环 × 全高 44，真实零件在俯视轮廓内分区不同高
+   （bracket 基体单项 367,301 vs 全体金值 191,987.8；高度信号在 front/side 视图里），
+   连带识别侧圆的 hole/boss 消解（bracket 的臂端圆头被读成孔）；
+② **多视图下的回转体识别未做** ⇒ `PF60K`（法兰盘）被按板类零件建（−63.05%）。
+（原先"基体轮廓取视图包围盒"这条已由阶段 5 轮廓环消灭：l_bracket/图形练习
++227%/+200% → 逐位。）
 **别为了让表变绿去调发射器**——那会把"没读到"变成"读错了"（体积对了结构全错，
 正是本框架要消灭的病）。表上红的地方就是还没读出来的地方，见
 `run_rebuild_acceptance.py` 顶部注释。
-SW 表比 OCC 表更严：三个大靶子**发射就被拒**（`FeatureCut3` 返回 None），根因
-同样是上面两条 —— PF60K 的 7 条同心圆被读成 7 个同轴通孔（第一个 Ø60 切完后
-第二个 Ø50 无材料可切，切除不幂等）；bracket 的 r12 圆（GUESS(hole|boss)）圆心
-(193.3, ·, 24) 与基体包围盒 x 上界 205.3 **恰好相切**（真身是臂端圆头）。
+SW 表（2026-10-07 基体拉伸修复后）：**8 绿 + bracket 8/8 特征建成**（361,379.4，
+与 OCC 侧 361,044.7 吻合 0.09%）；仍按设计拒绝的只剩 PF60K（7 条同心圆被读成
+7 个同轴通孔，第一个 Ø60 切完后第二个 Ø50 无材料可切，切除不幂等）。
 验收表因此按"框架自己的 gate"判失败性质：`blocking()` 非空 ⇒ `[GAP] 按设计拒绝`
 （不计 FAIL、也不洗绿）；**一条阻塞疑问都没有却失败 ⇒ 疑似发射器 bug、计 FAIL**。
 另有一条已记账的静默默认：`BOSS/HOLE/POCKET/SLOT` 的 `axial_at` 参数缺省时
@@ -572,6 +578,17 @@ axial_at ⇒ 沿轴按 0 起`。实测症状：bracket 基体自 z=2 起而凸�
   否则键槽矩形角部距截面圆边 0.04mm 会被吸附畸变，致 `FeatureCut3` 返回 None；
   **但 boss 草图必须 `no_snap=False`**——SetAddToDB 模式下线端点不自动合并，
   多线环开环导致拉伸失败（八边环实测）
+- **`CreateArc` 的 direction 语义与文档不符**（2026-10-07 四点实验 + bisect 定死）:
+  `True` 实测 = **顺时针**；`False` 实测 = **取劣弧**（不是文档写的"逆时针"——
+  CCW 走优弧时它会把劣弧画出来）。顺时针**劣弧**传 True 会**静默拒绝拉伸**
+  （bracket r3 弧实测：同轨迹传 False 通过）；优弧必须用"顺时针 + 正确端点序"
+  表达（换端点序走顺时针 = 同一条优弧）。`sw_builder._sketch_profile` 已按此重写
+- **SW 拒绝 30+ 段首尾相接的碎片微线段链**：122 实体（未合并）连纯折线环都拉不出来；
+  同一条微链两排、任一排合并即可通过。修为**精确共线无损合并**（叉积 ≤1e-9·|a||b|，
+  bracket 微链垂偏 0.000µm，合并前后解析面积逐位相同），122→62 实体即通过
+- **SW 草图弧按（圆心+两端点）三点重拟合**：环端点离理想圆 0.3–4.7µm 时读回半径
+  偏移（实测 r20→19.9847、r25.5→25.5927），高密度环的体积对账残留 ±0.1–0.5%
+  （基体 −0.4942%、全弦对照 +0.0987%，逐位复现）；简单靶子端点精确、不受影响
 
 ### 已移除的功能（v0.3.0 起不再维护）
 
