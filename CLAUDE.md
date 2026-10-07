@@ -86,7 +86,7 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
                                                # 用户目视标记缺陷的入口（v0.6.18 三缺陷即由此而来）。
                                                # 脚本内路径写死 bracket：换重建结果改 main() 里 read_step 的 _3d.step 路径
 # 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性脚本一律用 `_` 前缀，
-# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；根目录现存 214 个（2026-10-06
+# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃；根目录现存 215 个（2026-10-07
 # 计数）分九类：`_probe_*.py` 几何探针（59：_probe_ysec 逐 y 层截面 / _probe_zsec
 # 水平截面 / _probe_tor9 挂耳 / _probe_gap145 挂耳间隙）、`_sw_*.py` SW COM API 探测
 # （24：2026-09-28 一轮 fillet/planes/cut/edge/circ 探针，`_sw_cleanup.py` 收尾）、
@@ -597,6 +597,9 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   （2026-10-06 复核：tag 又落后 HEAD 3 个提交——`v0.6.20-3-g4716081`，即
   440b543/8fe9712/4716081 三个 YZYX 入账提交，均为 v0.6.20 前缀；内容已在
   正文 `_yz_*` 节入账，仅 tag 簿记待下次发版收口）
+  （2026-10-07 复核：tag 落后 HEAD 6 个提交——`v0.6.20-6-g5e125f4`，新增
+  a1b326c/b50663d/5e125f4 三个（v15a 入账、#1 第三轮复核、ASSESSMENT 自评），
+  仍全部为 v0.6.20 前缀；同上，簿记待下次发版收口）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。

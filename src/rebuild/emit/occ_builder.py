@@ -76,15 +76,18 @@ from typing import Any, Callable
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
 from OCC.Core.BRepBndLib import brepbndlib
-from OCC.Core.BRepBuilderAPI import (BRepBuilderAPI_MakeFace,
+from OCC.Core.BRepBuilderAPI import (BRepBuilderAPI_MakeEdge,
+                                     BRepBuilderAPI_MakeFace,
                                      BRepBuilderAPI_MakePolygon,
-                                     BRepBuilderAPI_MakeVertex)
+                                     BRepBuilderAPI_MakeVertex,
+                                     BRepBuilderAPI_MakeWire)
 from OCC.Core.BRepCheck import BRepCheck_Analyzer
 from OCC.Core.BRepExtrema import BRepExtrema_DistShapeShape
 from OCC.Core.BRepFilletAPI import BRepFilletAPI_MakeChamfer, BRepFilletAPI_MakeFillet
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.BRepPrimAPI import (BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakePrism,
                                   BRepPrimAPI_MakeRevol)
+from OCC.Core.GC import GC_MakeArcOfCircle
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.STEPControl import (STEPControl_AsIs, STEPControl_Reader,
                                   STEPControl_Writer)
@@ -97,6 +100,7 @@ from ..features import library
 from ..model.claim import Claim, Tier
 from ..model.feature_tree import Feature, FeatureType, Part
 from ..model.geom import Axis3, Point3, Vector3
+from ..model.geom2d import Profile2
 from ..model.ids import FeatureId
 
 __all__ = ["OccBuildError", "OccUnavailable", "build_shape", "build_step",
@@ -330,7 +334,13 @@ def _extrude(face: Any, d: Vector3, length: float, f: Feature, what: str):
 
 
 def _profile_face(f: Feature, profile: Any, t: float, what: str):
-    """把 `profile`（面内 (a,b) 点列）在轴上坐标 t 处的平面内造成 face。"""
+    """把 `profile` 在轴上坐标 t 处的平面内造成 face。
+
+    两种契约：原始的 ``[(a, b), ...]`` 点列（多边形）与
+    ``Profile2``（含圆弧段，views/ring 提取的环经 to_profile 而来）。
+    """
+    if isinstance(profile, Profile2):
+        return _profile2_face(f, profile, t, what)
     if not isinstance(profile, (list, tuple)) or len(profile) < 3:
         raise OccBuildError(
             f"特征 #{f.id}（{f.type.value}）{what}：profile 需为 ≥3 点的点列，实得 {profile!r}")
@@ -338,6 +348,78 @@ def _profile_face(f: Feature, profile: Any, t: float, what: str):
     b1, b2 = basis_of(d)
     pts = [_at(o, b1, b2, d, float(a), float(b), t) for a, b in profile]
     return _polygon_face(pts, f, what)
+
+
+def _profile2_face(f: Feature, profile: Profile2, t: float, what: str):
+    """带圆弧的轮廓（``Profile2``）→ 轴上 t 处平面内的 face。
+
+    弧段用**三点弧** ``GC_MakeArcOfCircle(P1, Pm, P2)`` 建棱：方向由
+    三点顺序唯一决定，不依赖 ``gp_Circ`` 参数化朝向（``MakeEdge(circ,
+    P1, P2)`` 在起点参数大于终点时会绕出补弧，朝向语义易错）。弧中点
+    Pm 按 ``sa→ea``（``ccw`` 定方向）取跨度中角——与 views/ring.py 记
+    角度同约定：``sa`` 恒为 ``p1`` 端角、``ea`` 恒为 ``p2`` 端角。
+
+    ⚠️ 段序必须是**遍历序**（首尾相接的闭合链）：``MakeWire.Add`` 对乱序
+    边会自动重排，产出的 face 有时面积对、拉伸后体积错（实测乱序 D 形
+    面积 957.08 应为 557.08），故进门先用 ``Profile2.chain_break`` 验链。
+    """
+    o, d = _axis_of(f)
+    b1, b2 = basis_of(d)
+    segs = profile.segments
+    if len(segs) < 2:
+        raise OccBuildError(
+            f"特征 #{f.id}（{f.type.value}）{what}：轮廓段数需 ≥2（两段弧可构成整圆），"
+            f"实得 {len(segs)}")
+    brk = profile.chain_break()
+    if brk is not None:
+        s0, s1 = segs[brk], segs[(brk + 1) % len(segs)]
+        raise OccBuildError(
+            f"特征 #{f.id}（{f.type.value}）{what}：轮廓段序断开——段 {brk} 止点 "
+            f"({s0.p2.x:.3f},{s0.p2.y:.3f}) 与段 {(brk + 1) % len(segs)} 起点 "
+            f"({s1.p1.x:.3f},{s1.p1.y:.3f}) 相距 {s0.p2.distance_to(s1.p1):.3f}mm"
+            "（段序必须是遍历序）")
+    mk = BRepBuilderAPI_MakeWire()
+    for s in segs:
+        p1 = _pnt(_at(o, b1, b2, d, s.p1.x, s.p1.y, t))
+        p2 = _pnt(_at(o, b1, b2, d, s.p2.x, s.p2.y, t))
+        if s.kind != "arc":
+            if p1.Distance(p2) <= 1e-9:
+                continue          # 零长段（焊接产物）：不贡献几何，跳过
+            emk = BRepBuilderAPI_MakeEdge(p1, p2)
+            if not emk.IsDone():
+                raise OccBuildError(
+                    f"特征 #{f.id}（{f.type.value}）{what}：直线段建棱失败 "
+                    f"({s.p1.x:.3f},{s.p1.y:.3f})→({s.p2.x:.3f},{s.p2.y:.3f})")
+            mk.Add(emk.Edge())
+            continue
+        if s.center is None or s.radius <= 0.0:
+            raise OccBuildError(
+                f"特征 #{f.id}（{f.type.value}）{what}：弧段缺圆心/半径")
+        span = ((s.ea - s.sa) if s.ccw else (s.sa - s.ea)) % (2.0 * math.pi)
+        if span <= 1e-9:
+            continue
+        thm = s.sa + span / 2.0 if s.ccw else s.sa - span / 2.0
+        pm = _pnt(_at(o, b1, b2, d,
+                      s.center.x + s.radius * math.cos(thm),
+                      s.center.y + s.radius * math.sin(thm), t))
+        amk = GC_MakeArcOfCircle(p1, pm, p2)
+        if not amk.IsDone():
+            raise OccBuildError(
+                f"特征 #{f.id}（{f.type.value}）{what}：弧段建弧失败")
+        emk = BRepBuilderAPI_MakeEdge(amk.Value())
+        if not emk.IsDone():
+            raise OccBuildError(
+                f"特征 #{f.id}（{f.type.value}）{what}：弧段转棱失败")
+        mk.Add(emk.Edge())
+    if not mk.IsDone():
+        raise OccBuildError(
+            f"特征 #{f.id}（{f.type.value}）{what}：{len(segs)} 段轮廓串线失败"
+            "（段间不连续？）")
+    fmk = BRepBuilderAPI_MakeFace(mk.Wire())
+    if not fmk.IsDone():
+        raise OccBuildError(
+            f"特征 #{f.id}（{f.type.value}）{what}：轮廓成环建面失败（共面性/自交）")
+    return fmk.Face()
 
 
 def _cylinder(f: Feature, r: float, t_lo: float, t_hi: float, what: str):
@@ -561,6 +643,14 @@ def select_edges(shape: Any, f: Feature, tol: float = _EDGE_TOL) -> list[Any]:
 # 逐特征建模
 # ---------------------------------------------------------------------------
 
+def _profile_desc(profile: Any) -> str:
+    """轮廓的描述串（点列 vs Profile2 两种契约的记账口径）。"""
+    if isinstance(profile, Profile2):
+        n_arc = sum(1 for s in profile.segments if s.kind == "arc")
+        return f"{len(profile.segments)} 段轮廓（{n_arc} 弧）"
+    return f"{len(profile)} 点轮廓"
+
+
 def _build_base(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
     """BASE：闭合轮廓沿轴拉伸成基体（零件的第一块材料）。"""
     o, d = _axis_of(f)
@@ -569,7 +659,7 @@ def _build_base(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
     face = _profile_face(f, profile, 0.0, "基体轮廓")
     tool = _extrude(face, d, length, f, "基体拉伸")
     return _add_material(shape, tool, f, validate), \
-        f"base 拉伸 {len(profile)} 点轮廓 h={length:g}mm 沿 ({d.x:g},{d.y:g},{d.z:g})"
+        f"base 拉伸 {_profile_desc(profile)} h={length:g}mm 沿 ({d.x:g},{d.y:g},{d.z:g})"
 
 
 def _build_revolve(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
@@ -658,7 +748,7 @@ def _build_pocket(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
     if shape is None:
         raise OccBuildError(f"特征 #{f.id}（pocket）没有基体可切")
     return _cut(shape, tool, f, validate), \
-        f"cut 腔 {len(profile)} 点轮廓 深{depth:g} 底 {t_bot:g}"
+        f"cut 腔 {_profile_desc(profile)} 深{depth:g} 底 {t_bot:g}"
 
 
 def _build_slot(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:

@@ -9,11 +9,13 @@ from .correspondence import (
     CorrKind, Correspondence, CorrespondenceResult, CylinderHint, ViewFrame,
     build_correspondence, describe,
 )
+from .ring import Ring, RingResult, RingSeg, extract_ring
 from .view_detector import DetectParams, detect_views
 from .view_typer import describe_views, type_views
 
 __all__ = [
     "CorrKind", "Correspondence", "CorrespondenceResult", "CylinderHint",
-    "DetectParams", "ViewFrame", "build_correspondence", "describe",
-    "describe_views", "detect_views", "type_views",
+    "DetectParams", "Ring", "RingResult", "RingSeg", "ViewFrame",
+    "build_correspondence", "describe", "describe_views", "detect_views",
+    "extract_ring", "type_views",
 ]

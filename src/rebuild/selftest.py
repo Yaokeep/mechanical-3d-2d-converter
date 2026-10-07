@@ -68,6 +68,7 @@ from src.rebuild.views import (                                          # noqa:
     CorrKind,
     build_correspondence,
     detect_views,
+    extract_ring,
     type_views,
 )
 from src.rebuild.pipeline import rebuild, understand                     # noqa: E402
@@ -1250,6 +1251,107 @@ def test_pipeline() -> None:
           f"{buf2.getvalue().strip()!r} {part.features[1].params['axial_at']}")
 
 
+# ============ J. 轮廓环提取（views/ring） ============
+
+def test_ring() -> None:
+    """轮廓环提取（views/ring.py）——锚今天落地的移植与三处修复。
+
+    运行序**必须**：分离 → 定性 → 提环（section 守卫依赖 is_section
+    ⇔ 定性结果）——这里的 helper 与 ring.py 冒烟的 _main 同序。
+    """
+    section("J. 轮廓环提取（views/ring）")
+    simple = ROOT / "CAD" / "test_simple"
+    tmp = ROOT / "CAD" / "temp_output"
+
+    def ring_of(path, vid):
+        d = read_dxf(path)
+        detect_views(d)
+        type_views(d)
+        v = next(v for v in d.views if v.id == vid)
+        return extract_ring(d, v)
+
+    def invariants(tag, r):
+        g = r.ring
+        check(f"{tag} 有环", g is not None, r.note or "无")
+        if g is None:
+            return
+        n = len(g.segs)
+        check(f"{tag} 段链闭合",
+              all(g.segs[i].p2 == g.segs[(i + 1) % n].p1 for i in range(n)))
+        check(f"{tag} 面积为正", g.area > 0, f"{g.area}")
+        check(f"{tag} coverage≥0.75", min(g.coverage) >= 0.75, str(g.coverage))
+
+    # J1 L 形轮廓（凹角非矩形——步骤 C 变绿的靶子；旧管线逐字复现）
+    r = ring_of(simple / "l_bracket.dxf", "V0")
+    invariants("l_bracket V0", r)
+    if r.ring is not None:
+        check("l_bracket 面积 = 60×60−50×50 = 1100",
+              abs(r.ring.area - 1100.0) < 1e-6, f"{r.ring.area}")
+        check("l_bracket 6 段（含凹角）", len(r.ring.segs) == 6,
+              str(len(r.ring.segs)))
+
+    # J2 矩形靶子（环提取的正确性基线，防回归）
+    for path, vid, want in ((simple / "block_3view.dxf", "V0", 3000.0),
+                            (simple / "block_3view.dxf", "V1", 6000.0),
+                            (simple / "block_3view.dxf", "V2", 1800.0),
+                            (simple / "plate_100x60.dxf", "V0", 6000.0),
+                            (ROOT / "CAD" / "法兰练习.dxf", "V1", 1600.0)):
+        r = ring_of(path, vid)
+        invariants(f"{path.name}/{vid}", r)
+        if r.ring is not None:
+            check(f"{path.name}/{vid} 面积 = {want}",
+                  abs(r.ring.area - want) < 1e-6, f"{r.ring.area}")
+
+    # J3 三角形侧视图（分量守卫放宽到 <3 的锚：四棱锥侧投影）
+    for vid in ("V1", "V2"):
+        r = ring_of(ROOT / "CAD" / "图形练习.dxf", vid)
+        invariants(f"图形练习/{vid}", r)
+        if r.ring is not None:
+            check(f"图形练习/{vid} 三角形面积 1800",
+                  abs(r.ring.area - 1800.0) < 1e-6, f"{r.ring.area}")
+            check(f"图形练习/{vid} 3 段", len(r.ring.segs) == 3,
+                  str(len(r.ring.segs)))
+    r = ring_of(ROOT / "CAD" / "图形练习.dxf", "V0")
+    check("图形练习/V0 底面正方形 3600",
+          r.ring is not None and abs(r.ring.area - 3600.0) < 1e-6,
+          f"{r.ring.area if r.ring else r.note}")
+
+    # J4 纯圆视图让位（note 次序锚：圆是 2 顶点组件 ⇒ 候选池必空，
+    # has_lines 判定必须在 pool 判定之前，否则错报 no_ring_found）
+    for path in (simple / "flange_d80.dxf", ROOT / "CAD" / "法兰练习.dxf"):
+        r = ring_of(path, "V0")
+        check(f"{path.name}/V0 纯圆视图让位",
+              r.ring is None and r.note == "circles_only_view", r.note)
+
+    # J5 bracket 侧视图 2244 满矩形——三处修复的联合锚：
+    #   · 缺口横/竖线 26 条中 21/5 条是 hidden ⇒ 若 HIDDEN 入图，
+    #     遍历拐进缺口线簇拼出 1662 伪环（剖面图纸实测）
+    #   · 面环自交淘汰须与面积比较同层（否则自交大环把干净环压死）
+    r = ring_of(tmp / "bracket_angker_三视图_v4.dxf", "V2")
+    invariants("bracket 三视图 V2", r)
+    if r.ring is not None:
+        check("bracket 三视图 V2 面积 = 51×44 = 2244（非伪缺口环）",
+              abs(r.ring.area - 2244.0) < 0.01, f"{r.ring.area}")
+    # 剖面图纸（融合投影版）同名视图：已回到矩形量级，
+    # 剩 2244−2241.58 = 2.42 未收敛（等步骤 E 专项），先用容差锁住
+    # "不许退回 1662 伪环"
+    r = ring_of(tmp / "bracket_angker_图纸_20260922_剖面图.dxf", "V2")
+    invariants("bracket 剖面图 V2", r)
+    if r.ring is not None:
+        check("bracket 剖面图 V2 为矩形量级（±3，不许退回伪缺口环）",
+              abs(r.ring.area - 2244.0) < 3.0, f"{r.ring.area}")
+
+    # J6 剖视图让位（section 守卫——步骤 F 的排除契约）
+    d = read_dxf(tmp / "bracket_angker_图纸_20260922_剖面图.dxf")
+    detect_views(d)
+    type_views(d)
+    secs = [v for v in d.views if v.id in ("V3", "V4", "V5")]
+    for v in secs:
+        r = extract_ring(d, v)
+        check(f"剖面图纸 {v.id} 剖视图让位",
+              r.ring is None and r.note == "section_view", r.note)
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -1265,6 +1367,7 @@ def main() -> int:
     test_conventions()
     test_features()
     test_pipeline()
+    test_ring()
 
     print("\n" + "=" * 72)
     if _failed:

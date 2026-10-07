@@ -83,6 +83,7 @@ from ..features import library
 from ..model.claim import Claim, Tier
 from ..model.feature_tree import Feature, FeatureType, Part
 from ..model.geom import Axis3, Point3, Vector3
+from ..model.geom2d import Point2, Profile2, ProfileSeg2
 from ..model.ids import FeatureId
 
 __all__ = ["SwBuildError", "SwUnavailable", "PatternPlan", "active_doc", "build_part",
@@ -374,6 +375,67 @@ def _sketch_polygon(driver: Any, pts: list[tuple[float, float]]) -> None:
         driver.draw_line(x1, y1, 0.0, x2, y2, 0.0)
 
 
+def _profile_desc(profile: Any) -> str:
+    """轮廓的描述串（点列 vs Profile2 两种契约的记账口径）。"""
+    if isinstance(profile, Profile2):
+        n_arc = sum(1 for s in profile.segments if s.kind == "arc")
+        return f"{len(profile.segments)} 段轮廓（{n_arc} 弧）"
+    return f"{len(profile)} 点轮廓"
+
+
+def _sketch_profile(driver: Any, frame: _Frame, o: Point3, profile: Profile2,
+                    f: Feature, what: str) -> None:
+    """画带圆弧的闭合轮廓（``Profile2``，段序 = 遍历序）到活动草图。
+
+    弧方向（``CreateArc`` 的 direction 参数）**必须在草图局部坐标里重判**：
+    ``_Frame.local`` 对 z/x 轴是恒等映射，对 y 轴是把两个坐标对调（含反射），
+    轮廓坐标里的 ``ccw`` 直传会在 y 轴上画成补弧。判据 = 弧中点两侧弦的叉积
+    ``(pm−p1)×(p2−pm)`` 符号——映射含反射时符号自动翻转，一条式子覆盖三轴。
+    段序连续性由 ``Profile2.chain_break`` 把关（SW 的草图比 OCC 的 MakeWire
+    更不能容忍乱序：乱序边在草图里就是一堆断开的曲线，拉伸静默失败）。
+    """
+    segs = profile.segments
+    if len(segs) < 2:
+        raise SwBuildError(
+            f"特征 #{f.id}（{f.type.value}）{what}：轮廓段数需 ≥2（两段弧可构成整圆），"
+            f"实得 {len(segs)}")
+    brk = profile.chain_break()
+    if brk is not None:
+        s0, s1 = segs[brk], segs[(brk + 1) % len(segs)]
+        raise SwBuildError(
+            f"特征 #{f.id}（{f.type.value}）{what}：轮廓段序断开——段 {brk} 止点 "
+            f"({s0.p2.x:.3f},{s0.p2.y:.3f}) 与段 {(brk + 1) % len(segs)} 起点 "
+            f"({s1.p1.x:.3f},{s1.p1.y:.3f}) 相距 {s0.p2.distance_to(s1.p1):.3f}mm"
+            "（段序必须是遍历序）")
+
+    def loc(a: float, b: float) -> tuple[float, float]:
+        return frame.local(frame.ir_point(o, a, b, 0.0))
+
+    for s in segs:
+        x1, y1 = loc(s.p1.x, s.p1.y)
+        x2, y2 = loc(s.p2.x, s.p2.y)
+        if s.kind != "arc":
+            if math.hypot(x2 - x1, y2 - y1) <= 1e-9:
+                continue                      # 零长段（焊接产物）：不贡献几何
+            driver.draw_line(x1, y1, 0.0, x2, y2, 0.0)
+            continue
+        if s.center is None or s.radius <= 0.0:
+            raise SwBuildError(f"特征 #{f.id}（{f.type.value}）{what}：弧段缺圆心/半径")
+        span = ((s.ea - s.sa) if s.ccw else (s.sa - s.ea)) % (2.0 * math.pi)
+        if span <= 1e-9:
+            continue                          # 零跨度退化弧：不贡献几何
+        thm = s.sa + span / 2.0 if s.ccw else s.sa - span / 2.0
+        xm, ym = loc(s.center.x + s.radius * math.cos(thm),
+                     s.center.y + s.radius * math.sin(thm))
+        cross = (xm - x1) * (y2 - ym) - (ym - y1) * (x2 - xm)
+        if abs(cross) <= 1e-9 * max(1.0, s.radius):
+            raise SwBuildError(
+                f"特征 #{f.id}（{f.type.value}）{what}：弧段方向不可判"
+                f"（弧中点两侧弦近共线，r={s.radius:g}）")
+        cx, cy = loc(s.center.x, s.center.y)
+        driver.draw_arc(cx, cy, 0.0, x1, y1, 0.0, x2, y2, 0.0, clockwise=cross < 0.0)
+
+
 def _sketch_circles(driver: Any, circles: list[tuple[tuple[float, float], float]]) -> None:
     """画一个或多个整圆。
 
@@ -436,17 +498,20 @@ def _build_base(driver: Any, f: Feature) -> str:
     profile = _param(f, "profile")
     if length <= 0.0:
         raise SwBuildError(f"特征 #{f.id}（base）拉伸长度必须为正，实得 {length}")
-    # 轮廓坐标 (a,b) 是"垂直 dir 的平面内"的两个坐标 → 换算成 IR 点再取草图局部坐标
-    pts = [frame.local(frame.ir_point(o, float(a), float(b), 0.0)) for a, b in profile]
     t0 = _opt(f, "axial_at", 0.0) or 0.0     # BASE 无此参数，留 0
     plane_t, depth = _extrude_place(frame, t0, t0 + length)
     offset = frame.plane_offset(frame.ir_point(o, 0.0, 0.0, plane_t))
     plane = _plane(driver, frame, offset, f"B{f.id}")
     _start_sketch(driver, plane, f, "拉伸基体")
-    _sketch_polygon(driver, pts)
+    if isinstance(profile, Profile2):
+        _sketch_profile(driver, frame, o, profile, f, "拉伸基体")
+    else:
+        # 轮廓坐标 (a,b) 是"垂直 dir 的平面内"的两个坐标 → 换算成 IR 点再取草图局部坐标
+        pts = [frame.local(frame.ir_point(o, float(a), float(b), 0.0)) for a, b in profile]
+        _sketch_polygon(driver, pts)
     if not driver.feature_boss_extrude(depth, feat_name=f"Base{f.id}"):
-        raise SwBuildError(f"特征 #{f.id}（base）拉伸失败（{len(pts)} 点轮廓）")
-    return f"base 拉伸 {len(pts)} 点轮廓 h={depth:g}mm 于 {plane}"
+        raise SwBuildError(f"特征 #{f.id}（base）拉伸失败（{_profile_desc(profile)}）")
+    return f"base 拉伸 {_profile_desc(profile)} h={depth:g}mm 于 {plane}"
 
 
 def _build_revolve(driver: Any, f: Feature) -> str:
@@ -574,13 +639,16 @@ def _build_pocket(driver: Any, f: Feature) -> str:
     if depth <= 0.0:
         raise SwBuildError(f"特征 #{f.id}（pocket）深度必须为正，实得 {depth}")
     t_bot = _axial_at(f)
-    pts = [frame.local(frame.ir_point(o, float(a), float(b), 0.0)) for a, b in profile]
     plane_t, cut_depth = _cut_place(frame, t_bot, t_bot + depth)
     offset = frame.plane_offset(frame.ir_point(o, 0.0, 0.0, plane_t))
     plane = _plane(driver, frame, offset, f"C{f.id}")
     _start_sketch(driver, plane, f, "腔切除")
-    _sketch_polygon(driver, pts)
-    return _cut(driver, f, cut_depth, plane, f"腔 {len(pts)} 点轮廓 深{depth:g}")
+    if isinstance(profile, Profile2):
+        _sketch_profile(driver, frame, o, profile, f, "腔切除")
+    else:
+        pts = [frame.local(frame.ir_point(o, float(a), float(b), 0.0)) for a, b in profile]
+        _sketch_polygon(driver, pts)
+    return _cut(driver, f, cut_depth, plane, f"腔 {_profile_desc(profile)} 深{depth:g}")
 
 
 def _build_slot(driver: Any, f: Feature) -> str:
@@ -1431,10 +1499,50 @@ def _demo_plate_boss() -> tuple[Part, float, tuple[float, float, float]]:
     return p, vol, (20.0, 40.0, 40.0)
 
 
+def _arc_end_part(dir_name: str) -> tuple[Part, float, tuple[float, float, float]]:
+    """80×40×15 板 + 右端 R20 半圆头（D 形，弧段在**基体轮廓**里）。
+
+    解析体积 = (80×40 + π·20²/2)·15 = 57424.777961 mm³。
+    专给 Profile2 弧段 sketch 路径：SW ``CreateArc`` 方向参数错了会**静默**
+    画出补弧（特征照样建成、体积对不上），所以必须进自证链量体积。
+    轮廓：底边 → 右端凸半圆（(80,0)→(80,40) 经 (100,20)）→ 顶边 → 左边。
+    """
+    prof = Profile2((
+        ProfileSeg2("line", Point2(0.0, 0.0), Point2(80.0, 0.0)),
+        ProfileSeg2("arc", Point2(80.0, 0.0), Point2(80.0, 40.0),
+                    Point2(80.0, 20.0), 20.0, True, -math.pi / 2, math.pi / 2),
+        ProfileSeg2("line", Point2(80.0, 40.0), Point2(0.0, 40.0)),
+        ProfileSeg2("line", Point2(0.0, 40.0), Point2(0.0, 0.0)),
+    ))
+    p = Part()
+    p.add(Feature(
+        id=FeatureId(0),
+        type=_claim(FeatureType.BASE),
+        params={"dir": _claim(dir_name), "length": _claim(15.0), "profile": _claim(prof)},
+        axis=_claim(Axis3(Point3(0.0, 0.0, 0.0), _DIRS[dir_name])),
+    ))
+    vol = (80.0 * 40.0 + math.pi * 400.0 / 2.0) * 15.0
+    return p, vol, (100.0, 40.0, 15.0)
+
+
+def _demo_arc_end() -> tuple[Part, float, tuple[float, float, float]]:
+    """arc_end：轴向 z（上视基准面，局部映射为恒等）。"""
+    return _arc_end_part("z")
+
+
+def _demo_arc_end_y() -> tuple[Part, float, tuple[float, float, float]]:
+    """arc_end_y：同轮廓、轴向 y（前视基准面）——``_Frame.local`` 在此把
+    两个坐标**对调**（含反射），专测 `_sketch_profile` 弧方向"在局部坐标
+    里重判叉积"那条式子；沿轮廓 ``ccw`` 直传会在这帧上画成补弧。"""
+    return _arc_end_part("y")
+
+
 _DEMOS: dict[str, Callable[[], tuple[Part, float, tuple[float, float, float]]]] = {
     "plate_hole": _demo_plate_hole,
     "shaft": _demo_shaft,
     "plate_boss": _demo_plate_boss,
+    "arc_end": _demo_arc_end,
+    "arc_end_y": _demo_arc_end_y,
 }
 
 
