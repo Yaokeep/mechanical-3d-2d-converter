@@ -18,9 +18,10 @@
 优先取**视图轮廓环**（要求铺满轮廓跨度），提不到才退回包围盒矩形。`l_bracket`
 因此转绿（19,800 逐位）。锥化词汇（``taper_scale``：侧看三角形剪影 ⇒
 沿该轴自低端收敛到一点）同日落地，`图形练习` 转绿（四棱锥 ⅓·60³ = 72,000
-逐位；此前按侧面三角棱柱读成 108,000）。剩余 GAP 三条各有其因：
-  * `bracket` 两条 —— 基体轮廓面是俯视图（V0），它的环覆盖率不足
-    （三视图 0.06×0.12 / 剖面图纸 0.44×0.78，均被 0.75 门控挡住）
+逐位；此前按侧面三角棱柱读成 108,000）。剩余 GAP 两条各有其因：
+  * `bracket` 两条 —— **高度分解未做**：基体 = 俯视外环 × 全高 44（单项
+    367,301 vs 全体金值 191,987.8），真实零件在俯视轮廓内分区不同高；高度
+    信号在 front/side 视图里。连带识别侧圆的 hole/boss 消解（臂端圆头读成孔）
   * `PF60K` —— 多视图下的回转体识别（它是法兰盘，却按板类零件建；V1 的
     台阶区子环被跨度覆盖率门控挡住，退回了包围盒）
 ⚠️ 因此**不要**为了让表好看去调发射器：表上红的地方就是还没读出来的地方，
@@ -35,10 +36,12 @@
     类型全是 GUESS）。第一个 Ø60 切完后第二个 Ø50 **无材料可切** ⇒ `FeatureCut3`
     返回 None（切除不幂等，见 CLAUDE.md）。框架自己已把这条列成阻塞疑问
     （"是沉孔/倒角/台阶，还是同一面上的两个独立圆边？"）。
-  * `bracket` 两条 —— 第 7 个特征是 V1 里那条 r12 圆：找不到间距 2r 的轮廓对，
-    类型 GUESS(hole|boss)。圆心 (193.3, ·, 24)、r12，而基体（包围盒）x 上界
-    205.3 = 193.3 + 12 ⇒ 切除圆柱与基体右面**恰好相切**，SW 拒绝。真实零件
-    此处是臂端圆头（不是孔）——正是"包围盒基体 + hole/boss 未消解"合起来的后果。
+  * `bracket`（**已解**，2026-10-07）——曾任其一是 V1 里那条 r12 圆：圆心
+    (193.3, ·, 24)、r12，与**包围盒**基体 x 上界 205.3 恰好相切 ⇒ SW 拒绝。
+    轮廓环落地后基体是真环（臂端圆头就在环上），r12 不再与基体面相切，
+    加上 `sw_builder` 的基体拉伸修复（碎片线链无损合并 + 劣弧 `direction=False`），
+    现在 **8 特征 → SW 8 建成**（361,379.4，与 OCC 361,044.7 吻合 0.09%）。
+    r12 的 GUESS(hole|boss) 仍是识别侧待消解的记账。
 
 体积金值来源：
   * 6 个简单靶子 —— `run_simple_regression.py` 的 CASES 表（逐位黄金值）
@@ -57,7 +60,7 @@ ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "CAD" / "temp_output"
 
 #: 靶子 → (图纸, 金值体积 mm³, 金值 bbox (x,y,z) 或 None, 期望)
-#: 期望 "ok" = 应当与金值吻合；"gap" = 已知结构缺口（轮廓环未落地），偏差是预期
+#: 期望 "ok" = 应当与金值吻合；"gap" = 已知结构缺口（高度分解 / 回转体识别未做），偏差是预期
 CASES: dict[str, tuple[str, float | None, tuple | None, str]] = {
     "block_3view": ("CAD/test_simple/block_3view.dxf", 167196.2, (100, 30, 60), "ok"),
     "plate_100x60": ("CAD/test_simple/plate_100x60.dxf", 116858.4, (100, 60, 20), "ok"),
@@ -111,9 +114,11 @@ def run_occ(names: list[str]) -> int:
             continue
         r = rebuild(p, step=OUT / f"_acc_{name.replace(' ', '_')}.step", force=True)
         if r.errors:
+            verdict = _refusal(r, expect)
             print(f"{_mark(expect)} {name:<14} {r.errors[0][:110]}")
-            print(f"{'':<21} {_refusal(r, expect)}")
-            bad += 1
+            print(f"{'':<21} {verdict}")
+            if verdict.startswith("**"):
+                bad += 1
             continue
         m = probe_step(r.step)
         if not m.ok:

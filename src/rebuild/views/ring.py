@@ -13,6 +13,13 @@
 
 - 最左转（min-ccw）环遍历 + 最右转（max）兜底 + 左面遍历兜底，
   候选环按「顶点无重复（自交淘汰）+ 面积取大」选（:4341）
+- **边交点拆分**（:681 ``split_edges_at_intersections``，旧管线调用点 :7903）：
+  面遍历依赖端点共享；直线端点在另一条边的中段（T 型）、圆/弧被直线穿过
+  等情形下，交点若不成为图顶点，闭合环无法闭合。实测 bracket 俯视图
+  124 个直线端点精确落在弧几何上（d≤0.01mm）、且落在弧角跨度内部——
+  而整圆只按 0°/180° 拆两半（``_arc``），这些端点全是度 1，全被修剪，
+  凸台圆退化成 2 顶点分量被 ``len<3`` 守卫跳过 ⇒ 外环提不出来
+  （移植时漏掉此步 ⇒ V0 覆盖率 0.06×0.12）
 - 往返副本签名去重：同几何的 HLR 双副本视作一条（:3798 ``edge_sig``）
 - 微边支路跳过（<0.3mm 抖动边）；长链微边（链长 ≥2mm 的碎段链）
   豁免——那是真实轮廓（:3865 ``_is_micro_edge``）
@@ -161,6 +168,173 @@ def _shoelace(pts: list[tuple[float, float]]) -> float:
 # 边图构建（视图证据 → _E 列表 + 顶点表）
 # ---------------------------------------------------------------------------
 
+def _arc_prims(cx, cy, r, sa, ea):
+    """弧 → 图元（整圆拆两半；一律 CCW 参数化，span 用模运算取正）。"""
+    span = (ea - sa) % TAU
+    if span < 1e-9:
+        span = TAU                                # 整圆（|ea-sa| = 2π）
+    if span > TAU - 1e-3:                         # 整圆拆两半（同旧 :289）
+        mid = sa + math.pi
+        return [("A", cx, cy, r, sa, mid), ("A", cx, cy, r, mid, sa + TAU)]
+    return [("A", cx, cy, r, sa, sa + span)]
+
+
+def _prim_from_geom(g):
+    """视图几何 → 基本图元 [("L", x1,y1,x2,y2) | ("A", cx,cy,r,sa,ea)]。"""
+    if isinstance(g, Line2):
+        return [("L", g.start.x, g.start.y, g.end.x, g.end.y)]
+    if isinstance(g, Arc2):
+        return _arc_prims(g.center.x, g.center.y, g.radius,
+                          g.start_angle, g.end_angle)
+    if isinstance(g, Circle2):
+        return _arc_prims(g.center.x, g.center.y, g.radius, 0.0, TAU)
+    if isinstance(g, Polyline2):
+        pts = g.points
+        return [("L", p.x, p.y, q.x, q.y) for p, q in zip(pts, pts[1:])]
+    return []
+
+
+def _angle_in_arc(ang: float, sa: float, ea: float,
+                  tol: float = 1e-4) -> bool:
+    """角度（弧度）是否在弧参数范围内（含端点容差），弧按 CCW。"""
+    span = (ea - sa) % TAU
+    if span < 1e-9:
+        span = TAU
+    off = (ang - sa) % TAU
+    return -tol <= off <= span + tol
+
+
+#: 交点拆分参数域端点容差（交点恰在端点时不拆那一侧）
+_SPLIT_EPS = 1e-6
+
+
+def _split_primitives(prims: list) -> list:
+    """在边-边交点处拆分图元（旧 :681 ``split_edges_at_intersections`` 语义）。
+
+    三种情形全拆：线∩线（T 型 / X 型，内部侧拆）、弧∩弧（双圆求交）、
+    线∩弧（弧侧必拆、线侧仅内部拆）。相切交点（disc≈0）也要拆——
+    浮点误差可能让 disc 成微负（旧 v0.6.3 教训：法兰叶片角直线与 r=30
+    圆相切漏拆 ⇒ 外环断链）。
+    """
+    n = len(prims)
+    if n < 2:
+        return prims
+    bb = []
+    for p in prims:
+        if p[0] == "L":
+            _, x1, y1, x2, y2 = p
+            bb.append((min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)))
+        else:
+            _, cx, cy, r, _sa, _ea = p
+            bb.append((cx - r, cy - r, cx + r, cy + r))
+
+    cuts: list[list[float]] = [[] for _ in range(n)]
+    EPS = _SPLIT_EPS
+    for i in range(n):
+        for j in range(i + 1, n):
+            bxi, bxj = bb[i], bb[j]
+            if bxi[2] < bxj[0] or bxj[2] < bxi[0] or \
+                    bxi[3] < bxj[1] or bxj[3] < bxi[1]:
+                continue
+            pi, pj = prims[i], prims[j]
+            if pi[0] == "L" and pj[0] == "L":
+                x1, y1, x2, y2 = pi[1:]
+                x3, y3, x4, y4 = pj[1:]
+                d1x, d1y = x2 - x1, y2 - y1
+                d2x, d2y = x4 - x3, y4 - y3
+                den = d1x * d2y - d1y * d2x
+                if abs(den) < 1e-12:
+                    continue
+                t = ((x3 - x1) * d2y - (y3 - y1) * d2x) / den
+                s = ((x3 - x1) * d1y - (y3 - y1) * d1x) / den
+                if -EPS <= t <= 1 + EPS and -EPS <= s <= 1 + EPS:
+                    if EPS < t < 1 - EPS:         # T 型/X 型：内部侧才拆
+                        cuts[i].append(t)
+                    if EPS < s < 1 - EPS:
+                        cuts[j].append(s)
+            elif pi[0] == "A" and pj[0] == "A":
+                _c1, c1x, c1y, r1, s1a, e1a = pi
+                _c2, c2x, c2y, r2, s2a, e2a = pj
+                dx, dy = c2x - c1x, c2y - c1y
+                d = math.hypot(dx, dy)
+                if d < 1e-9 or d > r1 + r2 or d < abs(r1 - r2):
+                    continue
+                a = (r1 * r1 - r2 * r2 + d * d) / (2 * d)
+                h2 = r1 * r1 - a * a
+                if h2 < 0:
+                    continue
+                h = math.sqrt(h2)
+                bx, by = c1x + a * dx / d, c1y + a * dy / d
+                for sign in (1.0, -1.0):
+                    px = bx + sign * h * (-dy / d)
+                    py = by + sign * h * (dx / d)
+                    ang1 = math.atan2(py - c1y, px - c1x)
+                    ang2 = math.atan2(py - c2y, px - c2x)
+                    if _angle_in_arc(ang1, s1a, e1a):
+                        cuts[i].append(ang1 % TAU)
+                    if _angle_in_arc(ang2, s2a, e2a):
+                        cuts[j].append(ang2 % TAU)
+            else:
+                if pi[0] == "A":
+                    arc, line, arc_i, line_i = pi, pj, i, j
+                else:
+                    arc, line, arc_i, line_i = pj, pi, j, i
+                _c, cx, cy, r, sa, ea = arc
+                x1, y1, x2, y2 = line[1:]
+                dx, dy = x2 - x1, y2 - y1
+                fx, fy = x1 - cx, y1 - cy
+                a = dx * dx + dy * dy
+                if a < 1e-12:
+                    continue
+                b = 2 * (fx * dx + fy * dy)
+                c = fx * fx + fy * fy - r * r
+                disc = b * b - 4 * a * c
+                if disc < -1e-9 * max(1.0, b * b, abs(4 * a * c)):
+                    continue                      # 无交点（远离相切）
+                disc = max(disc, 0.0)             # 相切浮点微负 → 夹到 0
+                sq = math.sqrt(disc)
+                for t in ((-b - sq) / (2 * a), (-b + sq) / (2 * a)):
+                    if not (-EPS <= t <= 1 + EPS):
+                        continue
+                    px, py = x1 + t * dx, y1 + t * dy
+                    ang = math.atan2(py - cy, px - cx)
+                    if _angle_in_arc(ang, sa, ea):
+                        cuts[arc_i].append(ang % TAU)  # 弧侧必拆
+                        if EPS < t < 1 - EPS:
+                            cuts[line_i].append(t)
+
+    out: list = []
+    for i, p in enumerate(prims):
+        params = sorted(set(round(t, 9) for t in cuts[i]))
+        if not params:
+            out.append(p)
+            continue
+        if p[0] == "L":
+            x1, y1, x2, y2 = p[1:]
+            pts = [(x1, y1)]
+            for t in params:
+                pts.append((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t))
+            pts.append((x2, y2))
+            for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+                if math.hypot(bx - ax, by - ay) > 1e-9:
+                    out.append(("L", ax, ay, bx, by))
+        else:
+            _c, cx, cy, r, sa, ea = p
+            span = (ea - sa) % TAU
+            if span < 1e-9:
+                span = TAU
+            angs = sorted(params, key=lambda a: (a - sa) % TAU)
+            ordered = [sa] + angs + [sa + span]
+            for a1, a2 in zip(ordered, ordered[1:]):
+                if abs(a2 - a1) < 1e-9:
+                    continue
+                p1 = (cx + r * math.cos(a1), cy + r * math.sin(a1))
+                p2 = (cx + r * math.cos(a2), cy + r * math.sin(a2))
+                if math.hypot(p2[0] - p1[0], p2[1] - p1[1]) > 1e-9:
+                    out.append(("A", cx, cy, r, a1, a2))
+    return out
+
+
 def _profile_edges(d: Drawing, v: View):
     """视图轮廓类证据 → (edges: list[_E], vpos: dict[int, (x, y)])。"""
     by_h = {e.handle: e for e in d.evidence}
@@ -176,46 +350,36 @@ def _profile_edges(d: Drawing, v: View):
             vpos[i] = k
         return i
 
-    edges: list[_E] = []
-
-    def _line(x1, y1, x2, y2) -> None:
-        vs, ve = _vid(x1, y1), _vid(x2, y2)
-        if vs == ve:
-            return                                # 吸附后退化，静默丢弃
-        edges.append(_E("L", vs, ve))
-
-    def _arc(cx, cy, r, sa, ea) -> None:
-        span = (ea - sa) % TAU
-        if span < 1e-9:
-            span = TAU                            # 整圆（|ea-sa| = 2π）
-        if span > TAU - 1e-3:                     # 整圆拆两半（端点须相异）
-            mid = sa + math.pi
-            _arc(cx, cy, r, sa, mid)
-            _arc(cx, cy, r, mid, sa + TAU)
-            return
-        x1, y1 = cx + r * math.cos(sa), cy + r * math.sin(sa)
-        x2, y2 = cx + r * math.cos(ea), cy + r * math.sin(ea)
-        vs, ve = _vid(x1, y1), _vid(x2, y2)
-        if vs == ve:
-            return
-        edges.append(_E("A", vs, ve, cx, cy, r, sa, ea, vs, ve))
-
-    for h in v.evidence:
+    # 边表顺序 = 解析（文件）序，不是 v.evidence 序：v.evidence 是
+    # 视图聚类检测顺序（按位置排序），走环平手（同切向数条候选）时的
+    # 稳定排序会按此定胜负。旧管线 parse_dxf_edges 按文件序建表，
+    # bracket V0 r3 圆处文件序 7A5 分段（[29.17..58.57]，正确续段）在
+    # 7A8/7AA 重复副本之前 → 走通；聚类序把 7A8/7AA 排前面 → 走进
+    # 49.20 死端（8-07 实测：welded 遍断在 (21.90,140.33)）。
+    ev_order = {ev.handle: i for i, ev in enumerate(d.evidence)}
+    prims: list = []
+    for h in sorted(v.evidence, key=lambda h: ev_order.get(h, 1 << 30)):
         ev = by_h.get(h)
         if ev is None or ev.role.value not in _PROFILE_ROLES:
             continue
-        g = ev.geom
-        if isinstance(g, Line2):
-            _line(g.start.x, g.start.y, g.end.x, g.end.y)
-        elif isinstance(g, Arc2):
-            _arc(g.center.x, g.center.y, g.radius, g.start_angle, g.end_angle)
-        elif isinstance(g, Circle2):
-            _arc(g.center.x, g.center.y, g.radius, 0.0, TAU)
-        elif isinstance(g, Polyline2):
-            pts = g.points
-            for p, q in zip(pts, pts[1:]):
-                _line(p.x, p.y, q.x, q.y)
+        prims.extend(_prim_from_geom(ev.geom))
+    prims = _split_primitives(prims)
 
+    edges: list[_E] = []
+    for p in prims:
+        if p[0] == "L":
+            vs, ve = _vid(p[1], p[2]), _vid(p[3], p[4])
+            if vs == ve:
+                continue                          # 吸附后退化，静默丢弃
+            edges.append(_E("L", vs, ve))
+        else:
+            _c, cx, cy, r, sa, ea = p
+            x1, y1 = cx + r * math.cos(sa), cy + r * math.sin(sa)
+            x2, y2 = cx + r * math.cos(ea), cy + r * math.sin(ea)
+            vs, ve = _vid(x1, y1), _vid(x2, y2)
+            if vs == ve:
+                continue
+            edges.append(_E("A", vs, ve, cx, cy, r, sa, ea, vs, ve))
     return edges, vpos
 
 
@@ -361,9 +525,21 @@ def _weld(edges: list[_E], vpos):
         if best is not None:
             _u(vid, best[1])
 
+    # 簇 rep 位置：**弧端点优先**（弧是刚性几何，微链段是软证据）。
+    # 微-微传递合并会沿链把弧端点卷进簇；若按"首见端点"取 rep，弧端点
+    # 会被拖离圆——bracket V0 r3 实测被拖 0.955mm：弧真端点 (19.94,141.05)
+    # 距心 2.995（在圆上），被链中间点 (19.28,141.74)（距心 3.744）顶替，
+    # 环输出直线变斜线 + 弧起点离圆 0.74mm，发射器三点弧近共线（拟合
+    # r≈15 vs 原 3）→ BRepCheck 判 B-rep 无效。
     rep_pos: dict[int, tuple[float, float]] = {}
     for vid, x, y, _vm in ep:
         rep_pos.setdefault(_f(vid), (x, y))
+    anchor: dict[int, tuple[float, float]] = {}
+    for e in edges:
+        if e.t == "A" and e.r > 0.0:
+            anchor.setdefault(_f(e.vs), vpos[e.vs])
+            anchor.setdefault(_f(e.ve), vpos[e.ve])
+    rep_pos.update(anchor)
     vpos2 = {v: rep_pos.get(_f(v), p) for v, p in vpos.items()}
     edges2 = [replace(e, vs=_f(e.vs), ve=_f(e.ve),
                       sa_v=_f(e.sa_v), ea_v=_f(e.ea_v)) for e in edges]
@@ -485,6 +661,9 @@ def _one_pass(edges: list[_E], vpos, micro_len: dict[int, float]):
         cands = []
         for eid, other, ang in adj.get(cur, []):
             if eid in used or sig[eid] in used_sigs:
+                if _DBG >= 3:
+                    why = "已用" if eid in used else "签名重复"
+                    print(f"[adv3] v{cur} 排除边 {eid}（{why}）sig={sig[eid]}")
                 continue
             ccw = ang - out_ref
             if ccw < -math.pi:
@@ -497,6 +676,14 @@ def _one_pass(edges: list[_E], vpos, micro_len: dict[int, float]):
                 ccw = math.pi
             cands.append((ccw, eid, other, ang))
         if not cands:
+            if _DBG >= 3:
+                for eid, other, ang in adj.get(cur, []):
+                    st = ("已用" if eid in used else
+                          "签名重复" if sig[eid] in used_sigs else "空闲")
+                    print(f"[adv3] 断点 v{cur} @({vpos[cur][0]:.2f},"
+                          f"{vpos[cur][1]:.2f}) 边{eid}→"
+                          f"({vpos[other][0]:.2f},{vpos[other][1]:.2f}) "
+                          f"[{st}] sig={sig[eid]}")
             return None
         # 微边支路跳过（伪影挂线）——仅在存在非微边候选时
         big = [c for c in cands if not _is_micro_edge(c[1])]
