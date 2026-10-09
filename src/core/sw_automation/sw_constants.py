@@ -26,6 +26,16 @@ swRefPlaneOffsetFlip = 8 + 256
 # ---- 倒角类型 ----
 swChamferDistanceDistance = 2  # 等距倒角
 
+# ---- 回转终止条件（FeatureRevolve2 的 Dir1Type）----
+# 2026-10-10 实测（根目录 `_probe_sw_revmid.py`，前视面上画 centerline + 矩形
+# (3,0)-(5,4) 按 Dir1Type×角度 试建量体积）：
+#   Dir1Type=6 角 90° → 体积 50.27（= 201.06/4）、bbox z ±3.536 = ±5·sin45°
+#     → **两侧对称中面，Dir1Angle = 总角**
+#   Dir1Type=7 角 90° → 体积同为 50.27 但 bbox z∈[−5,0] → 单侧扫，**不是**中面
+# （曾按网上枚举表猜 7 = MidPlane，实测推翻；以本行实测值为准。）
+# 用途：bracket #6 根部圆角的角域 ±57.78° 回转补料（SW 原生圆角无角域限制）。
+swEndCondMidPlane = 6
+
 # ---- 圆角类型 ----
 # V45 验证: SW2025 FeatureFillet3 必须 Options=195 (0 和 1 均静默失败)
 swFeatureFilletSimple = 0      # 等半径圆角 (SW2025 不可用!)

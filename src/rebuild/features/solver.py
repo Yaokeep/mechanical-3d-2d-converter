@@ -147,6 +147,10 @@ def apply_prior(f: Feature, rep: SolveReport) -> None:
     「R8 vs R8.5」：图纸标 φ17 ⇒ 半径 8.5。旧管线只能照抄 8.5；
     这里会把 R8（R10 优先数）挂成**备选**并算清偏离 5.88%，于是
     "真件多半是 R8"这件事第一次出现在报告里，由 gate 去问人。
+
+    提醒分两档：**人工标注**偏离才升疑问+挂备选（人凑整的痕迹）；
+    **投影量取值**偏离只记 refinement —— 量取值没有凑整痕迹，偏离是
+    真值，升疑问会把 CAD 精确出图的自由尺寸误判成欠定（见下方注释）。
     """
     for name, kind in _PRIOR_KINDS.items():
         c = f.params.get(name)
@@ -168,25 +172,39 @@ def apply_prior(f: Feature, rep: SolveReport) -> None:
                 f.id, name, str(c), str(new),
                 f"{s.source} 标准值吸附（原值偏离 {s.delta_pct:.2f}%）"))
             continue
-        # 标注/投影级的参数 ⇒ **值不动**，只把标准值挂成备选并说清偏离
+        # 标注/投影级的参数 ⇒ **值不动**。怎么提醒，分两档 ——
+        # 先验要读的是"人写数字时留下的痕迹"（拿工具尺寸去标、把数凑整，
+        # CLAUDE.md 的「R8 vs R8.5」正是人把 R8 的槽写成了 φ17）：
+        if c.tier < Tier.ANNOTATED:
+            # 投影量得的半径没有这层痕迹：它是图纸几何的直接量取（出图/量取
+            # 噪声 0.1% 级），偏离标准值 1.9% 是**真值**而不是读数误差 ——
+            # 拿它去问人只会把 CAD 精确出图的正常自由尺寸（实测 bracket
+            # Ø31.4 孔）判成欠定。故**不升疑问、也不挂备选**：挂上备选会让
+            # solve() 的欠定兜底（tier ≤ PROJECTION 且未定 ⇒ 报歧义）把它
+            # 再报一次，等于白改。偏离只进 refinement（报告可见）。
+            rep.refinements.append(Refinement(
+                f.id, name, f"{c.value:g}", f"{c.value:g}",
+                f"投影量得值不是 {s.source} 标准值（最近 {s.value:g}，"
+                f"偏离 {s.delta_pct:.2f}%）—— 投影量取无凑整痕迹，按量取值走"))
+            continue
+        # 图上人工标注 ⇒ 值仍不动，标准值挂成备选并升疑问（留给人裁决）
         if s.value not in c.alternatives:
             f.params[name] = Claim(c.value, c.method, c.tier, c.evidence,
                                    c.alternatives + (s.value,))
-            src = "图上标注" if c.tier >= Tier.ANNOTATED else "投影量得"
             rep.refinements.append(Refinement(
                 f.id, name, f"{c.value:g}", f"{c.value:g}（备选 {s.value:g}）",
-                f"{src}值不是 {s.source} 标准值（最近 {s.value:g}，"
+                f"图上标注值不是 {s.source} 标准值（最近 {s.value:g}，"
                 f"偏离 {s.delta_pct:.2f}%）—— 值保持原值，标准值进备选待裁决"))
             q = Question(
                 OpenQuestion.AMBIGUOUS_FEATURE,
-                f"#{f.id}.{name} {src} {c.value:g}，但 {s.source} 标准值是 "
+                f"#{f.id}.{name} 图上标注 {c.value:g}，但 {s.source} 标准值是 "
                 f"{s.value:g}（偏离 {s.delta_pct:.2f}%）——"
                 + ("若这是凹槽/圆角，真值多半取标准值（本条正是 CLAUDE.md "
                    "「R8 vs R8.5」那种情形）" if kind == "radius"
                    else "孔是被钻头加工的，直径通常取标准值"),
                 evidence=c.evidence,
                 candidates=(f"{s.value:g}（{s.source} 标准值）",
-                            f"{c.value:g}（{src}）"))
+                            f"{c.value:g}（图上标注）"))
             rep.questions.add(q)
 
 

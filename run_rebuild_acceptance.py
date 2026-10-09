@@ -21,12 +21,14 @@
 逐位；此前按侧面三角棱柱读成 108,000）。多视图回转体识别 2026-10-09 落地
 （`features/revolve.py`：同轴圆簇 + 剖面轴扫读母线 ⇒ REVOLVE 基体；方料段
 按"外轮廓 − 回转外径圆"的四角月牙补料，不回盖回转体孔），`PF60K` 转绿
-（OCC 262,097.7 / SW 262,099.1 vs 金值 261,935 = +0.06%）。剩余 GAP 只剩
-`bracket` 两条（**高度分解未做**：基体 = 俯视外环 × 全高 44（单项 367,301
-vs 全体金值 191,987.8），真实零件在俯视轮廓内分区不同高；高度信号在
-front/side 视图里。连带识别侧圆的 hole/boss 消解——臂端圆头读成孔；
-当前数值 285,495.2 / 353,495.2 配"实/虚冲突消解"版 correspondence，
-与历史 361,044.7 / 318,983.4 的差是显式化歧义所致，见 CLAUDE.md 记账）。
+（OCC 262,097.7 / SW 262,099.1 vs 金值 261,935 = +0.06%）。高度分解 + 圆角/
+侧通道 2026-10-10 落地（`features/height_zones.py` 俯视圆分区 × 侧视剪影
+包络 ⇒ 基体降到最低公共顶面、分区抬升；`roundovers.py` 顶边 R3 凸圆角 +
+根部 R3 凹圆角；`side_channels.py` 挂耳月牙/张缝/销孔；
+`views/correspondence.resolve_frame_mirrors` 帧镜像裁决），`bracket` 两条
+随之转绿（OCC 191,970.1 / −0.01%、192,196.5 / +0.11%；SW 193,032.3 /
+193,032.8 / +0.54%——SW 侧比 OCC 高的那 ~+1.06k 是发射器口径差、早于本轮，
+圆角区已由盒探针证两发射器吻合 ≤0.4mm³）。**当前全表 9 靶子无 GAP**。
 ⚠️ 因此**不要**为了让表好看去调发射器：表上红的地方就是还没读出来的地方，
 改发射器只会把"没读到"变成"读错了"（体积对了结构全错，正是本框架要消灭的病）。
 
@@ -67,7 +69,8 @@ ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "CAD" / "temp_output"
 
 #: 靶子 → (图纸, 金值体积 mm³, 金值 bbox (x,y,z) 或 None, 期望)
-#: 期望 "ok" = 应当与金值吻合；"gap" = 已知结构缺口（高度分解未做），偏差是预期
+#: 期望 "ok" = 应当与金值吻合；"gap" = 已知结构缺口，偏差是预期（**当前无靶子
+#: 登记为此**——bracket 两条 2026-10-10 阶段 7 高度分解 + 圆角/侧通道落地后转绿）
 CASES: dict[str, tuple[str, float | None, tuple | None, str]] = {
     "block_3view": ("CAD/test_simple/block_3view.dxf", 167196.2, (100, 30, 60), "ok"),
     "plate_100x60": ("CAD/test_simple/plate_100x60.dxf", 116858.4, (100, 60, 20), "ok"),
@@ -75,10 +78,13 @@ CASES: dict[str, tuple[str, float | None, tuple | None, str]] = {
     "法兰练习": ("CAD/法兰练习.dxf", 94247.78, (80, 80, 20), "ok"),
     "l_bracket": ("CAD/test_simple/l_bracket.dxf", 19800.0, (60, 60, 18), "ok"),
     "图形练习": ("CAD/图形练习.dxf", 72000.0, (60, 60, 60), "ok"),
+    # bracket 2026-10-10 阶段 7（高度分解 + 圆角/侧通道 + 镜像裁决）转绿：
+    # OCC 三视图 191,970.1（−0.01%）/ 剖面图 192,196.5（+0.11%），实体 1、11 特征；
+    # SW 193,032.3 / 193,032.8（+0.54%，发射器口径差，圆角区盒探针与 OCC ≤0.4mm³）
     "bracket 三视图": ("CAD/temp_output/bracket_angker_三视图_v4.dxf",
-                       191987.84, (203.30, 51.00, 44.00), "gap"),
+                       191987.84, (203.30, 51.00, 44.00), "ok"),
     "bracket 剖面图": ("CAD/temp_output/bracket_angker_图纸_20260922_剖面图.dxf",
-                       191987.84, (203.30, 51.00, 44.00), "gap"),
+                       191987.84, (203.30, 51.00, 44.00), "ok"),
     # PF60K 2026-10-09 回转体识别落地后转绿：OCC 262,097.7 / SW 262,099.1
     # vs 261,935 = +0.06%（剩余 +0.06% 的落点已记账：r=8 台阶区 +1,005.3 /
     # 锥区 −852.5，见 CLAUDE.md——两处都是识别侧读数口径，非发射器问题）
@@ -176,6 +182,14 @@ def run_sw(names: list[str]) -> int:
             if verdict.startswith("**"):
                 bad += 1
             continue
+        if r.sldprt is None:
+            # 发射被**静默跳过**（`pipeline._emit_sw` 对"SW 不可用"只记 notes
+            # 不记 errors；典型是循环中途 SW 进程退出）。硬连下去就是 2026-10-10
+            # 那次 ActiveDoc=None 的崩溃——在这里拦住并把原因打出来。
+            note = next((n for n in r.notes if "跳过 .sldprt" in n), "未知原因")
+            print(f"{_mark(expect)} {name:<14} SW 侧发射被跳过：{note}")
+            bad += 1
+            continue
         want = sum(_expected_sw(f, r.part, SB) for f in r.part.features)
         driver = SB.connect()                 # 模型已留在 SW 里，只连上去量，不关文档
         vol = SB.measure_sw_volume_mm3(driver)
@@ -208,13 +222,22 @@ def main(argv: list[str]) -> int:
     print("=" * 100)
     print("新框架验收表" + ("（SW 原生特征模型，需 SW 2025）" if sw else "（STEP，需 cad-occt）"))
     print("=" * 100)
+    if sw:
+        from src.rebuild.emit import sw_builder as _SB
+        if not _SB.sw_available():
+            print("**SW 2025 没在运行** —— 先启动 SolidWorks 再跑 SW 表。")
+            print("（SW 不在时 `pipeline._emit_sw` 对每靶子的发射是**静默跳过**，"
+                  "而 `SB.connect()` 会把 SW 拉起来却没有文档，量体积以 "
+                  "ActiveDoc=None 崩溃——2026-10-10 首跑实测，故提前拦在这里）")
+            return 2
     bad = run_sw(names) if sw else run_occ(names)
     print("-" * 100)
     if bad:
         print(f"[FAIL] {bad} 个靶子疑似发射器 bug（无阻塞疑问却失败）—— 要查的不是表，是发射器")
     else:
-        print("[完成] 无发射器 bug —— [GAP] 行是已知结构缺口（高度分解未做），"
-              "其中标「按设计拒绝」的是欠定图纸被 force 强推后发射器拒绝，均不是回归")
+        print("[完成] 无发射器 bug——最后一条 [GAP]（bracket 高度分解）2026-10-10 已消灭，"
+              "当前全表应为 [OK ]；若再见 [GAP]，那是已知结构缺口或被 force 强推的欠定图纸，"
+              "不是回归")
     return 1 if bad else 0
 
 

@@ -871,13 +871,261 @@ def _build_slot(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
         f"cut 槽 {length:g}×{width:g} 深{depth:g} 底 {t_bot:g}"
 
 
-def _build_fillet(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
-    """FILLET：等半径圆角，棱由 `params["edges"]` 的棱上点定位。"""
+def _fillet_section(o: Point3, ea: Vector3, eb: Vector3, r: float, *,
+                    add: bool):
+    """圆角工具的剖面 face：在 ``ea``/``eb`` 张成的平面里、以 ``o`` 为原点。
+
+    (a, b) 坐标与识别侧同一口径（见 `features/roundovers.py` 契约）：
+
+    - ``add=False``（凸圆角**切**刀）：a 指向材料内（a=0 在壁上）、b 自
+      **切线面**起，剖面 = 角方块 − 四分之一圆盘（圆心 (r, 0)）——即
+      ``a ∈ [−1, u(b)]、u(b) = r − √(r²−b²)``，壁外多伸 1mm 落在空气里。
+    - ``add=True``（凹圆角**补**料）：a 由壁向外、b 自基体顶面起，剖面 =
+      角方块 − 四分之一圆盘（圆心 (r, r)），补上去正好把交角填成 R。
+    """
+    def P(a: float, b: float) -> Any:
+        return gp_Pnt(o.x + ea.x * a + eb.x * b,
+                      o.y + ea.y * a + eb.y * b,
+                      o.z + ea.z * a + eb.z * b)
+
+    c45 = math.cos(math.pi / 4.0) * r
+    w = BRepBuilderAPI_MakeWire()
+    if add:
+        w.Add(BRepBuilderAPI_MakeEdge(P(0.0, 0.0), P(0.0, r)).Edge())
+        w.Add(BRepBuilderAPI_MakeEdge(GC_MakeArcOfCircle(
+            P(0.0, r), P(r - c45, r - c45), P(r, 0.0)).Value()).Edge())
+        w.Add(BRepBuilderAPI_MakeEdge(P(r, 0.0), P(0.0, 0.0)).Edge())
+    else:
+        w.Add(BRepBuilderAPI_MakeEdge(P(-1.0, 0.0), P(-1.0, r)).Edge())
+        w.Add(BRepBuilderAPI_MakeEdge(P(-1.0, r), P(r, r)).Edge())
+        w.Add(BRepBuilderAPI_MakeEdge(GC_MakeArcOfCircle(
+            P(r, r), P(r - c45, c45), P(0.0, 0.0)).Value()).Edge())
+        w.Add(BRepBuilderAPI_MakeEdge(P(0.0, 0.0), P(-1.0, 0.0)).Edge())
+    return BRepBuilderAPI_MakeFace(w.Wire()).Face()
+
+
+def _top_round_tool(org: Point3, b1v: Vector3, b2v: Vector3, axis: Vector3,
+                    s: ProfileSeg2, t_z0: float, r: float, ccw: bool):
+    """轮廓一段（直线/弧）的凸圆角刀 —— 逐段**精确**扫掠（不近似、不圆角核）。
+
+    直线段沿其方向 ``MakePrism``；圆弧段绕弧心竖轴 ``MakeRevol`` 角跨度。
+    两者都还原成真圆弧边（`BRepFilletAPI` 在本零件任何子集上 IsDone=False，
+    见 `features/roundovers.py` 模块 docstring）。
+    """
+    def p_in(px: float, py: float) -> Point3:
+        """轮廓局部 2D → placement 平面内的模型点。"""
+        return org + b1v * px + b2v * py
+
+    sgn = 1.0 if ccw else -1.0                  # 环 CCW ⇒ 材料在行进左方
+    if s.is_arc:
+        cx, cy = s.center.x, s.center.y
+        rad = math.hypot(s.p1.x - cx, s.p1.y - cy)
+        if rad <= 1e-9:
+            raise OccBuildError("轮廓弧半径退化，无法生成圆角刀")
+        ux, uy = (s.p1.x - cx) / rad, (s.p1.y - cy) / rad
+        # 弧自转方向与环同 ⇒ 凸角（材料朝圆心）；反向 ⇒ 凹角（材料背圆心）
+        m = 1.0 if s.ccw == ccw else -1.0
+        ea = b1v * (-ux * m) + b2v * (-uy * m)
+        face = _fillet_section(p_in(s.p1.x, s.p1.y) + axis * t_z0, ea, axis,
+                               r, add=False)
+        c3 = p_in(cx, cy) + axis * t_z0
+        span = ((s.ea - s.sa) % (2 * math.pi)) if s.ccw else \
+               -((s.sa - s.ea) % (2 * math.pi))
+        ax = gp_Ax1(gp_Pnt(c3.x, c3.y, c3.z), gp_Dir(axis.x, axis.y, axis.z))
+        return BRepPrimAPI_MakeRevol(face, ax, span).Shape(), \
+            f"弧 r{rad:g} 跨 {math.degrees(span):+.2f}°"
+    dx, dy = s.p2.x - s.p1.x, s.p2.y - s.p1.y
+    ln = math.hypot(dx, dy)
+    if ln <= 1e-9:
+        raise OccBuildError("轮廓线段长度退化，无法生成圆角刀")
+    tx, ty = dx / ln, dy / ln
+    ea = b1v * (-ty * sgn) + b2v * (tx * sgn)
+    face = _fillet_section(p_in(s.p1.x, s.p1.y) + axis * t_z0, ea, axis,
+                           r, add=False)
+    vec = b1v * (tx * ln) + b2v * (ty * ln)
+    return BRepPrimAPI_MakePrism(face, gp_Vec(vec.x, vec.y, vec.z)).Shape(), \
+        f"线 L={ln:.3f}"
+
+
+def _mate_prisms(f: Feature, part: Part, base_id: FeatureId, org: Point3,
+                 axis: Vector3, t_lo: float, t_hi: float):
+    """树里**别的**加料特征（BASE/BOSS、轴与刀平行）沿轴拉成棱柱 —— 供刀避让。
+
+    刀（棱柱/回转体）不认材料归谁：切削域内一概切掉。可**抬升体落在自己轮廓
+    之内**的那块材料属于抬升体，不该算基体顶边的倒圆。实测（bracket 第四笔，
+    2026-10-10）不避让的代价：体育场内部被削 0.7mm²/mm —— 盒探针 x∈[25,60]、
+    y∈[169.4,171.05]、z∈[21,24.2] 少 24.2，而金值那里恰好全满（184.80 = 盒体积）。
+
+    返回 (棱柱表, 记账行表)。轴不平行 / 没有轮廓的**记账不避让**（读不出来就
+    不猜），不静默。
+    """
+    prisms: list[Any] = []
+    notes: list[str] = []
+    for g in part.features:
+        if g.id == base_id or g.type.value not in (FeatureType.BASE, FeatureType.BOSS):
+            continue
+        c = g.params.get("profile")
+        if c is None or c.value is None:
+            notes.append(f"#{g.id} 无轮廓未避让")
+            continue
+        o_g, d_g = _axis_of(g)
+        if abs(abs(d_g.dot(axis)) - 1.0) > 1e-9:
+            notes.append(f"#{g.id} 轴不平行未避让")
+            continue
+        # 刀的轴向区间 [t_lo, t_hi]（相对 org）换算到 g 自己的轴系坐标
+        s = 1.0 if d_g.dot(axis) > 0 else -1.0
+        c0 = (org - o_g).dot(d_g) + s * t_lo
+        c1 = (org - o_g).dot(d_g) + s * t_hi
+        t0, t1 = (c0, c1) if c0 <= c1 else (c1, c0)
+        t0 -= 1.0
+        t1 += 1.0
+        face = _profile_face(g, c.value, t0, "避让棱柱")
+        prisms.append(_extrude(face, d_g, t1 - t0, g, "避让棱柱"))
+        notes.append(f"#{g.id} 避让")
+    return prisms, notes
+
+
+def _fillet_top_round(shape: Any, f: Feature, part: Part, r: float,
+                      validate: bool) -> tuple[Any, str]:
+    """``mode="top_round"``：基体顶边凸圆角（逐段刀，切）。
+
+    几何全部取自 `depends_on[0]` 的基体：placement 平面 + `profile` 的段 +
+    `length`（切线面 = 顶面 − R）。识别侧已用四道门选定段号，这里只负责把
+    它们的**真实几何**扫成刀。
+    """
+    if not f.depends_on:
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet，top_round）没有 depends_on —— 该模式的 "
+            "placement/轮廓/切线面全取自基体，必须指到基体上")
+    try:
+        base = part.by_id(f.depends_on[0])
+    except KeyError as e:
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet，top_round）的 depends_on="
+            f"{f.depends_on[0]} 不在特征树里") from e
+    prof_c = base.params.get("profile")
+    dir_c = base.params.get("dir")
+    if prof_c is None or dir_c is None or not isinstance(prof_c.value, Profile2):
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet，top_round）的基体 #{base.id} 没有 "
+            "Profile2 的 profile+dir —— 该模式只支持轮廓环拉伸的基体")
+    prof: Profile2 = prof_c.value
+    dir_name = str(dir_c.value)
+    b1v, b2v = library.profile_plane(dir_name)
+    axis = b1v.cross(b2v)
+    org = base.placement.value
+    if not isinstance(org, Point3):
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet，top_round）的基体 #{base.id} "
+            f"placement 不是点（{type(org).__name__}）—— 轮廓坐标相对它")
+    length = float(base.params["length"].value)
+    t_z0 = length - r                     # 切线面相对 placement 平面的轴向距离
+    if t_z0 < 0.0:
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet，top_round）R{r:g} > 基体高 {length:g}")
+    idx = _opt(f, "segments", None)
+    if not idx:
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet，top_round）缺 `segments`（要倒圆的轮廓段下标）")
+    segs = prof.segments
+    ccw = prof.signed_area() > 0
+    tools: list[Any] = []
+    why: list[str] = []
+    for k in idx:
+        k = int(k)
+        if not (0 <= k < len(segs)):
+            raise OccBuildError(
+                f"特征 #{f.id}（fillet，top_round）段号 {k} 越界"
+                f"（轮廓 {len(segs)} 段）")
+        tool, info = _top_round_tool(org, b1v, b2v, axis, segs[k], t_z0, r, ccw)
+        tools.append(tool)
+        why.append(f"#{k} {info}")
+    cutter = tools[0]
+    fused = 0
+    for t in tools[1:]:                   # 合成一把刀再一次 Cut（逐次布尔更慢）
+        op = BRepAlgoAPI_Fuse(cutter, t)
+        if not op.IsDone():
+            raise OccBuildError(
+                f"特征 #{f.id}（fillet，top_round）逐段刀 Fuse 失败"
+                f"（第 {fused + 1} 段之后）")
+        cutter = op.Shape()
+        fused += 1
+    # 刀避让：抬升体自己轮廓内的材料不归基体顶边（见 `_mate_prisms` docstring）
+    prisms, notes = _mate_prisms(f, part, base.id, org, axis, t_z0, t_z0 + r)
+    for k, p in enumerate(prisms):
+        op = BRepAlgoAPI_Cut(cutter, p)
+        if not op.IsDone():
+            raise OccBuildError(
+                f"特征 #{f.id}（fillet，top_round）刀避让第 {k + 1} 个棱柱"
+                f"（{notes[k]}）时布尔失败")
+        cutter = op.Shape()
+    avoid = f"，避让 {'、'.join(notes)}" if notes else ""
+    out = _cut(shape, cutter, f, validate)
+    return out, (f"fillet R{r:g} 顶边（切线面 t={t_z0:g}，"
+                 f"{len(tools)} 段：{'、'.join(why)}{avoid}）")
+
+
+def _fillet_root(shape: Any, f: Feature, r: float,
+                 validate: bool) -> tuple[Any, str]:
+    """``mode="root"``：抬升区/凸台与基体顶面交角处的凹圆角（补料）。
+
+    只在给出的角域内 ``MakeRevol`` 扫一圈剖面补上去 —— 位置全在 params/
+    placement 里（placement 的 origin = 圆心 × 基体顶面、方向 = 轴向；
+    ``theta_deg`` 自面内 b1 轴起算，与 `library.profile_plane` 同源）。
+    """
+    ax_c = f.placement
+    ax = ax_c.value if ax_c is not None else None
+    if not isinstance(ax, Axis3):
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet，root）的 placement 不是轴线（"
+            f"{type(ax).__name__}）—— 需要圆心×基体顶面 + 轴向")
+    o, d = ax.origin, ax.direction.normalized()
+    wall_r = float(_param(f, "wall_r"))
+    if wall_r <= r:
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet，root）壁半径 {wall_r:g} 不大于圆角半径 "
+            f"{r:g}（刀会跨过轴心）")
+    th = _param(f, "theta_deg")
+    if not isinstance(th, (tuple, list)) or len(th) != 2:
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet，root）`theta_deg` 必须是 (起, 止) 两元，"
+            f"实得 {th!r}")
+    t0, t1 = float(th[0]), float(th[1])
+    span = t1 - t0
+    if abs(span) <= 1e-9 or abs(span) >= 360.0:
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet，root）角域 {span:g}° 不合法（要 0 < |角域| < 360）")
+    b1v, b2v = basis_of(d)                # 与 library.profile_plane 同一约定
+    rad = b1v * math.cos(math.radians(t0)) + b2v * math.sin(math.radians(t0))
+    o_wall = o + rad * wall_r             # 壁上的 (a=0, b=0) 点
+    face = _fillet_section(o_wall, rad, d, r, add=True)
+    line = gp_Ax1(gp_Pnt(o.x, o.y, o.z), gp_Dir(d.x, d.y, d.z))
+    tool = BRepPrimAPI_MakeRevol(face, line, math.radians(span)).Shape()
+    out = _add_material(shape, tool, f, validate)
+    return out, (f"fillet R{r:g} 根部（壁 r{wall_r:g}，角域 "
+                 f"{t0:.2f}°..{t1:.2f}°）")
+
+
+def _build_fillet(shape: Any, f: Feature, part: Part,
+                  validate: bool) -> tuple[Any, str]:
+    """FILLET 三条腿：棱上点选棱（默认）/ 顶边凸圆角 / 根部凹圆角。
+
+    后两条是"工具式"构造（扫剖面 → 布尔），因为 `BRepFilletAPI_MakeFillet`
+    在本项目零件上 IsDone() 恒 False（见 `features/roundovers.py`）。
+    """
     r = float(_param(f, "radius"))
     if r <= 0.0:
         raise OccBuildError(f"特征 #{f.id}（fillet）半径必须为正，实得 {r}")
     if shape is None:
         raise OccBuildError(f"特征 #{f.id}（fillet）没有基体可倒圆")
+    mode = _opt(f, "mode", None)
+    if mode == "top_round":
+        return _fillet_top_round(shape, f, part, r, validate)
+    if mode == "root":
+        return _fillet_root(shape, f, r, validate)
+    if mode is not None:
+        raise OccBuildError(
+            f"特征 #{f.id}（fillet）mode={mode!r} 未知（只有 None/top_round/root）")
     edges = select_edges(shape, f)
     mk = BRepFilletAPI_MakeFillet(shape)
     for e in edges:
@@ -1080,6 +1328,10 @@ def _dispatch(shape: Any, f: Feature, part: Part, built: set[FeatureId],
         raise OccBuildError(f"特征 #{f.id}（{t.value}）缺必需参数 {missing}（不默认 0）")
     if t is FeatureType.PATTERN:
         return _build_pattern(shape, f, part, built, validate, allow_guess)
+    if t is FeatureType.FILLET:
+        # 工具式圆角要顺着 depends_on 取基体的轮廓/placement（参数里只有
+        # 段号与半径 —— 真实几何是基体的，抄一份进参数反而会有两个真相）
+        return _build_fillet(shape, f, part, validate)
     fn = _BUILDERS.get(t)
     if fn is None:
         raise OccBuildError(f"特征 #{f.id} 的类型 {t.value} 尚无 OCC 发射实现")

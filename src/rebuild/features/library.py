@@ -322,7 +322,12 @@ def _predict_pocket(f: Feature, view_type: str) -> list[Prim3]:
     ab = _profile_ab(prof.value) if prof is not None else None
     if not ab:
         return []
-    pts = [ir_point(o, dir_name, a, b, 0.0) for a, b in ab]
+    # 轮廓是绝对坐标、轴向位置由 axial_at 表达（契约：腔底）⇒ 预测也必须在
+    # 该平面上落点。曾写死 t=0.0：`make_cut` 改把 t_lo 挪进 axial_at 之后，
+    # 预测会把 z[2,30] 的腔画在 z[0,28] 上、与图纸对不上（两发射器无此病）。
+    ta = _num(f, "axial_at")
+    pts = [ir_point(o, dir_name, a, b, ta if ta is not None else 0.0)
+           for a, b in ab]
     if is_along(view_type, ax):
         out = []
         for i, a in enumerate(pts):
@@ -536,10 +541,26 @@ LAYER: dict[FeatureType, int] = {
 }
 
 
+def _is_tool_fillet(f: Feature) -> bool:
+    """工具式圆角（参数里带 `mode`：`top_round` 顶边倒圆 / `root` 根部倒圆）。
+
+    它的"刀"是发射器按参数**自己造成**的棱柱/回转体——切削域里有什么就切什么，
+    **不认**哪块材料是哪条特征加上来的。实测（bracket 第四笔）：先抬升体育场、
+    后倒圆 ⇒ 刀穿过去，把抬升体落在自己（体育场）轮廓内的材料也削掉——
+    盒探针 x∈[25,60]、y∈[169.4,171.05]、z∈[21,24.2] 少 24.2，而金值那里恰是全满。
+    所以它必须**依赖一就绪就建**：只切到那时已存在的材料为止。
+    真正的边圆角（`select_edges`）没这个问题——`MakeFillet` 只动相邻的两个面，
+    留在 `LAYER=4` 最后。
+    """
+    return f.type.value == FeatureType.FILLET and "mode" in f.params
+
+
 def build_order(features: list[Feature]) -> list[Feature]:
     """拓扑序：先基体，后材料岛，再切除，最后圆角/倒角。
 
     `depends_on` 优先于层号（显式依赖更可信），层号只作同层稳定排序。
+    例外是工具式圆角（见 `_is_tool_fillet`）：它排在任何同批就绪者**之前**，
+    因为它的刀只对"建它时已存在的材料"负责，越晚建越会切到后面才加上来的材料。
     """
     done: list[Feature] = []
     remaining = list(features)
@@ -553,7 +574,8 @@ def build_order(features: list[Feature]) -> list[Feature]:
         if not cand:
             # 依赖成环：按层号强行打破，但要让调用方知道
             raise ValueError("特征依赖成环：" + ", ".join(str(f.id) for f in remaining))
-        cand.sort(key=lambda f: (LAYER.get(f.type.value, 9), f.id))
+        cand.sort(key=lambda f: (0 if _is_tool_fillet(f)
+                                 else LAYER.get(f.type.value, 9) + 1, f.id))
         f = cand[0]
         done.append(f)
         remaining.remove(f)

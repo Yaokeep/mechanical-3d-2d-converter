@@ -433,28 +433,74 @@ def _merge_collinear_segs(segs: list[ProfileSeg2]) -> list[ProfileSeg2]:
     return out
 
 
+#: 弧折线化的弦高公差（mm）—— SW 草图发射专用，依据见 `_sketch_profile`。
+_ARC_SAG_MM = 0.01
+
+
+def _flatten_arcs(segs: list[ProfileSeg2],
+                  sag: float = _ARC_SAG_MM) -> tuple[list[ProfileSeg2], bool]:
+    """弧 → 弦折线化：弦高 ≤ ``sag``，端点**精确锚定**（首末点直取原段端点对象）。
+
+    返回 (段表, 是否出现过弧)。中间点按角度均分；首末点与相邻段逐位同值
+    衔接——``SetAddToDB`` 模式下 SW 不做端点自动合并，闭合环靠的就是这一点。
+    弧缺圆心/半径时原样保留，让绘制循环按原报错口径炸。
+    """
+    out: list[ProfileSeg2] = []
+    had = False
+    for s in segs:
+        if s.kind != "arc" or s.center is None or s.radius <= 0.0:
+            out.append(s)
+            continue
+        had = True
+        span = ((s.ea - s.sa) if s.ccw else (s.sa - s.ea)) % (2.0 * math.pi)
+        if span <= 1e-12:
+            continue                          # 零跨度退化弧：不贡献几何
+        step = 2.0 * math.acos(max(-1.0, 1.0 - sag / s.radius))
+        k = max(1, math.ceil(span / step))
+        a0 = math.atan2(s.p1.y - s.center.y, s.p1.x - s.center.x)
+        sgn = 1.0 if s.ccw else -1.0
+        pts = [Point2(s.center.x + s.radius * math.cos(a0 + sgn * span * m / k),
+                      s.center.y + s.radius * math.sin(a0 + sgn * span * m / k))
+               for m in range(k + 1)]
+        pts[0], pts[-1] = s.p1, s.p2          # 精确锚定（含对象本身）
+        out += [ProfileSeg2("line", pts[m], pts[m + 1]) for m in range(k)]
+    return out, had
+
+
 def _sketch_profile(driver: Any, frame: _Frame, o: Point3, profile: Profile2,
                     f: Feature, what: str) -> None:
-    """画带圆弧的闭合轮廓（``Profile2``，段序 = 遍历序）到活动草图。
+    """画闭合轮廓（``Profile2``，段序 = 遍历序）到活动草图。
 
-    弧方向（``CreateArc`` 的 direction 参数）**必须在草图局部坐标里重判**：
-    ``_Frame.local`` 对 z/x 轴是恒等映射，对 y 轴是把两个坐标对调（含反射），
-    轮廓坐标里的 ``ccw`` 直传会在 y 轴上画成补弧。判据 = 弧中点两侧弦的叉积
-    ``(pm−p1)×(p2−pm)`` 符号——映射含反射时符号自动翻转，一条式子覆盖三轴。
     段序连续性由 ``Profile2.chain_break`` 把关（SW 的草图比 OCC 的 MakeWire
     更不能容忍乱序：乱序边在草图里就是一堆断开的曲线，拉伸静默失败）。
 
-    直线部分先过 ``_merge_collinear_segs``（无损）：SW 求解器会拒绝
-    30+ 段首尾相接的碎片线链（bracket 三视图实测，122 实体拉伸全败）。
+    ⚠️ **弧一律折线化（``_flatten_arcs``，弦高 ≤0.01mm），且含弧的轮廓整条在
+    ``SetAddToDB(True)`` 下画**（2026-10-10 实测定档）。三组证据：
 
-    ⚠️ 弧的 SW 调用语义（2026-10-07 四点实验 + bisect 定死，与文档不同）：
-    ``direction=True`` 实测 = **顺时针**；``direction=False`` 实测 = **取劣弧**
-    （与 CCW 同向时等价，CCW 走优弧时会把劣弧画出来——cwF 反例）。故
-    **span ≤ π 的弧一律传 False**（任何走向都得到那条劣弧本身；bracket r3
-    顺时针劣弧传 True 会静默拒绝拉伸、传 False 通过且几何正确）；**优弧**
-    必须用"顺时针 + 正确端点序"表达：局部系顺时针走向的（``cross<0``）直接
-    传 True，逆时针走向的换端点序——顺时针从 p2 画到 p1 即同一条优弧。
-    恰好 π 的弧两端点对径、两条半圆都合法，此处按劣弧分支取其一（未遇靶子）。
+    ① **SW 会把弧改掉**：孤立单画一条 r20 87.87° 弧（L=30.6713mm，周围没有
+       任何可吸附的邻居），SW 读回 GetLength = **31.3928mm**（+2.35%）；在
+       整轮廓里还自行合并共圆相邻弧对（画 8 弧，GetArcCount 读回 6~7）。
+       弧端点浮点由 SW 按 (圆心, 半径, 端点) 重算，与相邻直线的端点不逐位等值。
+    ② **推理捕捉按画入顺序改写几何**：同一闭合曲线（54 线 + 8 弧），只改
+       "草图第一笔的起点"（段表循环旋转 k=0..8），FeatureExtrusion2 通过性
+       P P P F F P F P F（确定、非单调；A 原样 k=0 与 k=3/4/6/8 失败、R 反序
+       k=0 通过）；通过者的体积还随接缝漂 ±1%（182,853 / 181,731 / 183,954，
+       OCC 同曲线真值 183,646）——SW 草图求解器在推理/吸附中把轮廓改了
+       （与旧管线记的键槽"吸附畸变"同源）。
+    ③ **折线化 + 关推理 = 逐字保真**：弧折成弦（端点精确锚定、与相邻段逐位
+       同值），画草图时 ``SetAddToDB(True)``、画完恢复：A k=0 / R k=0 / k=5
+       三接缝全部通过，体积**逐位相同** 183,615.61 = OCC 折线真值
+       183,615.61（±0.00%）——接缝敏感性消失。而**弧**在该模式下必失败：没有
+       端点自动合并，弧与直线的 µm 级缝隙让轮廓开口（旧管线"boss 草图必须
+       no_snap=False、SetAddToDB 下多线环开环"的另一面）——弧与关推理不可
+       兼得，折线化是唯一出路。
+
+    （直线早有其例：``_merge_collinear_segs`` 无损合并——SW 求解器会拒绝
+    30+ 段首尾相接的碎片线链，bracket 三视图实测 122 实体拉伸全败。历史的
+    弧直画分支（``CreateArc`` direction 实测语义 = True 顺时针 / False 取劣弧）
+    已随折线化退场；要恢复弧直画，先复现 `_` 探针族
+    ``_probe_sw_seam_scan.py`` / ``_probe_sw_arcexp.py`` / ``_probe_sw_addtodb.py``
+    的数据再说。）
     """
     segs = profile.segments
     if len(segs) < 2:
@@ -470,41 +516,26 @@ def _sketch_profile(driver: Any, frame: _Frame, o: Point3, profile: Profile2,
             f"({s1.p1.x:.3f},{s1.p1.y:.3f}) 相距 {s0.p2.distance_to(s1.p1):.3f}mm"
             "（段序必须是遍历序）")
     segs = _merge_collinear_segs(list(segs))
+    segs, had_arcs = _flatten_arcs(segs)
 
     def loc(a: float, b: float) -> tuple[float, float]:
         return frame.local(frame.ir_point(o, a, b, 0.0))
 
-    for s in segs:
-        x1, y1 = loc(s.p1.x, s.p1.y)
-        x2, y2 = loc(s.p2.x, s.p2.y)
-        if s.kind != "arc":
+    if had_arcs:                              # 推理捕捉关闭：折线几何逐字进 SW
+        driver.sw_model.SetAddToDB(True)
+    try:
+        for s in segs:
+            if s.kind != "line":
+                raise SwBuildError(
+                    f"特征 #{f.id}（{f.type.value}）{what}：弧段缺圆心/半径")
+            x1, y1 = loc(s.p1.x, s.p1.y)
+            x2, y2 = loc(s.p2.x, s.p2.y)
             if math.hypot(x2 - x1, y2 - y1) <= 1e-9:
                 continue                      # 零长段（焊接产物）：不贡献几何
             driver.draw_line(x1, y1, 0.0, x2, y2, 0.0)
-            continue
-        if s.center is None or s.radius <= 0.0:
-            raise SwBuildError(f"特征 #{f.id}（{f.type.value}）{what}：弧段缺圆心/半径")
-        span = ((s.ea - s.sa) if s.ccw else (s.sa - s.ea)) % (2.0 * math.pi)
-        if span <= 1e-9:
-            continue                          # 零跨度退化弧：不贡献几何
-        thm = s.sa + span / 2.0 if s.ccw else s.sa - span / 2.0
-        xm, ym = loc(s.center.x + s.radius * math.cos(thm),
-                     s.center.y + s.radius * math.sin(thm))
-        cross = (xm - x1) * (y2 - ym) - (ym - y1) * (x2 - xm)
-        if abs(cross) <= 1e-9 * max(1.0, s.radius):
-            raise SwBuildError(
-                f"特征 #{f.id}（{f.type.value}）{what}：弧段方向不可判"
-                f"（弧中点两侧弦近共线，r={s.radius:g}）")
-        cx, cy = loc(s.center.x, s.center.y)
-        if span <= math.pi:
-            driver.draw_arc(cx, cy, 0.0, x1, y1, 0.0, x2, y2, 0.0,
-                            clockwise=False)
-        elif cross < 0.0:                     # 优弧且局部系顺时针：端点序即遍历序
-            driver.draw_arc(cx, cy, 0.0, x1, y1, 0.0, x2, y2, 0.0,
-                            clockwise=True)
-        else:                                 # 优弧且局部系逆时针：换序走顺时针
-            driver.draw_arc(cx, cy, 0.0, x2, y2, 0.0, x1, y1, 0.0,
-                            clockwise=True)
+    finally:
+        if had_arcs:
+            driver.sw_model.SetAddToDB(False)
 
 
 def _sketch_circles(driver: Any, circles: list[tuple[tuple[float, float], float]]) -> None:
@@ -978,20 +1009,312 @@ def _select_edges(driver: Any, f: Feature) -> int:
     return got
 
 
-def _build_fillet(driver: Any, f: Feature) -> str:
-    """FILLET：等半径圆角（Options=195 与 `sw_driver.feature_fillet_edges` 一致）。
+def _edge_pts_mm(edge: Any) -> Any:
+    """棱的两端点（mm，1µm 取整）；闭合/退化/读不出 ⇒ None（不参与端点粗筛）。
 
-    Options 实测只有 2 与 195 能建出特征，其余取值一律静默返回 None；
-    两个值的几何结果相同，沿用驱动里的 195。
+    ⚠️ 闭合圆边（孔的圆缘等）SW 的 GetStartVertex/GetEndVertex 给同一顶点，
+    若照端点当键去重会把**所有**闭合边混成一条 —— 调用方对 None 一律直通。
+    """
+    try:
+        p1 = tuple(float(v) * 1000.0 for v in _member(_member(edge, "GetStartVertex"),
+                                                      "GetPoint")[:3])
+        p2 = tuple(float(v) * 1000.0 for v in _member(_member(edge, "GetEndVertex"),
+                                                      "GetPoint")[:3])
+    except Exception:                                           # noqa: BLE001
+        return None
+    if math.dist(p1, p2) < 0.05:
+        return None
+    return (tuple(round(v, 3) for v in p1), tuple(round(v, 3) for v in p2))
 
-    ⚠️ 圆角是**按选中棱**做的 —— 但如果选中的是**面**，SW 会把该面整圈边界
-    都倒圆（`_select_edges` 因此改用几何定位，见其 docstring）。
+
+def _all_edges(driver: Any) -> list[tuple[Any, Any]]:
+    """枚举实体全部棱一次：`[(IEdge, 端点点对或 None)]`，同棱去重。
+
+    一条棱会被相邻两个面各列一次，而 `Select(True)` 是追加语义 —— 同一条棱
+    选两遍计数会乱。去重键：两端点（mm）；闭合边（端点是 None）用"离原点
+    最近点"（每条闭合边一个固定的几何量，两侧列出结果一致）。**一次枚举、
+    全部探点复用**——原来每个探点都重走 GetBodies2→GetFaces→GetEdges，
+    #5 的 6 探点实测约 15 分钟，大头就在这里。
+    """
+    model = driver.sw_model
+    out: list[tuple[Any, Any]] = []
+    seen: set = set()
+    for body in model.GetBodies2(0, True):
+        for face in (_member(body, "GetFaces") or []):
+            for edge in (_member(face, "GetEdges") or []):
+                pts = _edge_pts_mm(edge)
+                if pts is None:
+                    try:
+                        cp = list(edge.GetClosestPointOn(0.0, 0.0, 0.0))
+                        key = ("closed",) + tuple(round(v, 6) for v in cp[:3])
+                    except Exception:                        # noqa: BLE001
+                        key = ("unk", id(edge))              # 认不出 ⇒ 不去重（保守）
+                else:
+                    key = pts
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append((edge, pts))
+    return out
+
+
+def _pt_seg_dist(p: Any, a: Any, b: Any) -> float:
+    """点到线段距离（三点均 mm）——粗筛用；直线棱精确，弧棱偏差上界 = 矢高。"""
+    ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+    ap = (p[0] - a[0], p[1] - a[1], p[2] - a[2])
+    d2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]
+    if d2 <= 0.0:
+        return math.sqrt(ap[0] ** 2 + ap[1] ** 2 + ap[2] ** 2)
+    t = (ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / d2
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return math.sqrt((ap[0] - t * ab[0]) ** 2 + (ap[1] - t * ab[1]) ** 2
+                     + (ap[2] - t * ab[2]) ** 2)
+
+
+def _select_edges_at(driver: Any, f: Feature, pts: list[Point3]) -> int:
+    """按"棱上点"选棱：**一次枚举 + 端点粗筛 + 几何最近命中 + 端点键去重**。
+
+    与 `_select_edges` 的分工：那里的点是调用方手写的棱中点，要求唯一命中
+    （有歧义 = 写给角点了，报错正确）；这里的点是**轮廓段的几何中点**，一条
+    段在 SW 里可能被合并/拆成别的棱 —— 取最近一条，且同一棱被多个点命中时
+    只选一次（`Select(True)` 是追加语义，重复可把同一条棱选两遍）。
+
+    粗筛（本地"点到端点弦"距离）：直线棱精确；弧棱对弦的偏差上界 = 矢高
+    ≤ 弦长/2 ⇒ 余量取 `_EDGE_TOL + 1 + 弦长/2` 保证不误杀。闭合边/读不出
+    端点的边一律直通送 `GetClosestPointOn` 复核。
+    """
+    driver.clear_selection()
+    edges = _all_edges(driver)                               # 一次枚举，探点复用
+    seen: list[Any] = []
+    picked = 0
+    for p in pts:
+        sw = _ir_to_sw(p)
+        xyz = (sw.x, sw.y, sw.z)                             # mm
+        best: Any = None
+        for edge, ep in edges:
+            if ep is not None:
+                margin = _EDGE_TOL + 1.0 + math.dist(ep[0], ep[1]) * 0.5
+                if _pt_seg_dist(xyz, ep[0], ep[1]) > margin:
+                    continue
+            cp = list(edge.GetClosestPointOn(xyz[0] / 1000.0, xyz[1] / 1000.0,
+                                             xyz[2] / 1000.0))
+            dist = math.dist(cp[:3], [v / 1000.0 for v in xyz]) * 1000.0
+            if best is None or dist < best[0]:
+                best = (dist, edge)
+        if best is None or best[0] > _EDGE_TOL:
+            raise SwBuildError(
+                f"特征 #{f.id}（{f.type.value}）选棱失败：模型上找不到 IR 点 "
+                f"({p.x:g}, {p.y:g}, {p.z:g}) 附近 {_EDGE_TOL}mm 内的棱"
+                f"（SW 坐标 {sw.x:g}, {sw.y:g}, {sw.z:g}）"
+            )
+        key = _edge_pts_mm(best[1])
+        if key is not None and key in seen:
+            continue
+        seen.append(key)
+        best[1].Select(True)                                 # True = Append
+        picked += 1
+    got = driver.selection_count()
+    if got < picked:
+        raise SwBuildError(
+            f"特征 #{f.id}（{f.type.value}）选棱失败：{picked} 个棱上点只选中 {got} 条")
+    if got < len(pts):
+        print(f"[emit] 特征 #{f.id}（{f.type.value}）{len(pts)} 个棱上点 → {got} 条棱"
+              "（相邻点落在 SW 合并后的同一条棱上，已去重——圆角会覆盖整条合并棱）")
+    return got
+
+
+def _arc_mid_2d(s: ProfileSeg2) -> tuple[float, float]:
+    """轮廓段在自身参数中点处的 (a, b) 坐标（弧取**角跨度中点**，不是弦中点）。"""
+    if s.kind == "arc" and s.center is not None and s.radius > 0.0:
+        span = ((s.ea - s.sa) if s.ccw else (s.sa - s.ea)) % (2.0 * math.pi)
+        a0 = math.atan2(s.p1.y - s.center.y, s.p1.x - s.center.x)
+        ang = a0 + (1.0 if s.ccw else -1.0) * 0.5 * span
+        return (s.center.x + s.radius * math.cos(ang),
+                s.center.y + s.radius * math.sin(ang))
+    return (0.5 * (s.p1.x + s.p2.x), 0.5 * (s.p1.y + s.p2.y))
+
+
+def _fillet_top_round(driver: Any, f: Feature, part: Part, r: float) -> str:
+    """``mode="top_round"``：基体顶边凸圆角 —— 用 SW **原生圆角**按棱做。
+
+    几何口径与 `occ_builder._fillet_top_round` 同源：棱上点 = 基体轮廓被选段
+    （`segments`）在 t=length 平面上的**几何中点**，取自 `depends_on[0]` 基体的
+    profile/dir/placement/length。OCC 侧必须用"逐段扫掠刀 + Cut"（BRepFilletAPI
+    在本零件上 IsDone 恒 False，见 features/roundovers.py）；SW 的圆角核能处理
+    这些凸棱，几何同为真 R 圆弧。**不给容差、不给默认**：段号越界即炸。
+    """
+    from ...core.sw_automation.sw_constants import SW_FILLET_OPTIONS
+
+    if not f.depends_on:
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，top_round）没有 depends_on —— 顶边棱的几何"
+            "（轮廓/轴向/切线面）全取自基体，必须指到基体上")
+    try:
+        base = part.by_id(f.depends_on[0])
+    except KeyError as e:
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，top_round）的 depends_on="
+            f"{f.depends_on[0]} 不在特征树里") from e
+    prof_c = base.params.get("profile")
+    if prof_c is None or not isinstance(prof_c.value, Profile2):
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，top_round）的基体 #{base.id} 没有 Profile2"
+            " 轮廓 —— 该模式只支持轮廓环拉伸的基体")
+    prof: Profile2 = prof_c.value
+    dir_name = str(_opt(base, "dir", "z"))
+    b1v, b2v = library.profile_plane(dir_name)
+    axis = b1v.cross(b2v)
+    org = base.placement.value
+    if not isinstance(org, Point3):
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，top_round）的基体 #{base.id} placement 不是点"
+            f"（{type(org).__name__}）—— 轮廓坐标相对它")
+    length = float(base.params["length"].value)
+    idx = _opt(f, "segments", None)
+    if not idx:
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，top_round）缺 `segments`（要倒圆的轮廓段下标）")
+    segs = prof.segments
+    probes: list[Point3] = []
+    why: list[str] = []
+    for k in idx:
+        k = int(k)
+        if not (0 <= k < len(segs)):
+            raise SwBuildError(
+                f"特征 #{f.id}（fillet，top_round）段号 {k} 越界（轮廓 {len(segs)} 段）")
+        a, b = _arc_mid_2d(segs[k])
+        probes.append(org + b1v * a + b2v * b + axis * length)
+        why.append(f"#{k}{'弧' if segs[k].kind == 'arc' else ''}")
+    n = _select_edges_at(driver, f, probes)
+    feat = driver.sw_feat_mgr.FeatureFillet3(
+        SW_FILLET_OPTIONS, driver.mm_to_m(r),
+        0, 0, False, 0, False, False,
+    )
+    _require(driver, feat, f, f"圆角 R{r:g} 顶边（{n} 条棱）")
+    _name_feature(feat, f, "Fillet")
+    return f"fillet R{r:g} 顶边（{'、'.join(why)} → {n} 条棱）"
+
+
+def _fillet_root(driver: Any, f: Feature, r: float) -> str:
+    """``mode="root"``：抬升壁与基体顶面交角处的凹圆角 —— 按**回转补料**发射。
+
+    不用 SW 原生 `FeatureFillet3` 的两条实测理由：
+    ① 原生圆角没有角域限制 —— 给它一条棱就沿整条相切链走到头，而 `theta_deg`
+       是图纸读数（bracket：±57.78°，远不到半圈）；
+    ② 壁在 SW 里是折线化的弦链（`_flatten_arcs`，相邻弦约 3.6° 折角），圆角
+       不跨折角传播，原生圆角只能选中一条弦、弦与弦之间留缝。
+    回转补料与 `occ_builder._fillet_root` 同一构造：剖面（壁段 + 圆角弧 +
+    顶面段）绕 placement 轴扫 `theta_deg` 角域，Fuse 到本体上。剖面画在
+    "过轴的前视面"（局部 x = IR x、y = IR z 的既有口径，同 `_build_revolve`），
+    用**中面回转**（`Dir1Type=6`；语义见 `sw_constants.swEndCondMidPlane`）。
+    """
+    from ...core.sw_automation.sw_constants import swEndCondMidPlane
+
+    ax_c = f.placement
+    ax = ax_c.value if ax_c is not None else None
+    if not isinstance(ax, Axis3):
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，root）的 placement 不是轴线（{type(ax).__name__}）"
+            " —— 需要圆心×基体顶面 + 轴向")
+    o, d = ax.origin, ax.direction.normalized()
+    name = _axis_name(d)
+    if name != "z":
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，root）轴为 {name}：SW 侧只有 z 轴的"
+            "「过轴前视面」口径经过验证，其余轴向不猜")
+    wall_r = float(_param(f, "wall_r"))
+    if wall_r <= r:
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，root）壁半径 {wall_r:g} 不大于圆角半径 {r:g}"
+            "（剖面会跨过轴心）")
+    th = _param(f, "theta_deg")
+    if not isinstance(th, (tuple, list)) or len(th) != 2:
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，root）`theta_deg` 必须是 (起, 止) 两元，"
+            f"实得 {th!r}")
+    t0, t1 = float(th[0]), float(th[1])
+    span = t1 - t0
+    if abs(span) <= 1e-9 or abs(span) >= 360.0:
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，root）角域 {span:g}° 不合法（要 0 < |角域| < 360）")
+    if abs(t0 + t1) > 1e-6:
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet，root）角域 {t0:g}°..{t1:g}° 不以 0° 为中心 ——"
+            " 剖面画在 θ=0 的过轴面上，中面回转的窗口只能关于它对称")
+
+    # 剖面（IR (x, z) 坐标）：壁向内多伸 0.1 保证与折线化侧壁**实交**
+    # （弦内缩 ≤ sag 0.01mm），圆角弧半径 = r、圆心 (壁 + r, 顶面 + r)。
+    # 弧折线化（sag = `_ARC_SAG_MM`）后全为直线段 —— SetAddToDB 下弧不可用。
+    d_in = 0.1
+    x_wall = o.x + wall_r
+    z_top = o.z
+    arc = ProfileSeg2("arc", Point2(x_wall, z_top + r), Point2(x_wall + r, z_top),
+                      center=Point2(x_wall + r, z_top + r), radius=r,
+                      ccw=True, sa=math.pi, ea=1.5 * math.pi)
+    chords, _had = _flatten_arcs([arc])
+    chain = ([(x_wall - d_in, z_top), (x_wall - d_in, z_top + r), (x_wall, z_top + r)]
+             + [(c.p2.x, c.p2.y) for c in chords])
+    plane = "前视基准面"
+    offset = -o.y
+    if abs(offset) > 1e-6:
+        plane = f"F{f.id}_{offset:.2f}"
+        if not driver.create_ref_plane_offset("前视基准面", offset, plane):
+            raise SwBuildError(
+                f"特征 #{f.id}（fillet，root）建过轴基准面失败（偏移 {offset:g}mm）")
+    _start_sketch(driver, plane, f, "根部圆角")
+    c_half = wall_r + r + 2.0                                # 中心线要长过剖面
+    driver.draw_centerline(o.x, z_top - c_half, 0.0, o.x, z_top + c_half, 0.0)
+    driver.sw_model.SetAddToDB(True)                         # 关推理：几何逐字进 SW
+    try:
+        for i, (x1, y1) in enumerate(chain):
+            x2, y2 = chain[(i + 1) % len(chain)]
+            driver.draw_line(x1, y1, 0.0, x2, y2, 0.0)
+    finally:
+        driver.sw_model.SetAddToDB(False)
+    feat = driver.sw_feat_mgr.FeatureRevolve2(
+        True,                                                # SingleDir
+        True,                                                # IsSolid
+        False,                                               # IsThin
+        False,                                               # IsCut
+        False,                                               # ReverseDir
+        False,                                               # BothDirectionUpToSameEntity
+        swEndCondMidPlane,                                   # Dir1Type = 两侧对称
+        0,                                                   # Dir2Type
+        library.radians(span),                               # Dir1Angle（总角，弧度）
+        0.0,                                                 # Dir2Angle
+        False, False, 0.01, 0.01,                            # Offset*（同驱动现役值）
+        0, 0.0, 0.0,                                         # Thin*
+        True,                                                # Merge
+        True, True,                                          # UseFeatScope, UseAutoSelect
+    )
+    _require(driver, feat, f, f"根部圆角回转 R{r:g}（{span:.2f}° 中面）")
+    _name_feature(feat, f, "Fillet")
+    return (f"fillet R{r:g} 根部（壁 r{wall_r:g}，角域 {t0:.2f}°..{t1:.2f}°，"
+            f"回转补料 {span:.2f}° 中面，剖面 {len(chain)} 点）")
+
+
+def _build_fillet(driver: Any, f: Feature, part: Part) -> str:
+    """FILLET 三条腿：棱上点选棱（默认）/ 顶边凸圆角 / 根部凹圆角。
+
+    与 `occ_builder._build_fillet` 同一分派口径（mode 取值、缺失即炸）。
+    Options=195 实测只有 2 与 195 能建出特征，其余取值一律静默返回 None；
+    两个值的几何结果相同，沿用驱动里的 195。圆角是**按选中棱**做的 —— 如果
+    选中的是**面**，SW 会把该面整圈边界都倒圆（`_select_edges` 因此改用几何
+    定位，见其 docstring）。
     """
     from ...core.sw_automation.sw_constants import SW_FILLET_OPTIONS
 
     radius = float(_param(f, "radius"))
     if radius <= 0.0:
         raise SwBuildError(f"特征 #{f.id}（fillet）半径必须为正，实得 {radius}")
+    mode = _opt(f, "mode", None)
+    if mode == "top_round":
+        return _fillet_top_round(driver, f, part, radius)
+    if mode == "root":
+        return _fillet_root(driver, f, radius)
+    if mode is not None:
+        raise SwBuildError(
+            f"特征 #{f.id}（fillet）mode={mode!r} 未知（只有 None/top_round/root）")
     n = _select_edges(driver, f)
     feat = driver.sw_feat_mgr.FeatureFillet3(
         SW_FILLET_OPTIONS, driver.mm_to_m(radius),
@@ -1208,6 +1531,8 @@ def _dispatch(driver: Any, f: Feature, part: Part,
         raise SwBuildError(f"特征 #{f.id}（{t.value}）缺必需参数 {missing}（不默认 0）")
     if t is FeatureType.PATTERN:
         return _build_pattern(driver, f, part, allow_guess)
+    if t is FeatureType.FILLET:
+        return _build_fillet(driver, f, part)      # top_round 要读基体的轮廓
     return fn(driver, f)
 
 
@@ -1278,6 +1603,38 @@ def _timestamped(save_to: Path) -> Path:
     return cand
 
 
+def _defer_top_round(order: list[Feature]) -> list[Feature]:
+    """把 `mode="top_round"` 的圆角挪到队尾——**SW 专有**，OCC 侧不需要。
+
+    背景（2026-10-10 三轮实测，探针 `_probe_f5_opt/_probe_f5_ctx/_probe_f5_peredge`）：
+    SW 的 `FeatureFillet3` 是**原生圆角**——传播由内核沿相切链走、并由"建它时已有的
+    几何"截断；这与 OCC 那把自扫的刀（严格只切 6 段墙，453.10）不同：
+      · 生产建序（圆角紧接裸基体，`build_order` 的工具刀语义）：面沿相切链
+        过延伸到 x[−29.39,133.00]，净切 578.59（多切 125.5）；
+      · 抬升区/孔/腔之后建角：面精确落在 6 段墙上，净切 453.14 ≈ OCC 453.10。
+    已排除参数修法：`Options` ∈ {2,195}、`OverflowType` ∈ {0,1,2} 三档全 578.59
+    （传播与参数无关，唯一可控的是**建角时的上下文**）。
+
+    因此 SW 侧把 top_round 排到**全部其余特征之后**：让它看到全部材料，传播被
+    这些材料的边界截住，恰好复现 6 段墙的范围。`root` 圆角不在此列——它按
+    中面回转**补料**发射（不选棱、无传播语义），留在 `build_order` 原位。
+
+    ⚠️ 安全前提：圆角所在带与后续特征的材料不相交（bracket 实测满足——推迟后
+    净切 453.14 vs OCC 453.10，两发射器对上到 0.04mm³）。若未来某零件里后加材料
+    压在圆角选棱上，推迟会让选棱命中错边或把圆角切到后加材料上——那时应回到
+    `build_order` 原位并记账，而不是静默推迟。本函数是**稳定分区**：top_round
+    之间保持相对次序。
+    """
+    def is_top_round(f: Feature) -> bool:
+        return (f.type.value == FeatureType.FILLET.value
+                and _opt(f, "mode", None) == "top_round")
+
+    late = [f for f in order if is_top_round(f)]
+    if not late:
+        return order
+    return [f for f in order if not is_top_round(f)] + late
+
+
 def build_part(part: Part, save_to: Path, *, visible: bool = True,
                allow_guess: bool = False) -> Path:
     """把特征树建成 SW 原生特征模型并存盘，返回**实际**保存的路径。
@@ -1285,6 +1642,8 @@ def build_part(part: Part, save_to: Path, *, visible: bool = True,
     顺序由 `features/library.build_order` 定（先基体 → 凸台 → 切除 → 圆角/倒角；
     显式 `depends_on` 优先于层号），**不按 features 列表的书写顺序建** ——
     布尔序错会让 SW 静默失败（CLAUDE.md 的 `SetAddToDB` 那课）。
+    在它之上还有一处 **SW 专有的重排**：`mode="top_round"` 的圆角推迟到队尾
+    （SW 原生圆角传播由上下文截断，见 `_defer_top_round`）；OCC 建序不动。
 
     建完**不关**这个模型：留给用户看（CLAUDE.md：SW 同时只保留一个模型，
     下一个重建开始时由 `_close_stale_docs` 收尾）。
@@ -1300,6 +1659,7 @@ def _build_in(driver: Any, part: Part, save_to: Path, *,
         order = library.build_order(list(part.features))
     except ValueError as e:                         # 依赖成环
         raise SwBuildError(f"特征树拓扑排序失败: {e}") from e
+    order = _defer_top_round(order)                 # SW 原生圆角上下文修正，见其 docstring
     if not order:
         raise SwBuildError("特征树是空的，没有可建的特征")
     kinds = {FeatureType(f.type.value) for f in order

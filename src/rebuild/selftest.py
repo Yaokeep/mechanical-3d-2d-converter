@@ -581,7 +581,8 @@ def test_correspondence() -> None:
 
     # F1 阶段 1 验收①：bracket 剖面图纸的两条剖面轴 —— 与标题文字
     #    （B—B x=121.89 穿 r25.5 / C—C x=-18.11 穿 r20）**逐项对上**。
-    #    切平面位置由几何圆配准得出（标题坐标与图面坐标不同源，见 F3）。
+    #    切平面位置由几何圆配准得出：标题坐标 + 恒定平移 +40.11 = 模型坐标，
+    #    两条剖面各自独立算出同一平移（曾互斥、报 INCONSISTENT_FRAME，见 F2）。
     sec = read_dxf(ROOT / "CAD" / "temp_output"
                    / "bracket_angker_图纸_20260922_剖面图.dxf")
     detect_views(sec)
@@ -601,8 +602,8 @@ def test_correspondence() -> None:
               str(b.direction))
         check("B—B 半径 = 标题的 25.5",
               abs(b.radius.value - 25.5) < 1e-9, str(b.radius.value))
-        check("B—B 切平面 x = 45.30（121.89 经图面镜像配准）",
-              abs(b.origin.x - 45.3025) < 0.01, f"{b.origin.x:.4f}")
+        check("B—B 切平面 x = 162.00（121.89 + 平移 40.11）",
+              abs(b.origin.x - 162.0) < 0.01, f"{b.origin.x:.4f}")
         check("B—B 孔心 y = 148.05", abs(b.origin.y - 148.0547) < 0.01,
               f"{b.origin.y:.4f}")
     c = axes.get("V5")
@@ -610,23 +611,24 @@ def test_correspondence() -> None:
         check("C—C 轴沿 Z", c.direction.z == 1.0, str(c.direction))
         check("C—C 半径 = 标题的 20", abs(c.radius.value - 20.0) < 1e-9,
               str(c.radius.value))
-        check("C—C 切平面 x = 185.30（-18.11 经同一镜像常量配准）",
-              abs(c.origin.x - 185.3025) < 0.01, f"{c.origin.x:.4f}")
+        check("C—C 切平面 x = 22.00（-18.11 经同一平移 40.11）",
+              abs(c.origin.x - 22.0) < 0.01, f"{c.origin.x:.4f}")
 
-    # F2 标题坐标与图面坐标**互为镜像**这件事必须报出来，而不是静默选一路：
-    #    两个剖面各自独立给出同一镜像常量 k=167.190，而平移解不存在
-    #    （偏移 -76.59 与 +203.41 互不相同）。这是出图侧俯视图画成仰视图的
-    #    直接后果（model_to_drawing.project_all_views 的 dx = up × dz）。
+    # F2 标题坐标系与图面几何**只差一个平移**（+40.11，两条剖面各自独立算出同一值）。
+    #    曾经这里报 INCONSISTENT_FRAME：两剖面给出的"镜像常量"互斥、平移解不存在。
+    #    根因在 V0 俯视图的 u 轴——帧记 mirror_axes=('y',)（轴记错了）且 mirror 参数
+    #    无人消费，几何一律按未翻面解释（drawing_u = 207.2992 − model_x，见
+    #    resolve_frame_mirrors 的 docstring）。帧翻面位改正后标注/图面同源，疑问消失。
+    #    注意判据不是"没报错就算过"：翻面本身是**投出来的**（V0 镜像解释比现行解释多
+    #    解释 72mm 轮廓线），裁决过程记在 resolved 里，下面一并核。
     inc = res.questions.by_kind(OpenQuestion.INCONSISTENT_FRAME)
-    check("报出「标注坐标系与图面不一致」", len(inc) == 1, str(len(inc)))
-    if inc:
-        check("候选里带镜像常量 167.190",
-              any("mirror:167.190" in str(x) for x in inc[0].candidates),
-              str(inc[0].candidates))
-        check("两个平移候选都在（-76.59 / 203.41）",
-              any("-76.59" in str(x) for x in inc[0].candidates)
-              and any("203.41" in str(x) for x in inc[0].candidates),
-              str(inc[0].candidates))
+    check("标注坐标系与图面几何已同源（不再报不一致）", len(inc) == 0, str(len(inc)))
+    votes = [a for a in res.questions.resolved
+             if a.by == "correspondence:mirror_vote"]
+    check("V0 帧翻面由跨视图投票裁决（记入 resolved）",
+          len(votes) == 1 and votes[0].question.view == "V0"
+          and "翻面" in str(votes[0].answer),
+          str([str(a) for a in votes])[:200])
 
     # F3 中心线共线匹配：**6 个回归用例逐张跑，判据不是"看起来对"而是
     #    "落在零件自己的坐标窗口里"** —— 误配必然把位置甩到窗口外。
@@ -872,11 +874,21 @@ def test_conventions() -> None:
 # ---- 阶段 3：特征层 ----
 
 def _recognized(path: Path):
-    """读 → 分离 → 定性 → 约定 → 对应 → 识别（阶段 3 全链）。"""
-    d = _prepared(path)
+    """读 → 分离 → 定性 → 约定 → 对应 → 识别（阶段 3 全链）。
+
+    **与 ``pipeline.understand`` 同一条接线**：从头共用一份 QuestionList
+    （type_views 起、约定层的问题并进去、corr 与 recognize 都往它上面写）。
+    不共用的话 corr 层的歧义疑问落在 corr.questions、识别层的裁决落在
+    rep.questions —— 两个列表各记各的，``rep.questions.resolved`` 永远
+    为空（H5 查"裁决记录可追"时才发现，此前一直如此）。
+    """
+    d = read_dxf(path)
+    detect_views(d)
+    qs = type_views(d)
     conv = run_rules(RuleCtx(d=d))
-    corr = build_correspondence(d, broken=conv.broken)
-    return d, conv, corr, recognize(d, corr, conv)
+    qs.extend(conv.questions.items)
+    corr = build_correspondence(d, qs, broken=conv.broken)
+    return d, conv, corr, recognize(d, corr, conv, qs)
 
 
 def test_features() -> None:
@@ -958,47 +970,55 @@ def test_features() -> None:
         label="半径")
     check("标注 vs 投影差 1mm **不**算冲突（出图误差是常态）", cf3 is None)
 
-    # ---- H5 bracket：剖面标题进树 + 通孔判定 ----
+    # ---- H5 bracket：高度分解 + 剖面标题并证据 + 通孔判定 ----
+    # 树自 v0.6.21 阶段 7 起是"分解后"的形态：基体降到最低公共高度，
+    # 分区（材料升 / 切除）各成一段 base/pocket —— 7 特征是分解前的账。
     _, conv_b, corr_b, rep_b = _recognized(_SEC_DWG)
-    f1 = next((f for f in rep_b.part.features if f.id == FeatureId(1)), None)
-    check("bracket 剖面图纸识别出 7 个特征（同心圆不合并 +2 → 8；"
-          "剖面标题的 r20 轴与既有 #4 重合、吸收后不再另建孤儿 −1）",
-          len(rep_b.part.features) == 7,
+    check("bracket 剖面图纸识别出 11 个特征（基体降高 +4 分区 + 2 圆角 + "
+          "月牙缺口/张缝/销孔；r9 拒发、剖面标题不建孤儿）",
+          len(rep_b.part.features) == 11,
           str([(str(f.id), f.type.value) for f in rep_b.part.features]))
     base = rep_b.part.features[0]
-    check("基体=沿 z 拉伸 44（最薄向）",
+    check("基体降到 z[2,24]（高 22）——高度分解已生效（不再是沿 z 拉伸 44）",
           base.type.value == "base" and base.params["dir"].value == "z"
-          and abs(base.params["length"].value - 44.0) < 1e-9)
-    check("#1 半径被剖面标题（B—B 的 r25.5）精化为 ANNOTATED",
-          f1 is not None and f1.params["radius"].tier is Tier.ANNOTATED
-          and abs(f1.params["radius"].value - 25.5) < 1e-9,
-          str(f1.params["radius"]) if f1 else "无 #1")
-    check("同一根轴的两路证据合并（≥2 项）",
-          f1 is not None and len(f1.evidence) >= 2, str(f1.evidence if f1 else ""))
-    check("剖面标题吸收进宿主特征（半径标注进 #1/#4，不另建孤儿特征）",
-          f1 is not None and f1.params["radius"].method == "note:section_title"
+          and abs(base.params["length"].value - 22.0) < 1e-9,
+          str(base.params["length"]))
+    f1 = next((f for f in rep_b.part.features if f.id == FeatureId(1)), None)
+    check("材料分区各成一段抬升 base（#1 塔柱 z24..46 高 22、#2 圆盘 z24..30 高 6）",
+          f1 is not None
+          and all(rep_b.part.features[i].type.value == "base" for i in (1, 2))
+          and abs(f1.params["length"].value - 22.0) < 1e-9
+          and abs(rep_b.part.features[2].params["length"].value - 6.0) < 1e-9,
+          str([(str(f.id), f.type.value) for f in rep_b.part.features[:3]]))
+    check("剖面标题（B—B r25.5 / A—A r20）与已读圆柱重合 ⇒ 只并证据、不建孤儿",
+          f1 is not None and len(f1.evidence) >= 5
           and all(f.type.method != "note:section_title"
-                  for f in rep_b.part.features))
-    f2 = next((f for f in rep_b.part.features if f.id == FeatureId(3)), None)
-    check("#3 深 22 < 材料厚 44 ⇒ 判为盲孔（DERIVED，非 GUESS）",
-          f2 is not None and f2.params["through"].value is False
-          and f2.params["through"].tier is Tier.DERIVED
-          and f2.params["through"].method == "derived:depth_vs_material",
-          str(f2.params["through"]) if f2 else "无 #3")
-    f2r15 = next((f for f in rep_b.part.features if f.id == FeatureId(2)), None)
-    check("同轴同心圆各建一个特征（r25.5 与 r15.7 各一条，见 G 段说明）",
-          f2r15 is not None and abs(f2r15.params["radius"].value - 15.7) < 1e-9,
-          str(f2r15.params["radius"]) if f2r15 else "无 #2")
-    check("r15.7 实/虚轮廓证据相当 ⇒ 孔 GUESS（不拍板为凸台）",
-          f2r15 is not None and f2r15.type.value == "hole"
-          and f2r15.type.tier is Tier.GUESS
-          and FeatureType.BOSS in (f2r15.type.alternatives or ()),
-          str(f2r15.type) if f2r15 else "无 #2")
-    check("实/虚冲突被记成待确认项（实线对可能是另一条棱的重合投影）",
-          any(q.kind is OpenQuestion.AMBIGUOUS_FEATURE and "实线轮廓对" in q.detail
-              for q in corr_b.questions),
-          str([q.detail[:40] for q in corr_b.questions
-               if q.kind is OpenQuestion.AMBIGUOUS_FEATURE][:3]))
+                  for f in rep_b.part.features)
+          and sum("只并证据" in n for n in rep_b.notes) == 2,
+          str([n for n in rep_b.notes if "只并证据" in n]))
+    f3 = next((f for f in rep_b.part.features if f.id == FeatureId(3)), None)
+    check("#3 深 44 = 该轴材料厚 44 ⇒ 通孔（DERIVED，非 GUESS）",
+          f3 is not None and f3.params["through"].value is True
+          and f3.params["through"].tier is Tier.DERIVED
+          and f3.params["through"].method == "derived:depth_vs_material",
+          str(f3.params["through"]) if f3 else "无 #3")
+    check("r15.7 实/虚冲突由分区剪影裁决为孔（hole/PROJECTION，不再 GUESS）",
+          f3 is not None and f3.type.value == "hole"
+          and f3.type.tier is Tier.PROJECTION
+          and FeatureType.BOSS not in (f3.type.alternatives or ()),
+          str(f3.type) if f3 else "无 #3")
+    check("被裁决的圆歧义进 resolved 而不是被删（可追当时怎么想的）",
+          any("实线轮廓对" in a.question.detail and "hole" in str(a.answer)
+              for a in rep_b.questions.resolved)
+          and any("找不到间距 2r" in a.question.detail
+                  and "neither" in str(a.answer)
+                  for a in rep_b.questions.resolved),
+          str([str(a)[:60] for a in rep_b.questions.resolved]))
+    check("r9 圆（R3 环面相切圆）在 HLR 图上全无轮廓对 ⇒ 拒发、不猜孔",
+          all(abs(f.params["radius"].value - 9.0) > 1e-9
+              for f in rep_b.part.features if "radius" in f.params)
+          and any("不建特征" in n for n in rep_b.notes),
+          str([n for n in rep_b.notes if "不建特征" in n]))
     check("每处孔都有 through（发射器不接受缺参数）",
           all("through" in f.params for f in rep_b.part.features
               if f.type.value == "hole"))

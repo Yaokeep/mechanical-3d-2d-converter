@@ -45,9 +45,11 @@ Y = 由俯视图/侧视图补出的第三向。这样"图纸上量到的图元�
 
 ## 遗留（诚实清单）
 
-- **REAR/BOTTOM/RIGHT 的镜像没消解**：这些视图本身就没定性（views/view_typer
-  的俯/仰、主/后歧义），镜像只会让 y/z 反号。本模块给出 `mirror_axes`，
-  并把两次解释都算出来；**未定就都留着**，不擅自选一个。
+- **镜像歧义按证据消解，没证据就不动**：REAR/BOTTOM/RIGHT 这些视图自身
+  未定性时，`mirror_axes` 只标出"符号未定"；`resolve_frame_mirrors` 再用
+  **跨视图轮廓证据**（圆 ↔ 正交视图的轮廓对）判定要不要翻面，翻面写在
+  `ViewFrame.u_flip`/`v_flip` 上，全模块一处生效。证据不足（对称零件两解
+  同分）时保持现行解释 —— 那条路仍是"两种都算、都不选"。
 - **POINT 对应只做有界版**：端点两两配对是组合爆炸，此处只对
   "与圆/弧心重合或在包围盒极值上"的特征点做配对（见 `_points`），
   全量版属于阶段 3 求解器的活。
@@ -55,7 +57,7 @@ Y = 由俯视图/侧视图补出的第三向。这样"图纸上量到的图元�
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
@@ -74,6 +76,10 @@ MATCH_TOL = 0.6
 #: 视图间共享轴的取值一致性容差（比 MATCH_TOL 松：视图间可能有出图偏差）
 AGREE_TOL = 1.0
 
+#: 镜像投票的门槛（mm）：翻面解释必须比现行解释多解释这么长的轮廓线，才动
+#: 帧的朝向。对称零件上两解同分（差 0），按此纪律保持现行解释不动。
+MIRROR_MARGIN = 10.0
+
 #: 视图类型 → (图纸横向对应的模型轴, 图纸纵向对应的模型轴)
 _AXES_OF_VIEW: dict[ViewType, tuple[str, str]] = {
     ViewType.FRONT: ("x", "z"), ViewType.REAR: ("x", "z"),
@@ -81,6 +87,19 @@ _AXES_OF_VIEW: dict[ViewType, tuple[str, str]] = {
     ViewType.LEFT: ("y", "z"), ViewType.RIGHT: ("y", "z"),
 }
 _ALL_AXES = ("x", "y", "z")
+
+#: 视图权威序 —— 镜像投票只许"低权威视图向高权威视图看齐"（否则两视图会
+#: 互相翻面、没有不动点）。序与 solve_frames 里"跨度基准视图"的偏好一致
+#: （x: 主 > 俯；y: 俯 > 左；z: 主 > 左），只是把三个轴合成一个全序。
+_AUTHORITY: dict[ViewType, int] = {
+    ViewType.FRONT: 0, ViewType.REAR: 1, ViewType.TOP: 2,
+    ViewType.BOTTOM: 3, ViewType.LEFT: 4, ViewType.RIGHT: 5,
+}
+
+
+def _authority(v: View) -> int:
+    """视图的权威等级（越小越权威；未定性的一律最低）。"""
+    return _AUTHORITY.get(v.resolved_type, 99)
 
 
 def _other(axes: tuple[str, str]) -> str:
@@ -98,6 +117,12 @@ class ViewFrame:
     ``mirror_axes`` 列出**符号未定**的轴：俯/仰、主/后、左/右 各自只差一次
     镜像，未定性时同一张图纸有两种解释。此处的立场是
     **两种都算、都不选**（§3 原则二），由 gate 决定要不要降级。
+
+    ``u_flip``/``v_flip`` 是**已裁决**的翻面：跨视图证据（圆 ↔ 正交视图里的
+    轮廓对）判定该轴与其余视图互为镜像时置位（见
+    :func:`resolve_frame_mirrors`），此后 ``u_to_model`` 默认就按翻面映射 ——
+    不用每个调用方各自记得传 ``mirror=True``。未裁决时两字段都是 False，
+    行为与旧版逐位一致。
 
     ``broken_axes`` 列出**被断裂画法打断**的轴：该向的图只画了一部分，
     跨度是残缺值。立场同样是"不猜"——``model_span`` 对这类轴返回 ``None``，
@@ -117,17 +142,25 @@ class ViewFrame:
     v_span: tuple[float, float] = (0.0, 0.0)
     mirror_axes: tuple[str, ...] = ()
     broken_axes: tuple[str, ...] = ()
+    #: 已裁决的翻面（跨视图证据判定，见 resolve_frame_mirrors）
+    u_flip: bool = False
+    v_flip: bool = False
+
     def u_to_model(self, u: float, mirror: bool = False) -> float:
-        """图纸横向坐标 → 模型坐标（``mirror`` 按 u 跨度翻转）。"""
+        """图纸横向坐标 → 模型坐标（``mirror`` 按 u 跨度翻转）。
+
+        ``mirror=True`` 要的是**另一种解释**：已裁决翻面时给回现行解释，
+        未裁决且该轴在 ``mirror_axes`` 里时给翻面解释。
+        """
         val = u + self.u_off
-        if mirror and self.u_axis in self.mirror_axes:
+        if self.u_flip ^ (mirror and self.u_axis in self.mirror_axes):
             lo, hi = self.u_span
             val = lo + hi - val
         return val
 
     def v_to_model(self, v: float, mirror: bool = False) -> float:
         val = v + self.v_off
-        if mirror and self.v_axis in self.mirror_axes:
+        if self.v_flip ^ (mirror and self.v_axis in self.mirror_axes):
             lo, hi = self.v_span
             val = lo + hi - val
         return val
@@ -154,6 +187,9 @@ class ViewFrame:
 
     def __str__(self) -> str:
         tag = f" 断裂={','.join(self.broken_axes)}" if self.broken_axes else ""
+        flips = "".join(a for a, on in ((self.u_axis, self.u_flip),
+                                        (self.v_axis, self.v_flip)) if on)
+        tag += f" 翻面={flips}" if flips else ""
         return (f"{self.view_id}({self.view_type.value}) "
                 f"u={self.u_axis}+{self.u_off:.2f} v={self.v_axis}+{self.v_off:.2f} "
                 f"p={self.p_axis}{tag}")
@@ -178,6 +214,8 @@ class CylinderHint:
     radius_method: str = ""
     #: 轮廓来源说明
     profile_method: str = ""
+    #: 这个解释的全部图元 handle（圆边 + 轮廓对）—— 下游建 Feature 时当证据用
+    evidence: tuple[str, ...] = ()
 
     @property
     def resolved(self) -> bool:
@@ -405,7 +443,93 @@ def solve_frames(d: Drawing, qs: QuestionList | None = None,
                     view=v.id, evidence=tuple(v.evidence[:1]),
                     candidates=(f"{a:.2f}", f"{b:.2f}"),
                 ))
+    resolve_frame_mirrors(d, frames, questions)
     return frames, questions
+
+
+def resolve_frame_mirrors(d: Drawing, frames: dict[str, ViewFrame],
+                          qs: QuestionList) -> None:
+    """用**跨视图证据**消解帧的镜像歧义 —— 就地更新 ``frames`` 的翻面位。
+
+    圆在正交视图里的侧面轮廓是一对间距 2r 的平行线，**圆心必然落在这对线
+    的正中间**。圆心在该轴上的坐标，现行解释与跨度镜像解释各给一个值，
+    哪个值上真画着线对，就是哪个解释成立 —— 这是**图纸内部**的硬约束，
+    不需要模型也不需要基准。
+
+    实测 bracket 俯视图（V0）：r25.5 / r15.7 圆按现行解释在 u=45.30，主视图
+    里 45.30 处没有任何间距 51 / 31.4 的竖线对；按跨度镜像落到 162.0，**正好**
+    压上主视图的两对竖线 u=136.50/187.48（环外壁）与 146.30/177.67（孔壁），
+    逐位吻合。翻面后环、臂、耳全部回到与主视图一致的一侧，与图纸自带的
+    B—B 标题（`x=121.89 穿 r25.5 孔轴`，模型系坐标）也一致。
+
+    判决纪律（§3 原则二）：只在**翻面解释明显更被图面支持**时翻
+    （多解释 ``MIRROR_MARGIN`` 以上的轮廓长度）；对称零件上两解同分，
+    保持现行解释不动。裁决记入 ``qs.resolved``（记下"谁、凭什么翻的"）。
+
+    只向**权威更高**的视图看齐（``_AUTHORITY``），故投票无环：主视图永远
+    是 x/z 的锚，俯视图是 y 的锚。
+    """
+    idx = _index(d)
+    order = sorted((v for v in d.views if v.id in frames and v.bbox is not None),
+                   key=_authority)
+    for v in order:
+        f = frames.get(v.id)
+        if f is None or v.bbox is None:
+            continue
+        circles = _circles_of(d, idx, v)
+        if not circles:
+            continue
+        partners = [w for w in order
+                    if w.id != v.id and _authority(w) < _authority(v)]
+        if not partners:
+            continue
+        for axis in (f.u_axis, f.v_axis):
+            lo, hi = f.u_span if axis == f.u_axis else f.v_span
+            score_id = score_flip = 0.0
+            for handle, center, r in circles:
+                if r <= 0.0:
+                    continue
+                want_id = (f.u_to_model(center.x) if axis == f.u_axis
+                           else f.v_to_model(center.y))
+                want_flip = lo + hi - want_id
+                best_id = best_flip = 0.0
+                for w in partners:
+                    wf = frames[w.id]
+                    if wf.p_axis == f.p_axis:
+                        continue
+                    if wf.u_axis == f.p_axis:
+                        along, perp_axis = "h", wf.v_axis
+                    elif wf.v_axis == f.p_axis:
+                        along, perp_axis = "v", wf.u_axis
+                    else:
+                        continue
+                    if perp_axis != axis:
+                        continue        # 该伙伴给的是另一条轴的证据
+                    for pr in _parallel_line_pairs(idx, w, along, 2 * r):
+                        got = (wf.u_to_model(pr.perp_mid)
+                               if perp_axis == wf.u_axis
+                               else wf.v_to_model(pr.perp_mid))
+                        if abs(got - want_id) <= MATCH_TOL:
+                            best_id = max(best_id, pr.length)
+                        if abs(got - want_flip) <= MATCH_TOL:
+                            best_flip = max(best_flip, pr.length)
+                score_id += best_id
+                score_flip += best_flip
+            if score_flip < score_id + MIRROR_MARGIN:
+                continue
+            flip_field = "u_flip" if axis == f.u_axis else "v_flip"
+            frames[v.id] = f = replace(f, **{flip_field: True})
+            q = qs.add(Question(
+                OpenQuestion.INCONSISTENT_FRAME,
+                f"{v.id} 的 {axis.upper()} 轴与其余视图互为镜像：圆按现行解释"
+                f"只被 {score_id:.1f}mm 轮廓线支持，按跨度镜像翻面后被 "
+                f"{score_flip:.1f}mm 支持 —— 按跨视图轮廓证据翻面"
+                f"（圆心重新落进正交视图的轮廓对正中）",
+                view=v.id,
+                evidence=tuple(h for h, _, _ in circles[:4]),
+                candidates=(f"不翻面（{score_id:.1f}）", f"翻面（{score_flip:.1f}）"),
+            ))
+            qs.resolve(q, f"翻面 {axis}", by="correspondence:mirror_vote")
 
 
 def _section_axes(v: View) -> tuple[str, str] | None:
@@ -669,6 +793,41 @@ def _cut_pos_candidates(d: Drawing, idx: dict[str, Evidence],
     return tuple(out)
 
 
+#: 配准关系"同一条"的容差：标题坐标是 2 位小数（121.89 实为 121.885 这类
+#: 舍入误差 ≤ 5µm），两条剖面各自给出的常量必须在这个容差内才算一致
+REG_TOL = 0.05
+
+
+def _g(p: float, t: float, kind: str) -> float:
+    """候选圆坐标 p 与标题坐标 t 在某种关系下的"常量"。
+
+    平移：模型 = 标题 + k ⇒ k = p − t；镜像：模型 = k − 标题 ⇒ k = p + t。
+    """
+    return p - t if kind == "translate" else p + t
+
+
+def _covering_params(rows: list[_Row], kind: str) -> list[float]:
+    """所有"每个剖面都至少有一个候选圆与之相容"的关系常量（去重后）。
+
+    关键在**每个剖面至少一个**，不是"全部候选都相等"：一个剖面里同半径的
+    圆可以有好几个（bracket 的 r20 在长圆两端各一个），标题只指其中一个，
+    其余是同一半径的无关圆 —— 旧的"全部候选同值"口径遇到这种图纸直接塌成
+    "配准失败"（实测剖面图 r20 补出第二个候选后，两条剖面都被打回标题原值，
+    在 x=121.89 处凭空切出 Ø51 孔，体积 −25%）。
+    """
+    ks = [_g(p, r.cut.cut_pos, kind) for r in rows for p, _, _ in r.cands]
+    out: list[float] = []
+    for k in ks:
+        if all(any(abs(_g(p, r.cut.cut_pos, kind) - k) <= REG_TOL
+                   for p, _, _ in r.cands) for r in rows):
+            out.append(k)
+    uniq: list[float] = []
+    for k in sorted(out):
+        if not uniq or abs(k - uniq[-1]) > REG_TOL:
+            uniq.append(k)
+    return uniq
+
+
 def _solve_registration(rows: list[_Row],
                         qs: QuestionList) -> dict[str, _Reg]:
     """跨剖面**联合**解出"标题坐标 → 模型坐标"的关系 —— 单个剖面解不出这件事。
@@ -694,34 +853,42 @@ def _solve_registration(rows: list[_Row],
             out[n] = _Reg()          # 位置无从判定，按标题原值（Question 已单报）
             continue
         ev = tuple(h for r in have for _, h, _ in r.cands[:1])
-        offsets = {round(p - r.cut.cut_pos, 2) for r in have for p, _, _ in r.cands}
-        if len(offsets) == 1:
-            out[n] = _Reg("translate", next(iter(offsets)))
+        tr = _covering_params(have, "translate")
+        if len(tr) == 1:
+            out[n] = _Reg("translate", tr[0])
             continue
-        mirrors = {round(p + r.cut.cut_pos, 2) for r in have for p, _, _ in r.cands}
-        if len(mirrors) == 1 and len(have) >= 2:
-            k = next(iter(mirrors))
+        mi = _covering_params(have, "mirror")
+        if len(mi) == 1 and len(have) >= 2:
+            k = mi[0]
             out[n] = _Reg("mirror", k)
             qs.add(Question(
                 OpenQuestion.INCONSISTENT_FRAME,
                 f"切平面法向 {n}：剖面标题的坐标与图面坐标**互为镜像**"
                 f"（图面 = {k:.3f} − 标题；{len(have)} 个剖面各自独立给出同一常量），"
-                f"而平移解不存在（候选偏移 {sorted(offsets)}）。出图侧至少有一个视图的"
-                "投影方向与常规相反（本仓库 project_shape_to_2d 取 dx = up × dz，"
+                f"而平移解不存在（候选偏移 {sorted({round(p - r.cut.cut_pos, 2) for r in have for p, _, _ in r.cands})}）。"
+                "出图侧至少有一个视图的投影方向与常规相反"
+                "（本仓库 project_shape_to_2d 取 dx = up × dz，"
                 "dz=(0,0,-1) 时把俯视图画成了仰视图）。切平面位置已按几何圆配准，"
                 "**不要改用标题原值**",
                 evidence=ev,
                 candidates=(f"mirror:{k:.3f}",)
-                           + tuple(f"offset:{o:.2f}" for o in sorted(offsets)),
+                           + tuple(f"offset:{o:.2f}" for o in
+                                   sorted({round(p - r.cut.cut_pos, 2)
+                                           for r in have for p, _, _ in r.cands})),
             ))
             continue
         qs.add(Question(
             OpenQuestion.AMBIGUOUS_FEATURE,
             f"切平面法向 {n}：{len(group)} 个剖面给出的配准关系互不相容 —— "
-            f"候选平移 {sorted(offsets)}、候选镜像 {sorted(mirrors)}；"
+            f"没有一种平移（候选 "
+            f"{sorted({round(p - r.cut.cut_pos, 2) for r in have for p, _, _ in r.cands})}）"
+            f"或镜像（候选 "
+            f"{sorted({round(p + r.cut.cut_pos, 2) for r in have for p, _, _ in r.cands})}）"
+            "能同时覆盖每个剖面至少一个候选圆；"
             "符号通道与几何通道不同源，切平面位置暂按标题原值使用（可疑）",
             evidence=ev,
-            candidates=tuple(f"offset:{o:.2f}" for o in sorted(offsets)),
+            candidates=tuple(f"offset:{o:.2f}" for o in sorted(
+                {round(p - r.cut.cut_pos, 2) for r in have for p, _, _ in r.cands})),
         ))
         out[n] = _Reg()
     return out
@@ -861,13 +1028,43 @@ def _index(d: Drawing) -> dict[str, Evidence]:
     return {e.handle: e for e in d.evidence}
 
 
+#: 多段 ARC 拼成一条圆边的角覆盖门限（弧度）——取 ~170°，不是整圈。
+#: 实测（bracket 剖面图）：抬升长圆左端 r20 只画了朝内那半圈（另半圈图纸上
+#: 根本没有，可见/隐藏两层各 4 段弧、合起来 90°..270°），只认 CIRCLE / 整圆
+#: 弧的旧读法把这条圆边整条丢掉 —— 一处漏读级联三处结构错：长圆被读成两个
+#: 圆盘（材料区少一块），r6 长槽被读成"抬升盘 + 切除盘"（凭空多料 + 切错位）。
+#: 取 170° 而不是 90°：抬升区根部圆角（环面 ±57.78°）在俯视图里也是弧，
+#: 门限放到 90° 会把圆角弧读成圆边。
+ARC_COVER_MIN = math.radians(170.0)
+#: 覆盖判定的采样精度（弧度，0.5°）——只判"盖没盖够"，不需要精确
+ARC_COVER_BIN = math.radians(0.5)
+
+
+def _arc_cover(spans: list[tuple[float, float]]) -> float:
+    """多段弧在 [0, 2π) 上的覆盖合计（弧度）。``spans`` 给 (起角, 跨角) 对。"""
+    n = int(round(2 * math.pi / ARC_COVER_BIN))
+    hit = bytearray(n)
+    for s, w in spans:
+        if w >= 2 * math.pi - 1e-9:
+            return 2 * math.pi
+        i0 = int(round((s % (2 * math.pi)) / ARC_COVER_BIN))
+        i1 = int(round(((s % (2 * math.pi)) + w) / ARC_COVER_BIN))
+        for i in range(i0, i1 + 1):
+            hit[i % n] = 1
+    return sum(hit) * ARC_COVER_BIN
+
+
 def _circles_of(d: Drawing, idx: dict[str, Evidence], v: View
                 ) -> list[tuple[EvidenceRef, Point3, float]]:
-    """视图里的整圆/整圆弧 → (handle, 图纸圆心, 半径)。
+    """视图里的整圆/整圆弧/多段弧拼出的圆边 → (handle, 图纸圆心, 半径)。
 
-    HLR 出图的圆常被打成整圆弧（Arc2 张角 2π），故两种都收。
+    HLR 出图的圆常被打成整圆弧（Arc2 张角 2π），故两种都收；此外一条圆边
+    可能被拆成**多段弧**（甚至只画一部分，见 ``ARC_COVER_MIN``）—— 按
+    (圆心, 半径) 归组、角覆盖达标即算一条圆边，各段**逐条进列表**：同心的
+    同半径多条会被 `cylinders_from_circles` 并成一条（依据并列，不误报同心）。
     """
     out: list[tuple[EvidenceRef, Point3, float]] = []
+    arcs: dict[tuple[int, int, int, int], list[tuple[EvidenceRef, Arc2]]] = {}
     for h in v.evidence:
         e = idx.get(h)
         if e is None or e.kind != Kind.EDGE:
@@ -879,6 +1076,18 @@ def _circles_of(d: Drawing, idx: dict[str, Evidence], v: View
             span = (g.end_angle - g.start_angle) % (2 * math.pi)
             if span > 2 * math.pi - 0.02:
                 out.append((e.handle, Point3(g.center.x, g.center.y, 0.0), g.radius))
+            else:
+                key = (round(g.center.x / MATCH_TOL), round(g.center.y / MATCH_TOL),
+                       round(g.radius / MATCH_TOL))
+                # 跨度不进 key：同一条圆边的各段半径相同 ⇒ 按 (圆心, 半径) 分组
+                arcs.setdefault(key, []).append((e.handle, g))
+    for items in arcs.values():
+        cover = _arc_cover([((a.start_angle), (a.end_angle - a.start_angle)
+                             % (2 * math.pi)) for _, a in items])
+        if cover >= ARC_COVER_MIN:
+            c = items[0][1].center
+            for handle, _ in items:
+                out.append((handle, Point3(c.x, c.y, 0.0), items[0][1].radius))
     return out
 
 
@@ -1030,7 +1239,8 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
     marker = f"circle:{v.id}"
     radius_claim = Claim(r, marker, Tier.PROJECTION, evidence=handles)
     hint = CylinderHint(Axis3(origin, axis_dir, radius_claim), r,
-                        radius_method=marker)
+                        radius_method=marker,
+                        evidence=tuple(h for _, h in refs0))
     refs: list[tuple[str, EvidenceRef]] = list(refs0)
     best: tuple[_Pair, str, float] | None = None
     best_vis: _Pair | None = None
@@ -1093,7 +1303,8 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
                 candidates=("hole", "boss"),
             ))
         hint = CylinderHint(hint.axis, r, length=pr.length, solid=solid,
-                            radius_method=marker, profile_method=f"outline:{wid}")
+                            radius_method=marker, profile_method=f"outline:{wid}",
+                            evidence=tuple(h for _, h in refs))
         return Correspondence(
             CorrKind.FEATURE, tuple(refs),
             Claim(hint, f"corr:circle+outline({v.id}+{wid})", Tier.PROJECTION,
