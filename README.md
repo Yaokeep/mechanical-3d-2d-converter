@@ -74,8 +74,10 @@ python main.py
 │   │   ├── model/              # 数据模型（Document / ShapeNode / ProjectionData）
 │   │   ├── io/                 # 文件导入/导出（STEP / IGES / STL / DXF）
 │   │   ├── projection/         # 3D→2D 投影引擎（HLR / 三视图 / 轴测图 / 剖面图）
-│   │   ├── reconstruction/     # 2D→3D 重建引擎（线框 / 面 / 拉伸 / 旋转）
+│   │   ├── reconstruction/     # 2D→3D 重建引擎（线框 / 面 / 拉伸 / 旋转，已过时待删）
 │   │   └── annotation/         # 自动尺寸标注引擎
+│   ├── rebuild/                # 新框架：图纸理解 → 特征树 → 发射（当前主线，
+│   │                           #   证据/视图/约定/特征/验证/发射六层，见 docs/ARCHITECTURE.md）
 │   └── utils/                  # 工具模块（配置 / 日志 / 线程 / 单位换算）
 ├── resources/
 │   └── styles/                 # QSS 主题（亮色 / 暗色）
@@ -84,7 +86,7 @@ python main.py
 
 ## 开发路线图
 
-当前版本 **v0.6.20**（详细进度以 `CLAUDE.md` 和 git log 为准）：
+当前版本 **v0.6.21**（详细进度以 `CLAUDE.md` 和 git log 为准）：
 
 - [x] v0.1.0 — 项目脚手架（目录结构、GUI 骨架）
 - [x] v0.2.0~v0.5.9 — SolidWorks COM 自动化、DXF→SW 全流程建模、
@@ -152,6 +154,11 @@ python main.py
       同棱双进 V+H 集致黑轮廓被涂蓝）/ 剖面位置夹进圆柱面 bbox + 视线反向
       / 空剖面守卫（判据取 OCC 实测面积）/ 退化零长 LINE 丢弃。
       新增样本 D79307 / IMU / 轴测量 + 齿箱上盖原始 DWG；简单回归 6/6
+- [x] v0.6.21 — 新框架 `src/rebuild/` 阶段 5+6：轮廓环（视图环 → 带圆弧
+      profile）与锥化词汇（l_bracket 19,800 / 图形练习 72,000 逐位转绿）、
+      SW 基体拉伸破冰（碎片线链无损合并 + 劣弧 direction 语义）、多视图
+      回转体识别（PF60K −63% → **+0.06%**，OCC/SW 两发射器交叉验证）；
+      验收表 **7 绿**，自检 333 项，结构缺口只剩 bracket 高度分解
 - [ ] GUI 内 PythonOCC 集成 — `src/gui/view3d`、`projection`、
       `reconstruction` 模块骨架已就绪，待接入（核心算法已在根目录
       独立脚本 `dxf_to_3d_general.py` 等中完整实现）
