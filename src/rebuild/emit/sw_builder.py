@@ -1054,6 +1054,14 @@ def pattern_plan(f: Feature, part: Part) -> PatternPlan:
     "这几个孔构成一个阵列"（前者来自视图中逐个圆，后者来自图纸的均布约定），
     于是阵列实例位置常常与那些孔**逐个重合**。照着契约硬克隆，就等于把同一处
     材料切两遍。
+
+    ⚠️ 实例位置**从 child 自身锚起**（旋转 +i·step），`start_deg` 不参与定位：
+    它是图纸系相位读数（`p.angles[0]`），经视图镜像后与模型系角不直接可比。
+    曾写成旋转 `start + i·step`（把绝对角当相对角）—— PF60K 实测起飞出 3 个
+    幽灵位（落在 R35 的轴向方向，那里轮廓只到 r30 ⇒ 无材料可切，
+    `FeatureCut3` 返回 None，整棵树发射失败）；child 是模型系里已定型的实例，
+    锚在它身上既不引入镜像错位，又让 `_twin_at` 去重命中 IR 里逐个建的兄弟孔
+    （flange_d80 / 法兰练习 的 start=0，两式逐位相同，本就靠去重全命中）。
     """
     kind = str(_param(f, "kind"))
     count = int(_param(f, "count"))
@@ -1077,7 +1085,6 @@ def pattern_plan(f: Feature, part: Part) -> PatternPlan:
         child = part.by_id(FeatureId(int(child_id)))
     except KeyError as e:
         raise SwBuildError(f"特征 #{f.id}（pattern）的 child={child_id!r} 不在特征树里") from e
-    start = float(_opt(f, "start_deg", 0.0) or 0.0)
     co, cd, _ = _axis_of(child)
     # 阵列轴：过 center、方向取 child 自身轴向（螺栓分布圆的标准情形）
     sibs = [g for g in part.features
@@ -1086,7 +1093,7 @@ def pattern_plan(f: Feature, part: Part) -> PatternPlan:
     positions: list[Point3] = []
     covered: list[str] = []
     for i in range(1, count):                     # 第 0 个 = child 自身
-        p = _rotate_about(co, center, cd, start + i * 360.0 / count)
+        p = _rotate_about(co, center, cd, i * 360.0 / count)
         hit = _twin_at(sibs, p, child)
         if hit is None:
             positions.append(p)

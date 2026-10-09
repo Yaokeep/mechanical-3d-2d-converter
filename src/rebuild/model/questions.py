@@ -60,10 +60,32 @@ class Question:
 
 
 @dataclass
+class Answer:
+    """一条疑问的裁决 —— ``answer`` 是选中的候选（或新的结论）。
+
+    ``by`` 记录**谁做的裁决**（如 ``"revolve:1V0"``）。这个字段不是装饰：
+    报告里"这条疑问是谁解的"决定了它的可信度，也让人能顺藤摸到裁决逻辑。
+    """
+
+    question: Question
+    answer: Any
+    by: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.question} ⇒ {self.answer}（by {self.by}）"
+
+
+@dataclass
 class QuestionList:
-    """待确认项集合 —— 带去重，避免多路推理各报一遍。"""
+    """待确认项集合 —— 带去重，避免多路推理各报一遍。
+
+    ``resolved`` 是**已裁决**的条目：疑问在后续推理里被新证据消解后，
+    不删条目（删了就没人能回答"你当时怎么想的"），而是移到已裁决区并
+    记下答案与裁决者。``blocking()`` 之类的下游查询只看未裁决的那部分。
+    """
 
     items: list[Question] = field(default_factory=list)
+    resolved: list[Answer] = field(default_factory=list)
 
     def add(self, q: Question) -> Question:
         for old in self.items:
@@ -77,7 +99,30 @@ class QuestionList:
             self.add(q)
 
     def by_kind(self, kind: OpenQuestion) -> list[Question]:
+        """**未裁决**的指定种类疑问（已裁决的不会再拦路）。"""
         return [q for q in self.items if q.kind == kind]
+
+    def find(self, kind: OpenQuestion, view: str = "", *,
+             detail_contains: str = "") -> list[Question]:
+        """按种类/视图/描述子串找**未裁决**的疑问（消解端的检索入口）。"""
+        out = []
+        for q in self.items:
+            if q.kind != kind:
+                continue
+            if view and q.view != view:
+                continue
+            if detail_contains and detail_contains not in q.detail:
+                continue
+            out.append(q)
+        return out
+
+    def resolve(self, q: Question, answer: Any, by: str = "") -> bool:
+        """裁决一条疑问：移出待办、记入 ``resolved``。返回是否命中。"""
+        if q not in self.items:
+            return False
+        self.items.remove(q)
+        self.resolved.append(Answer(q, answer, by))
+        return True
 
     def __len__(self) -> int:
         return len(self.items)

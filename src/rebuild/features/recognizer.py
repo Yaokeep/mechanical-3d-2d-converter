@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from ..model.claim import Claim, Tier
 from ..model.feature_tree import Feature, FeatureType, Part, SymmetryOp
@@ -48,6 +49,9 @@ from ..views.correspondence import CorrespondenceResult, CylinderHint, ViewFrame
 from ..views.ring import extract_ring
 from .library import ir_point, mk_claim
 from .solver import Conflict, SolveReport, merge_with_conflict, solve
+
+if TYPE_CHECKING:
+    from .revolve import RevolvePlan
 
 #: 两条轴"是同一条"的判据：垂直距离 + 方向夹角
 AXIS_POS_TOL = 0.6       # mm
@@ -98,6 +102,9 @@ class RecognizeReport:
     conflicts: list[Conflict] = field(default_factory=list)
     #: 求解报告（``recognize`` 末尾自动跑一次；单独调 ``solve`` 则为 None）
     solved: SolveReport | None = None
+    #: 回转体检测的产出（``revolve.detect_revolve``；None = 非回转体）。
+    #: 基体已换成 REVOLVE 时，附属体（方料/键槽）与消解材料也在这里。
+    revolve: "RevolvePlan | None" = None
 
     def describe(self) -> str:
         lines = [f"识别出 {len(self.part.features)} 个特征"]
@@ -564,6 +571,14 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
         # （图形练习三向都是 60，按 min 取到的是字典序首位的 x）
         dir_name = tap.axis
     else:
+        # 回转体优先于"最薄方向"：≥3 条共轴同心圆 + 轴向剖面扫出母线，
+        # 是比"沿最薄向拉板"强得多的读法（PF60K 按板读体积 −63%）。
+        # 检测不成立（同心圆不够/扫描失败）返回 None，原路径不受影响。
+        from .revolve import detect_revolve
+        rv = detect_revolve(d, corr, rep)
+        if rv is not None:
+            rep.revolve = rv
+            return rv.base
         dir_name = min(ext, key=lambda a: ext[a])
     # 轮廓取"看不出的正是拉伸方向"的那个视图（它正对着这个平面）
     prof_view = next((f for f in frames.values() if f.p_axis == dir_name),
@@ -941,6 +956,7 @@ def pattern_features(conv, corr: CorrespondenceResult, rep: RecognizeReport,
         # **面内**距离 ≈ 分布圆半径"且"半径 ≈ 阵列孔半径"。早期版本比的是
         # 轴心到圆心的距离 ≤ 容差（= 在圆心处找孔），PF60K 上必然找不到 child
         child = None
+        on_circle = 0
         for f in part.features:
             if f.type.value == "pattern" or f.axis is None or f.axis.value is None:
                 continue
@@ -953,8 +969,9 @@ def pattern_features(conv, corr: CorrespondenceResult, rep: RecognizeReport,
             d = ((cm[frame.u_axis] - cn[frame.u_axis]) ** 2
                  + (cm[frame.v_axis] - cn[frame.v_axis]) ** 2) ** 0.5
             if abs(d - p.radius) <= AXIS_POS_TOL:
-                child = f
-                break
+                if child is None:
+                    child = f
+                on_circle += 1
         params = {
             "kind": mk_claim("circular", "convention:pattern", Tier.CONVENTION,
                              c.evidence),
@@ -979,6 +996,17 @@ def pattern_features(conv, corr: CorrespondenceResult, rep: RecognizeReport,
             f.depends_on.append(child.id)
             f.params["child"] = mk_claim(child.id, "convention:pattern",
                                          Tier.CONVENTION, c.evidence)
+            if on_circle >= p.n:
+                # 图上 n 个圆**全部逐个画出**且各有独立特征 ⇒「均布阵列」与
+                # 「n 个独立孔位」两种读法的位置逐个相同，阵列只是给分布加注
+                # （发射器的覆盖去重保证不重复建）—— 这正是"图上没写「均布」
+                # 字样"那条疑问的消解依据：不靠默认值，靠两读等效。
+                for q in rep.questions.find(OpenQuestion.AMBIGUOUS_FEATURE,
+                                            view=p.view,
+                                            detail_contains="等距落在"):
+                    rep.questions.resolve(
+                        q, "均布阵列（n 个圆全部有独立特征，与逐孔读法位置一致）",
+                        "convention:pattern_read_all")
         else:
             rep.questions.add(Question(
                 OpenQuestion.AMBIGUOUS_FEATURE,
@@ -1073,7 +1101,23 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
 
     base = base_feature(d, corr, rep)
     part.add(base)
-    for f in cylinder_features(corr, rep, next_id=1, skip=_base_outline(base)):
+    rv = rep.revolve
+    next_id = 1
+    skip = _base_outline(base)
+    if rv is not None:
+        # 回转体的附属体（方料块 × N、键槽）紧随基体进树 —— 它们都是
+        # **材料/切除**，顺序只对发射器的布尔序列有意义（材料先、切除后，
+        # 圆柱特征在更后面，天然满足）
+        solids = list(rv.solids) + ([rv.pocket] if rv.pocket is not None else [])
+        for f in solids:
+            f.id = FeatureId(next_id)
+            part.add(f)
+            next_id += 1
+        skip = rv.skip_outline          # 跳过**全部** Rset 同心圆（不只最外）
+        rep.notes.append(
+            f"附着：方料 {len(rv.solids)} 块、键槽 {'有' if rv.pocket else '无'}"
+            f"，特征自 #{next_id} 号续编")
+    for f in cylinder_features(corr, rep, next_id=next_id, skip=skip):
         part.add(f)
     merge_section_axes(corr, rep, part)
     for f in pattern_features(conv, corr, rep, part):
@@ -1085,6 +1129,11 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
     # 求解**在层内收尾**：先验/关系/欠定兜底共用同一个待确认清单，
     # 否则调用方忘了传 qs 就会重复报（求解层去重正是靠这份清单）
     rep.solved = solve(part, qs=questions)
+    if rv is not None:
+        # 消解**必须在 solve 之后**：solve 才把"type 未定/标准值偏离"的
+        # 疑问挂进清单，消解端（角孔定型/螺纹底孔先验）才有对象可裁
+        from .revolve import attach_revolve
+        attach_revolve(d, corr, rv, part, rep)
     rep.conflicts.extend(rep.solved.conflicts)
     return rep
 

@@ -330,10 +330,45 @@ def solve_frames(d: Drawing, qs: QuestionList | None = None,
         ua, va = axis_of[v.id]
         pa = _other((ua, va))
         assert v.bbox is not None
-        # 偏移：让本视图的 u/v 区间与已定的模型区间**起点对齐**；
-        # 模型区间缺失（该轴没有基准视图）时才自己定，并记进 span
-        u_lo, u_hi = span.get(ua, (v.bbox.xmin, v.bbox.xmax))
-        v_lo, v_hi = span.get(va, (v.bbox.ymin, v.bbox.ymax))
+        broken_here = broken_axes_of(v)
+        # 偏移：让本视图的 u/v 区间与已定的模型区间对齐。
+        # **跨度一致**（差 ≤ 容差）时按左缘对齐 —— 视图间平移是布局，
+        # 左缘是自然基准。**跨度不一致**时左缘对齐会引入半个跨度差的伪
+        # 平移：实测 PF60K 俯视图只画 ±30 的方框，r40 的角弧不撑 bbox，
+        # X 向跨度 60 vs 主视图的 80，左缘对齐把圆心平移了 10mm（与主视
+        # 图轴线错位、所有圆的配对轮廓都找不到）。此时按**中心对齐**并
+        # 记账 —— 中心是跨度的固有基准，与子集关系无关。
+        # **断裂轴不参与**：残缺跨度与完整跨度比必然"不一致"，比它没有
+        # 意义（该轴的内容坐标本来就是拼接的残片，不构成定标依据）。
+        def _align(own: tuple[float, float], ref: tuple[float, float] | None,
+                   axis: str, is_broken: bool) -> tuple[float, tuple[float, float]]:
+            """返回 (偏移, 该轴区间登记)。ref=None ⇒ 本视图自己定。"""
+            olo, ohi = own
+            if ref is None:
+                return 0.0, own
+            rlo, rhi = ref
+            if is_broken:
+                return rlo - olo, ref
+            w_o, w_r = ohi - olo, rhi - rlo
+            if abs(w_o - w_r) <= max(MATCH_TOL, 0.01 * max(w_o, w_r)):
+                off = rlo - olo
+            else:
+                off = (rlo + rhi) / 2.0 - (olo + ohi) / 2.0
+                questions.add(Question(
+                    OpenQuestion.AMBIGUOUS_VIEW,
+                    f"{axis.upper()} 向跨度两路不一致：{v.id} 量得 {w_o:.2f}、"
+                    f"基准视图量得 {w_r:.2f}（差 {abs(w_o - w_r):.2f}）——"
+                    "按**中心对齐**（左缘对齐会引入半个跨度差的伪平移）",
+                    view=v.id, evidence=tuple(v.evidence[:1]),
+                    candidates=(f"中心对齐 {off:+.2f}", f"左缘对齐 {rlo - olo:+.2f}"),
+                ))
+            # 登记该轴区间（有基准时借基准的区间，与跨视图并集口径一致）
+            return off, ref
+
+        u_off, u_span = _align((v.bbox.xmin, v.bbox.xmax), span.get(ua), ua,
+                               ua in broken_here)
+        v_off, v_span = _align((v.bbox.ymin, v.bbox.ymax), span.get(va), va,
+                               va in broken_here)
         mirror: tuple[str, ...] = ()
         # 俯/仰、主/后、左/右 只差一次镜像 —— 方向没定就两种解释都留着
         t = v.resolved_type
@@ -342,21 +377,23 @@ def solve_frames(d: Drawing, qs: QuestionList | None = None,
             mirror = (ua,) if ua in ("y",) or t == ViewType.REAR else (va,)
         frame = ViewFrame(
             view_id=v.id, view_type=t, u_axis=ua, v_axis=va, p_axis=pa,
-            u_off=u_lo - v.bbox.xmin, v_off=v_lo - v.bbox.ymin,
-            u_span=(u_lo, u_hi), v_span=(v_lo, v_hi), mirror_axes=mirror,
+            u_off=u_off, v_off=v_off,
+            u_span=u_span, v_span=v_span, mirror_axes=mirror,
             broken_axes=broken_axes_of(v),
         )
         frames[v.id] = frame
 
         # ---- 一致性检查（同一个模型轴被两个视图各说了一次） ----
+        # ⚠️ 修复前此检查恒不触发：比较的第二项用的是 u_lo/u_hi，而它们
+        # 在基准缺失时就是 mine 的拷贝、存在时又恰等于 ref ⇒ 条件恒真。
+        # 现在改回拿**本视图自身的 bbox 跨度**与基准跨度比。
         broken_here = broken_axes_of(v)
         for axis, mine in ((ua, (v.bbox.xmin, v.bbox.xmax)),
                            (va, (v.bbox.ymin, v.bbox.ymax))):
             if axis in broken_here:
                 continue     # 断裂视图的跨度量的是残缺的部分，比了必然"不一致"
             ref = span.get(axis)
-            if ref is None or (axis == ua and (u_lo, u_hi) == ref) \
-                    or (axis == va and (v_lo, v_hi) == ref):
+            if ref is None:
                 continue
             a, b = mine[1] - mine[0], ref[1] - ref[0]
             if abs(a - b) > max(MATCH_TOL, 0.01 * max(a, b)):
@@ -873,6 +910,13 @@ def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
         e = idx.get(h)
         if e is None or e.kind != Kind.EDGE or not isinstance(e.geom, Line2):
             continue
+        # **只有可见/隐藏轮廓能当侧面轮廓**：剖面图的剖面线边界与可见轮廓
+        # 完全重合，若混进来，"实线还是虚线"就变成了"先碰上哪条重合实体"
+        # 的运气。实测 bracket 的 C—C 剖视图：r20（真值是环状挂耳的外径，
+        # 与 r25.5 结构相同）因先碰上 hatch 角色 → solid=False 读成孔，
+        # 而 r25.5 碰上实线 → 凸台——同一图纸同一结构两种答案。
+        if e.role.value not in (Role.VISIBLE, Role.HIDDEN):
+            continue
         g = e.geom
         dx, dy = abs(g.end.x - g.start.x), abs(g.end.y - g.start.y)
         major, minor = (dx, dy) if horizontal else (dy, dx)
@@ -895,8 +939,15 @@ def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
                 for h2, p2, len2, vis2 in bucketed.get(nb, []):
                     if h1 == h2 or vis1 != vis2:
                         continue
-                    if h1 > h2:
-                        continue              # 每对只报一次
+                    if nb == b and h1 > h2:
+                        # 同桶（间距 < 容差）时对称访问会给出两次，按名字去一次。
+                        # ⚠️ 曾对所有桶都做 `h1 > h2`——那是按 **handle 字符串**
+                        # 去重：handle 序与位置序不一致的合法对会被整对丢弃
+                        # （实测 bracket：x=2.00 与 x=42.03 的可见轮廓对
+                        # "1955"/"1918" 因 1955>1918 被误判重复，r20 只剩
+                        # 剖面线的重合对可配对）。向上搜索每个对只访问一次，
+                        # 无需去重；只有同桶对称才要。
+                        continue
                     sep = abs(p2 - p1)
                     if abs(sep - want_sep) > MATCH_TOL:
                         continue
@@ -982,6 +1033,8 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
                         radius_method=marker)
     refs: list[tuple[str, EvidenceRef]] = list(refs0)
     best: tuple[_Pair, str, float] | None = None
+    best_vis: _Pair | None = None
+    best_hid: _Pair | None = None
     for w in d.views:
         if w.id == v.id or w.id not in frames or w.bbox is None:
             continue
@@ -1002,17 +1055,52 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
                 continue
             if best is None or pr.length > best[0].length:
                 best = (pr, w.id, got)
+            if pr.visible:
+                if best_vis is None or pr.length > best_vis.length:
+                    best_vis = pr
+            elif best_hid is None or pr.length > best_hid.length:
+                best_hid = pr
     if best is not None:
         pr, wid, _ = best
         refs += [(wid, pr.h1), (wid, pr.h2)]
-        hint = CylinderHint(hint.axis, r, length=pr.length, solid=pr.visible,
+        solid: bool | None = pr.visible
+        # 实/虚轮廓冲突：同一条圆柱轮廓在图上既有实线对又有虚线对、两者
+        # 量级又可比时，"实线=凸台、虚线=孔"这条判据在这张图上失效 ——
+        # 实线对很可能是**另一条棱**恰在该位置的重合投影（实测 bracket：
+        # r6/r15.7 的实线对在真值 HLR 里确有一条真实可见边与之重合，是
+        # 图纸本身的真歧义，不是出图伪影）。此时不许替用户拍板（§3 原则
+        # 二），留 solid=None 由识别层记 GUESS、交求解层/后置消解。
+        # 判据取"短的 ≥ 长的一半"：实测冲突样本都落在 0.5 附近（11/22、
+        # 10.25/20.5、14/28、5/10、5.05/10.10），而真正的单侧证据比值
+        # 都远小于 0.5（bracket r20 为 4.54/19、PF60K r30 为 9.87/56.5）。
+        # ⚠️ 已知抓不到的一类：只有实线对、虚线对被**可见优先去重**吃掉的
+        # 样本（bracket r12：3.00 长可见对，实为薄壁缘的棱，孔的壁虚线与之
+        # 重合后没进图）⇒ 仍读成薄凸台。要治它得靠"HLR 重合消影"推理，
+        # 不是长度判据能做的。
+        if (best_vis is not None and best_hid is not None
+                and min(best_vis.length, best_hid.length)
+                >= 0.5 * max(best_vis.length, best_hid.length)):
+            solid = None
+            qs.add(Question(
+                OpenQuestion.AMBIGUOUS_FEATURE,
+                f"{v.id} 的 r{r:g} 圆在正交视图里既有实线轮廓对（最长 "
+                f"{best_vis.length:.2f}）又有虚线轮廓对（最长 "
+                f"{best_hid.length:.2f}），量级可比 —— 实线对可能是另一条"
+                "棱的重合投影，孔/凸台未定",
+                view=v.id,
+                evidence=(handle, best_vis.h1, best_vis.h2,
+                          best_hid.h1, best_hid.h2),
+                candidates=("hole", "boss"),
+            ))
+        hint = CylinderHint(hint.axis, r, length=pr.length, solid=solid,
                             radius_method=marker, profile_method=f"outline:{wid}")
         return Correspondence(
             CorrKind.FEATURE, tuple(refs),
             Claim(hint, f"corr:circle+outline({v.id}+{wid})", Tier.PROJECTION,
                   evidence=tuple(h for _, h in refs)),
             note=f"r{r:g} 圆柱，长 {pr.length:.2f}，"
-                 + ("凸台（轮廓实线）" if pr.visible else "孔（轮廓虚线）"),
+                 + ("孔/凸台未定（实/虚轮廓证据相当）" if solid is None
+                    else ("凸台（轮廓实线）" if solid else "孔（轮廓虚线）")),
         )
     qs.add(Question(
         OpenQuestion.AMBIGUOUS_FEATURE,

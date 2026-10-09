@@ -961,8 +961,9 @@ def test_features() -> None:
     # ---- H5 bracket：剖面标题进树 + 通孔判定 ----
     _, conv_b, corr_b, rep_b = _recognized(_SEC_DWG)
     f1 = next((f for f in rep_b.part.features if f.id == FeatureId(1)), None)
-    check("bracket 剖面图纸识别出 8 个特征（同心圆不合并后 +2，见 G 段说明）",
-          len(rep_b.part.features) == 8,
+    check("bracket 剖面图纸识别出 7 个特征（同心圆不合并 +2 → 8；"
+          "剖面标题的 r20 轴与既有 #4 重合、吸收后不再另建孤儿 −1）",
+          len(rep_b.part.features) == 7,
           str([(str(f.id), f.type.value) for f in rep_b.part.features]))
     base = rep_b.part.features[0]
     check("基体=沿 z 拉伸 44（最薄向）",
@@ -974,18 +975,30 @@ def test_features() -> None:
           str(f1.params["radius"]) if f1 else "无 #1")
     check("同一根轴的两路证据合并（≥2 项）",
           f1 is not None and len(f1.evidence) >= 2, str(f1.evidence if f1 else ""))
-    check("有特征直接来自剖面标题（note:section_title）",
-          any(f.type.method == "note:section_title"
-              for f in rep_b.part.features))
+    check("剖面标题吸收进宿主特征（半径标注进 #1/#4，不另建孤儿特征）",
+          f1 is not None and f1.params["radius"].method == "note:section_title"
+          and all(f.type.method != "note:section_title"
+                  for f in rep_b.part.features))
     f2 = next((f for f in rep_b.part.features if f.id == FeatureId(3)), None)
     check("#3 深 22 < 材料厚 44 ⇒ 判为盲孔（DERIVED，非 GUESS）",
           f2 is not None and f2.params["through"].value is False
           and f2.params["through"].tier is Tier.DERIVED
           and f2.params["through"].method == "derived:depth_vs_material",
           str(f2.params["through"]) if f2 else "无 #3")
-    check("同轴同心圆各建一个特征（r25.5 凸台里再有一个 r15.7 凸台）",
-          any(f.id == FeatureId(2) and abs(f.params["radius"].value - 15.7) < 1e-9
-              for f in rep_b.part.features))
+    f2r15 = next((f for f in rep_b.part.features if f.id == FeatureId(2)), None)
+    check("同轴同心圆各建一个特征（r25.5 与 r15.7 各一条，见 G 段说明）",
+          f2r15 is not None and abs(f2r15.params["radius"].value - 15.7) < 1e-9,
+          str(f2r15.params["radius"]) if f2r15 else "无 #2")
+    check("r15.7 实/虚轮廓证据相当 ⇒ 孔 GUESS（不拍板为凸台）",
+          f2r15 is not None and f2r15.type.value == "hole"
+          and f2r15.type.tier is Tier.GUESS
+          and FeatureType.BOSS in (f2r15.type.alternatives or ()),
+          str(f2r15.type) if f2r15 else "无 #2")
+    check("实/虚冲突被记成待确认项（实线对可能是另一条棱的重合投影）",
+          any(q.kind is OpenQuestion.AMBIGUOUS_FEATURE and "实线轮廓对" in q.detail
+              for q in corr_b.questions),
+          str([q.detail[:40] for q in corr_b.questions
+               if q.kind is OpenQuestion.AMBIGUOUS_FEATURE][:3]))
     check("每处孔都有 through（发射器不接受缺参数）",
           all("through" in f.params for f in rep_b.part.features
               if f.type.value == "hole"))
@@ -1010,7 +1023,7 @@ def test_features() -> None:
             check("孔径与阵列声明一致（r2.75）",
                   abs(ch.params["radius"].value - 2.75) < 1e-9)
         check("阵列中心＝孔系中心（其余孔绕它均布）",
-              abs(p.placement.value.x - 32.0) < 0.01
+              abs(p.placement.value.x - 42.0) < 0.01
               and abs(p.placement.value.y - 192.9) < 0.01,
               f"({p.placement.value.x:.2f},{p.placement.value.y:.2f})")
 

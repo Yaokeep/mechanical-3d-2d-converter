@@ -975,12 +975,15 @@ def _build_pattern(shape: Any, f: Feature, part: Part, built: set[FeatureId],
                 f"特征 #{f.id}（pattern）的 bc_radius={float(bc):g} 与"
                 f"child 实际所在半径 {r_now:g} 不符 —— 阵列只会绕 center 复制"
                 f"child 的现位置，两者不一致时发出来的分布圆是错的")
-    start = float(_opt(f, "start_deg", 0.0) or 0.0)
     # 阵列实例位置**已被其它特征占掉**的就不重发（判据与 `sw_builder.pattern_plan` 同）：
     # 识别器会同时产出"逐个孔各是一个特征"与"这些孔构成阵列"，位置逐个重合。
     # OCC 侧重复发射几何上无害（同处再切一刀/再并一块，结果不变），跳过是为了
     # 少做一次布尔、也避免共面布尔留下可疑面 —— 但**记账**必须做：跳过意味着
     # 那个实例是靠别的 IR 特征建的，验收核"特征数一致"时要认这笔账。
+    # ⚠️ 实例位置**从 child 自身锚起**（+i·step），`start_deg` 不参与定位 ——
+    # 它是图纸系相位读数，经视图镜像后与模型系角不直接可比；曾把绝对角当相对角
+    # （`start + i·step` 旋转 child 的实际点），PF60K 实测幽灵位飞到无材料处。
+    # 完整理由与实测见 `sw_builder.pattern_plan` 的 docstring（两处必须同口径）。
     sibs = [g for g in part.features
             if g.id != f.id and g.id != child.id
             and g.type.value == child.type.value]
@@ -988,7 +991,7 @@ def _build_pattern(shape: Any, f: Feature, part: Part, built: set[FeatureId],
     out: list[str] = []
     skipped: list[str] = []
     for i in range(1, count):                     # 第 0 个 = child 自身
-        deg = start + i * 360.0 / count
+        deg = i * 360.0 / count
         p = _rotate_about(co, center, cd, deg)
         hit = _twin_at(sibs, p, r_child)
         if hit is not None:
