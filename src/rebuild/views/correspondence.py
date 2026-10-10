@@ -1165,6 +1165,72 @@ def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
     return out
 
 
+_MERGE_GAP = 0.1     # 并集量尺的合并间隙：影子碎段间 ≤0.1mm 的缝算连续
+
+
+def _merge_total(spans: list[tuple[float, float]]) -> float:
+    """一维区间的并集总长 —— 影子碎段的公平计长。
+
+    出图侧的可见优先去重会把被吃掉的隐藏线打成 0.37mm 步的碎段群，
+    逐段配对永远挑不出"最长的一条"；并集量尺把它们合起来跟可见轮廓
+    比（间隙 ≤ ``_MERGE_GAP`` 视为连续，跨越更大缺口才断开）。
+    """
+    total = 0.0
+    cur_lo = cur_hi = None
+    for lo, hi in sorted(spans):
+        if cur_hi is not None and lo <= cur_hi + _MERGE_GAP:
+            cur_hi = max(cur_hi, hi)
+        else:
+            if cur_hi is not None:
+                total += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+    if cur_hi is not None:
+        total += cur_hi - cur_lo
+    return total
+
+
+def _band_totals(idx: dict[str, Evidence], v: View, along: str,
+                 perp_mid: float, r: float) -> tuple[float, float, float, float]:
+    """圆柱**两壁母线带**内的实/虚轮廓并集总长（**分壁**统计）。
+
+    母线带 = ``perp_mid ± r ± MATCH_TOL`` 两条窄带 —— 圆柱的轮廓线就该
+    在这里。返回 ``(lo_vis, lo_hid, hi_vis, hi_hid)``：每条带内可见段、
+    隐藏段各自做并集合并（``_merge_total``，沿线方向）。
+
+    用途："HLR 重合消影/混合壁"检测。半圆柱面与被消影的孔壁在图上都是
+    **一壁实线、另一壁虚线**；同一条带内实虚混杂的则是异源结构（实测
+    r25.5 塔柱带内有基体侧缘圆角轮廓重叠，跨壁合计量尺 44 vs 44 误报，
+    分壁才分得开）。逐段配对看不到被可见优先去重打碎的隐藏影子
+    （0.37mm 步碎段群），并集量尺能把两侧拉平。
+    """
+    horizontal = along == "h"
+    bands: dict[str, list[tuple[float, float]]] = {
+        "lo_vis": [], "lo_hid": [], "hi_vis": [], "hi_hid": []}
+    for h in v.evidence:
+        e = idx.get(h)
+        if e is None or e.kind != Kind.EDGE or not isinstance(e.geom, Line2):
+            continue
+        if e.role.value not in (Role.VISIBLE, Role.HIDDEN):
+            continue
+        g = e.geom
+        dx, dy = abs(g.end.x - g.start.x), abs(g.end.y - g.start.y)
+        major, minor = (dx, dy) if horizontal else (dy, dx)
+        if major <= 1e-9 or minor > 1e-6 * major:
+            continue                      # 斜线 / 短线不算轮廓
+        perp = (g.start.y + g.end.y) / 2.0 if horizontal \
+            else (g.start.x + g.end.x) / 2.0
+        if abs(abs(perp - perp_mid) - r) > MATCH_TOL:
+            continue
+        key = ("lo" if perp < perp_mid else "hi") \
+            + ("_vis" if e.role.value == Role.VISIBLE else "_hid")
+        bands[key].append(
+            (min(g.start.x, g.end.x), max(g.start.x, g.end.x))
+            if horizontal
+            else (min(g.start.y, g.end.y), max(g.start.y, g.end.y)))
+    return (_merge_total(bands["lo_vis"]), _merge_total(bands["lo_hid"]),
+            _merge_total(bands["hi_vis"]), _merge_total(bands["hi_hid"]))
+
+
 def cylinders_from_circles(d: Drawing, frames: dict[str, ViewFrame],
                            qs: QuestionList) -> list[Correspondence]:
     """圆 ⇒ 圆柱轴；再拿正交视图里的轮廓对补上长度与"孔还是凸台"。
@@ -1264,14 +1330,15 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
             if abs(got - want) > MATCH_TOL:
                 continue
             if best is None or pr.length > best[0].length:
-                best = (pr, w.id, got)
+                best = (pr, w, got)
             if pr.visible:
                 if best_vis is None or pr.length > best_vis.length:
                     best_vis = pr
             elif best_hid is None or pr.length > best_hid.length:
                 best_hid = pr
     if best is not None:
-        pr, wid, _ = best
+        pr, w, _ = best
+        wid = w.id
         refs += [(wid, pr.h1), (wid, pr.h2)]
         solid: bool | None = pr.visible
         # 实/虚轮廓冲突：同一条圆柱轮廓在图上既有实线对又有虚线对、两者
@@ -1283,10 +1350,10 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
         # 判据取"短的 ≥ 长的一半"：实测冲突样本都落在 0.5 附近（11/22、
         # 10.25/20.5、14/28、5/10、5.05/10.10），而真正的单侧证据比值
         # 都远小于 0.5（bracket r20 为 4.54/19、PF60K r30 为 9.87/56.5）。
-        # ⚠️ 已知抓不到的一类：只有实线对、虚线对被**可见优先去重**吃掉的
-        # 样本（bracket r12：3.00 长可见对，实为薄壁缘的棱，孔的壁虚线与之
-        # 重合后没进图）⇒ 仍读成薄凸台。要治它得靠"HLR 重合消影"推理，
-        # 不是长度判据能做的。
+        # ⚠️ 上面这类"同一条轮廓线实/虚并存"抓不到的另一类：虚线对被
+        # **可见优先去重**吃掉的样本（bracket r12：可见对 3.00 长，实为
+        # 薄壁缘的棱，孔壁虚线与之重合后没进图）—— 逐段配对的长度判据
+        # 永远赢不了，由下方的并集量尺（HLR 重合消影/混合壁通道）补。
         if (best_vis is not None and best_hid is not None
                 and min(best_vis.length, best_hid.length)
                 >= 0.5 * max(best_vis.length, best_hid.length)):
@@ -1302,6 +1369,35 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
                           best_hid.h1, best_hid.h2),
                 candidates=("hole", "boss"),
             ))
+        elif solid is not None:
+            # HLR 重合消影 / 混合壁（分壁并集量尺）：逐段配对只看得见
+            # "最长的一对"，被出图侧可见优先去重打碎的隐藏影子（0.37mm
+            # 步、共 12mm 的碎段群）永远赢不过 3mm 的可见对 —— 把两壁
+            # 母线带内的实/虚段各自并集起来，**同一壁带内实虚并存、量级
+            # 相当**就报疑。这类图面有多种读法：半圆柱面（bracket r12
+            # 叉尖端壁：lo 壁实 12 / 虚 12、hi 壁纯实）、孔壁虚线被异源
+            # 可见棱重合吃掉（消影）、或同带异源结构重叠（r25.5 塔柱带
+            # 内基体圆角轮廓 44 vs 44）—— 都是图面真实歧义，逐段配对
+            # 判不出。实线轮廓仍是直接证据（solid 不动），这里只**报疑**
+            # （§3 原则二），交 _resolve_questions 按分区/特征剪影裁决；
+            # 纯 boss 两壁全实、纯孔两壁全虚都不报。
+            lo_v, lo_h, hi_v, hi_h = _band_totals(idx, w, along,
+                                                  pr.perp_mid, r)
+            for wv, wh, wl in ((lo_v, lo_h, "下"), (hi_v, hi_h, "上")):
+                if (wv >= 0.5 and wh >= 0.5
+                        and min(wv, wh) >= 0.5 * max(wv, wh)):
+                    qs.add(Question(
+                        OpenQuestion.AMBIGUOUS_FEATURE,
+                        f"{v.id} 的 r{r:g} 圆在正交视图里{wl}壁母线带内"
+                        f"实/虚轮廓并存且量级相当（实 {wv:.2f} vs 虚 "
+                        f"{wh:.2f}）—— 可能是半圆柱面，也可能是孔壁虚线"
+                        "被可见优先去重消影、只剩异源可见棱；暂按实线轮廓"
+                        "读，存疑待裁决",
+                        view=v.id,
+                        evidence=(handle, pr.h1, pr.h2),
+                        candidates=("hole", "boss"),
+                    ))
+                    break      # 一壁报一条就够了
         hint = CylinderHint(hint.axis, r, length=pr.length, solid=solid,
                             radius_method=marker, profile_method=f"outline:{wid}",
                             evidence=tuple(h for _, h in refs))

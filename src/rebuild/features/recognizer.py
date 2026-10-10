@@ -812,14 +812,15 @@ def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
 
 
 def _resolve_questions(rep: RecognizeReport, plan,
-                       no_feature: list[CylinderHint]) -> int:
+                       no_feature: list[CylinderHint],
+                       corr: "CorrespondenceResult | None" = None) -> int:
     """分区/轮廓证据已把圆的角色定死 ⇒ **裁决** corr 层留下的歧义疑问。
 
     ``QuestionList.resolve`` 不删条目：把它移进已裁决区并记下答案与裁决者
     （见 ``model/questions.py``）。只裁决**图元全部有结论**的疑问 —— 一条
     圆边还没定，疑问就原样保留（宁可多问，§3 原则二）。
 
-    三类消解（依据都来自识别期新证据，不是放宽门槛）：
+    四类消解（依据都来自识别期新证据，不是放宽门槛）：
       * 「同一圆心上有 N 条同心圆边」→ ``independent``：每个圆各由分区/
         特征层独立解释（材料分区、切除分区、凸台、或非特征切边）——
         "沉孔/台阶"那个假设需要两个圆**成对**解释同一段轴向，分区读数
@@ -827,6 +828,9 @@ def _resolve_questions(rep: RecognizeReport, plan,
       * 「既有实线对又有虚线对」→ ``boss``/``hole``：分区剪影把该圆
         所在的区域读成了材料/切除（实测 bracket r25.5 材料、r15.7 切除），
         比"实线对长度 vs 虚线对长度"这一路更强；
+      * 「消影」→ ``boss``/``hole``：母线带内实/虚并存（半圆柱面或孔壁
+        虚线被可见优先去重吃掉的图面），按分区/特征剪影裁决；与特征现值
+        相悖时回流改写 type（``_settle_cyl_type``）；
       * 「找不到间距 2r 的轮廓对」→ ``neither``：图纸画了隐藏线仍然全无
         轮廓 ⇒ 非圆柱特征（曲面切边/圆角足迹，实测 r9 = R3 环面相切圆）。
     """
@@ -859,6 +863,17 @@ def _resolve_questions(rep: RecognizeReport, plan,
     for h in no_feature:
         put(h, "none", f"r{h.radius:g} → 非特征（图上全无间距 2r 的轮廓对）")
 
+    # 圆边 handle → 半径（消影裁决回流改写特征时按**半径**匹配特征，
+    # 不能只看 handle —— 同心圆边的证据会被"盘+中心孔"共享，实测
+    # r25.5 圆边 handle 同时落在 #3（r15.7 孔）的 evidence 里）
+    rad_map: dict[str, float] = {}
+    if corr is not None:
+        for c in corr.cylinders():
+            hint = c.mapping.value
+            if isinstance(hint, CylinderHint) and hint.axis.radius is not None:
+                for h in hint.axis.radius.evidence:
+                    rad_map[str(h)] = hint.axis.radius.value
+
     n = 0
     for q in list(qs.find(OpenQuestion.AMBIGUOUS_FEATURE)):
         ev = tuple(q.evidence)
@@ -888,6 +903,18 @@ def _resolve_questions(rep: RecognizeReport, plan,
                    + "——实/虚线之争由分区剪影裁决）")
             if qs.resolve(q, ans, "height:zone"):
                 n += 1
+        elif "消影" in q.detail:
+            if ev[0] not in roles:
+                continue                  # 圆边还没结论：保留疑问
+            kind, text = roles[ev[0]]
+            if kind not in ("material", "cut"):
+                continue
+            ans = ("boss（" if kind == "material" else "hole（") + text \
+                + "——实/虚并存之疑由分区/特征剪影裁决）"
+            if qs.resolve(q, ans, "recognize:hlr_occlude"):
+                n += 1
+                _settle_cyl_type(rep, str(ev[0]), kind,
+                                 rad_map.get(str(ev[0])))
         elif "找不到间距 2r 的轮廓对" in q.detail:
             if all(h in roles and roles[h][0] == "none" for h in ev):
                 ans = ("neither（图纸画了隐藏线却没有任何间距 2r 的轮廓 ⇒ "
@@ -895,6 +922,52 @@ def _resolve_questions(rep: RecognizeReport, plan,
                 if qs.resolve(q, ans, "recognize:no_outline_pair"):
                     n += 1
     return n
+
+
+def _settle_cyl_type(rep: RecognizeReport, handle: str, kind: str,
+                     radius: float | None) -> None:
+    """裁决与特征现值相悖时，回流改写特征 type（height↔depth 键同步）。
+
+    分区/特征剪影（roles）是比"投影轮廓实/虚"更强的证据。消影/混合壁
+    之疑被裁决成与特征现值**相反**的结论时（读成凸台、实际切除区，或
+    反过来），把 type Claim 升级为 PROJECTION 级裁决值；一致则只记账
+    不改写。改判为孔时通孔/盲孔仍未知，补 MISSING_DIMENSION 疑问
+    （§3 原则二：消影场景没有独立的深度证据，宁可多问）。
+
+    匹配特征**同时**看 handle 与半径：同心圆边的证据会被"盘+中心孔"
+    共享（实测 r25.5 圆边 handle 落在 #3 r15.7 孔的 evidence 里），
+    只按 handle 会把孔误改写成凸台。
+    """
+    want = FeatureType.BOSS if kind == "material" else FeatureType.HOLE
+    for f in rep.part.features:
+        if f.type.value not in (FeatureType.HOLE.value, FeatureType.BOSS.value):
+            continue
+        if handle not in {str(x) for x in f.evidence}:
+            continue
+        rad = f.params.get("radius")
+        if radius is not None and (rad is None
+                                   or abs(float(rad.value) - radius) > 0.05):
+            continue                      # 共享证据的同心圆边：不是这条
+        if f.type.value == want.value:
+            return                          # 一致：只记账不改写
+        ev = tuple(f.evidence)
+        f.type = Claim(want, "recognize:hlr_occlude", Tier.PROJECTION,
+                       evidence=ev)
+        src, dst = ("height", "depth") if want is FeatureType.HOLE \
+            else ("depth", "height")
+        if src in f.params and dst not in f.params:
+            f.params[dst] = f.params.pop(src)
+        rep.notes.append(
+            f"特征 #{f.id}：消影/混合壁之疑经分区剪影裁决为"
+            f"{'凸台' if want is FeatureType.BOSS else '孔'}，type 改写"
+            f"（{src}→{dst} 参数键同步）")
+        if want is FeatureType.HOLE:
+            rep.questions.add(Question(
+                OpenQuestion.MISSING_DIMENSION,
+                f"#{f.id}.depth / #{f.id}.through：r{float(f.params['radius'].value):g} "
+                "经消影裁决改判为孔，但通孔/盲孔未定（消影场景无独立深度证据）",
+                view=f.source_view, evidence=ev))
+        return
 
 
 # ---- 3) 剖面标题给的轴线 ----
@@ -1357,7 +1430,7 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
         # 分区/轮廓证据把圆的角色定死之后，把 corr 层的歧义疑问**裁决**掉
         # （移进 resolved 并记答案+裁决者）—— 不删条目，报告里仍可追"当时
         # 怎么想的"。只在图元全部有结论时裁决，缺一条就保留疑问。
-        n = _resolve_questions(rep, rep.zones, no_feature)
+        n = _resolve_questions(rep, rep.zones, no_feature, corr)
         if n:
             rep.notes.append(
                 f"疑问消解：{n} 条圆歧义由分区角色/负轮廓证据裁决（见 resolved）")

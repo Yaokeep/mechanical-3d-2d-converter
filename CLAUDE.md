@@ -505,7 +505,7 @@ step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 331 项自检（2026-10-10 实测；阶段 6 记的 333 里两条基体断言随高度分解合并），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 336 项自检（2026-10-10 消影通道后实测；阶段 6 记的 333 里两条基体断言随高度分解合并），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
@@ -527,8 +527,10 @@ OCC 表与 SW 表在 7 个简单/PF60K 绿行上逐位/毫厘吻合——两个�
 l_bracket/图形练习 +227%/+200% → 逐位）、"多视图回转体识别未做"→
 `features/revolve.py`（阶段 6，PF60K −63.05% → +0.06%）、"高度分解未做"→
 `features/height_zones.py`（阶段 7，bracket +48.70%/+84.12% → −0.01%/+0.11%））。
-r12 的 GUESS(hole|boss) 已由 `recognizer._resolve_questions` 按分区剪影裁决
-清零阻塞疑问，但「HLR 重合消影推理」通道本身仍未做（收口路径仍欠账）。
+r12 的 GUESS(hole|boss) 的「HLR 重合消影推理」通道 2026-10-10 落地（corr
+层 `_band_totals` 分壁并集量尺报疑 → bracket 按分区剪影裁决回 boss
+（`recognize:hlr_occlude`，一致只记账、相悖回流改写 type）、PF60K r8.5 按
+revolve 证据覆盖裁决；9 绿逐位不变，自检 336 项）。
 **别为了让表变绿去调发射器**——那会把"没读到"变成"读错了"（体积对了结构全错，
 正是本框架要消灭的病）。表上红的地方就是还没读出来的地方，见
 `run_rebuild_acceptance.py` 顶部注释。反向同样成立：阶段 7 把 SW 的 top_round

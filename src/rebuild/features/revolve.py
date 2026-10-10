@@ -827,5 +827,20 @@ def attach_revolve(d: Drawing, corr: CorrespondenceResult, plan: RevolvePlan,
             qs.resolve(q, "独立孔（各圆边已各自定型为孔，轴向位置由孔壁线跨度定）",
                        "revolve:independent_holes")
 
+    # HLR 重合消影/混合壁之疑（corr 层按"母线带内实/虚并存"报的）：圆边
+    # 被回转基体吸收 ⇒ 实虚并存是凹槽/台阶自身的图面（槽底轮廓与槽缘棱），
+    # "孔壁虚线被消影"的读法不成立；已定型为独立孔的按孔收（消影孔读法）。
+    for q in qs.find(OpenQuestion.AMBIGUOUS_FEATURE, detail_contains="消影"):
+        if not q.evidence:
+            continue
+        h0 = str(q.evidence[0])
+        if h0 in absorbed:
+            qs.resolve(q, "母线台阶（圆边被回转基体吸收，实虚并存是凹槽/"
+                          "台阶自身的图面，非消影之孔）",
+                       "revolve:profile_absorbed")
+        elif h0 in holes_ev:
+            qs.resolve(q, "孔（圆边已定型为独立孔，实虚并存按消影孔读）",
+                       "revolve:independent_holes")
+
 
 __all__ = ["AxLine", "RevolvePlan", "attach_revolve", "detect_revolve"]

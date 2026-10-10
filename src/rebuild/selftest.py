@@ -663,6 +663,18 @@ def test_correspondence() -> None:
     check("靶子里确有中心线被匹配上（否则 F3 是空转）", n_center > 0,
           str(n_center))
 
+    # F4 消影/混合壁量尺：并集合并 —— 0.37mm 步的影子碎段群要能合起来
+    #    跟可见轮廓比，缝隙 ≤0.1 算连续、跨越更大缺口才断开
+    from src.rebuild.views.correspondence import _merge_total
+    check("并集量尺：≤0.1 缝隙的碎段合并",
+          abs(_merge_total([(0.0, 0.37), (0.37, 0.74),
+                             (5.0, 5.5), (5.55, 6.0)]) - 1.74) < 1e-9,
+          str(_merge_total([(0.0, 0.37), (0.37, 0.74),
+                             (5.0, 5.5), (5.55, 6.0)])))
+    check("并集量尺：>0.1 的缝断开计两段",
+          abs(_merge_total([(0.0, 1.0), (1.2, 2.0)]) - 1.8) < 1e-9,
+          str(_merge_total([(0.0, 1.0), (1.2, 2.0)])))
+
 
 # ============ G. 约定层（阶段 2） ============
 
@@ -1023,8 +1035,42 @@ def test_features() -> None:
           all("through" in f.params for f in rep_b.part.features
               if f.type.value == "hole"))
 
-    # ---- H6 PF60K：阵列挂到正确的孔上（判据是"在分布圆上"，不是"在圆心上"） ----
+    # ---- H5c HLR 重合消影/混合壁通道（corr 报疑 → 分区剪影裁决） ----
+    # 叉尖 r12 的侧视图下壁带内实 12 / 虚 12 并存（半圆柱面与"孔壁虚线被
+    # 可见优先去重消影"在图上同形）—— 逐段配对判据抓不到（最长隐藏对仅
+    # 0.37），并集量尺报疑；分区/特征剪影裁决回 boss、与特征现值一致 ⇒
+    # 只记账不改写（体积零漂移由验收表逐位保证）。r25.5 塔柱带内基体
+    # 圆角轮廓的实虚重叠同样报疑、同样被分区裁决。
+    occl = [a for a in rep_b.questions.resolved if "消影" in a.question.detail]
+    check("消影之疑报出并全部裁决（r12 叉尖 + r25.5 塔柱带异源重叠）",
+          len(occl) == 2
+          and all(a.by == "recognize:hlr_occlude"
+                  and "boss" in str(a.answer) for a in occl)
+          and any("r12" in a.question.detail for a in occl)
+          and any("r25.5" in a.question.detail for a in occl),
+          str([str(a)[:70] for a in occl]))
+    check("r12 特征仍为 boss/PROJECTION（裁决一致 ⇒ 不改写、tier 不降）",
+          any(f.type.value == "boss"
+              and abs(f.params["radius"].value - 12.0) < 1e-9
+              and f.type.tier is Tier.PROJECTION
+              for f in rep_b.part.features),
+          str([(str(f.id), f.type.value) for f in rep_b.part.features
+               if "radius" in f.params
+               and abs(f.params["radius"].value - 12.0) < 1e-9]))
+
+    # ---- H5d PF60K：r8.5 凹槽的实/虚并存按回转母线证据覆盖裁决 ----
+    # r8.5 的侧视图壁带内实 5.90 / 虚 5.00 并存 —— 若是独立圆柱这是
+    # "半圆柱/消影孔"之疑；但圆边已被回转基体吸收（凹槽/台阶是母线自身的
+    # 图面），按证据覆盖裁决，不阻塞。
     _, _, _, rep_p = _recognized(_PF60K)
+    occl_p = [a for a in rep_p.questions.resolved
+              if "消影" in a.question.detail]
+    check("PF60K r8.5 实/虚并存按回转母线证据覆盖裁决（凹槽图面非消影孔）",
+          len(occl_p) == 1 and occl_p[0].by == "revolve:profile_absorbed"
+          and "r8.5" in occl_p[0].question.detail,
+          str([str(a)[:70] for a in occl_p]))
+
+    # ---- H6 PF60K：阵列挂到正确的孔上（判据是"在分布圆上"，不是"在圆心上"） ----
     pats = [f for f in rep_p.part.features if f.type.value == "pattern"]
     check("PF60K 识别出 1 个阵列特征", len(pats) == 1, str(len(pats)))
     if pats:

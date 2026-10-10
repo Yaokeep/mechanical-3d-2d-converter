@@ -92,9 +92,14 @@
   333 项里两条基体断言合并）。
 
 **未竟（下一抓手）**：① SW−OCC 整体 ~+1.06k 口径差定位（早于本轮：旧 SW
-192,907.0 的 +0.48% 已含 ~+937，与圆角无关）；② r12 的 GUESS(hole|boss)
-消解——本阶段靠 `_resolve_questions` 按分区剪影裁决清零了阻塞疑问，但
-「HLR 重合消影推理」通道本身仍未做（`correspondence` 内有注释记账）。
+192,907.0 的 +0.48% 已含 ~+937，与圆角无关）；② ~~r12 的 GUESS(hole|boss)
+消解~~——**已由「HLR 重合消影推理」通道消灭（2026-10-10）**：corr 层
+`_band_totals` 分壁并集量尺报疑（母线带内实/虚并存且量级相当 ⇒
+AMBIGUOUS_FEATURE，detail 含"消影"——0.37mm 步的影子碎段群逐段配对永远
+抓不到），bracket r12 叉尖半圆柱 / r25.5 塔柱带异源重叠经分区剪影裁决回
+boss（`recognize:hlr_occlude`；与特征现值相悖时回流改写 type、一致只记账
+——体积零漂移），PF60K r8.5 凹槽按 revolve 证据覆盖裁决
+（`revolve:profile_absorbed`）；验收表 9 绿逐位不变，自检 331 → **336 项**。
 
 ---
 
