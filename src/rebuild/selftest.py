@@ -971,7 +971,7 @@ def test_features() -> None:
     check("标注 vs 投影差 1mm **不**算冲突（出图误差是常态）", cf3 is None)
 
     # ---- H5 bracket：高度分解 + 剖面标题并证据 + 通孔判定 ----
-    # 树自 v0.6.21 阶段 7 起是"分解后"的形态：基体降到最低公共高度，
+    # 树自 v0.6.22 阶段 7 起是"分解后"的形态：基体降到最低公共高度，
     # 分区（材料升 / 切除）各成一段 base/pocket —— 7 特征是分解前的账。
     _, conv_b, corr_b, rep_b = _recognized(_SEC_DWG)
     check("bracket 剖面图纸识别出 11 个特征（基体降高 +4 分区 + 2 圆角 + "

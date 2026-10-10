@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""通用 DXF 工程图 → SolidWorks 原生特征模型转换器 v0.6.21
+"""通用 DXF 工程图 → SolidWorks 原生特征模型转换器 v0.6.22
 
 与 dxf_to_3d_general.py 的关系:
   - 复用其 CSG 重建结果（精确实体 combined，体积误差 ~1%）
@@ -962,7 +962,7 @@ def _from_model(dxf_path: str, output_sldprt: str) -> int:
     from src.rebuild import pipeline
 
     print("=" * 60)
-    print("DXF → SW 特征模型（新框架路径 --from-model）v0.6.21")
+    print("DXF → SW 特征模型（新框架路径 --from-model）v0.6.22")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  输出: {output_sldprt}（实际文件名带时间戳，避免覆盖 SW 已占用的文件）")
@@ -1029,7 +1029,7 @@ def main():
         sys.exit(_from_model(dxf_path, output_sldprt))
 
     print("=" * 60)
-    print("通用 DXF → SW 原生特征模型转换器 v0.6.21")
+    print("通用 DXF → SW 原生特征模型转换器 v0.6.22")
     print("=" * 60)
     print(f"  输入: {dxf_path}")
     print(f"  输出: {output_sldprt}")
