@@ -86,7 +86,7 @@ python main.py
 
 ## 开发路线图
 
-当前版本 **v0.6.23**（详细进度以 `CLAUDE.md` 和 git log 为准）：
+当前版本 **v0.6.24**（详细进度以 `CLAUDE.md` 和 git log 为准）：
 
 - [x] v0.1.0 — 项目脚手架（目录结构、GUI 骨架）
 - [x] v0.2.0~v0.5.9 — SolidWorks COM 自动化、DXF→SW 全流程建模、
