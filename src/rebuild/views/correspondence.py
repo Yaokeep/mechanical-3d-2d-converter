@@ -73,6 +73,11 @@ from ..model.questions import OpenQuestion, Question, QuestionList
 #: 对不上通常是差几毫米 —— 这个容差卡在中间，避免把噪声配对、
 #: 又不至于漏掉出图误差级的真实对应。
 MATCH_TOL = 0.6
+#: 重合图元合并容差（mm）：同一条圆边被重复画时半径逐位相等，只须防浮点
+#: 噪声。必须远小于优先数特征差（≥0.5）——曾用 MATCH_TOL=0.6 把 PF60K
+#: 同圆心的 r8（φ16 沉孔）与 r8.5（φ17 凸台）并成一组取 8.5，r8 圆柱 hint
+#: 永不出现 → 沉孔带漏切 +1,005.3（v0.6.25 实测根因，见 CHANGELOG）。
+DUP_TOL = 0.05
 #: 视图间共享轴的取值一致性容差（比 MATCH_TOL 松：视图间可能有出图偏差）
 AGREE_TOL = 1.0
 
@@ -1259,7 +1264,7 @@ def cylinders_from_circles(d: Drawing, frames: dict[str, ViewFrame],
             # **半径不同**的才是"多条同心圆边"，各报一条（见 docstring）
             uniq: list[list[tuple[EvidenceRef, Point2, float]]] = []
             for item in group:
-                if uniq and abs(uniq[-1][-1][2] - item[2]) <= MATCH_TOL:
+                if uniq and abs(uniq[-1][-1][2] - item[2]) <= DUP_TOL:
                     uniq[-1].append(item)
                 else:
                     uniq.append([item])

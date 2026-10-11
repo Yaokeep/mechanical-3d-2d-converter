@@ -1369,6 +1369,15 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
             f.id = FeatureId(next_id)
             part.add(f)
             next_id += 1
+        if rv.cone is not None:
+            # 锥化过渡区：独立锥台 REVOLVE（材料）+ 4 个 POCKET 帽切 +
+            # 内腔补偿切（HOLE/环带 POCKET——锥台实心盘填掉的内腔切回）。
+            # 与键槽同纪律——都紧跟基体进树，布尔序由 LAYER 保证
+            # （REVOLVE=0 < POCKET=3 = HOLE=3；帽切与补偿切无空间交集）
+            for f in [rv.cone.cone] + rv.cone.caps + rv.cone.restores:
+                f.id = FeatureId(next_id)
+                part.add(f)
+                next_id += 1
         skip = rv.skip_outline          # 跳过**全部** Rset 同心圆（不只最外）
         rep.notes.append(
             f"附着：方料 {len(rv.solids)} 块、键槽 {'有' if rv.pocket else '无'}"

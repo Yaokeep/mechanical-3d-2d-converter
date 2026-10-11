@@ -29,8 +29,9 @@
 
 ## 不建的东西（如实记账，别顺手"修"）
 
-- **锥化过渡区**：母线在锥区取端点半径的平台近似（R40→R30 的过渡
-  不建，缺体积记进 note）——图纸只给了两端半径与出图微段链。
+- **主母线锥区**：母线在锥区仍取端点半径的平台近似（R40→R30 过渡
+  不并入母线）；锥台本身 v0.6.25 起由 ``_cone_zone`` 独立建（锥台
+  REVOLVE + 4 帽切 + 内腔补偿切），不再只是记账。
 - **镜像/朝向**：回转体绕轴镜像几何不变；键槽朝向由侧视图的**带符号**
   读数直接给出（不依赖 mirror 语义）。
 """
@@ -43,7 +44,7 @@ from typing import TYPE_CHECKING, Callable
 from ..model.claim import Claim, Tier
 from ..model.feature_tree import Feature, FeatureType
 from ..model.geom import Axis3, Point3, Vector3
-from ..model.geom2d import Line2, Point2, Profile2, ProfileSeg2
+from ..model.geom2d import Arc2, Line2, Point2, Profile2, ProfileSeg2
 from ..model.ids import FeatureId
 from ..model.questions import OpenQuestion, Question
 from ..views.correspondence import CorrespondenceResult, CylinderHint
@@ -95,6 +96,28 @@ class AxLine:
 
 
 @dataclass
+class ConeZone:
+    """锥化过渡区（``detect_revolve`` 的独立 pass 产物）。
+
+    基体母线建到方料顶面后由 ``r_hi`` 锥收到 ``r_top`` 的圆锥台，被方料的
+    四个平面削平（截面 = 方 ∩ r(z) 圆）。精确建模 = 独立锥台 REVOLVE +
+    4 个 POCKET 帽切除 + 内腔补偿切——全复用现有词汇，两个发射器零改动
+    （v0.6.25，PF60K 锥区欠料 −852.5 由此归零）。
+    """
+
+    t0: float
+    t1: float
+    r_hi: float
+    r_top: float
+    cone: Feature
+    caps: list[Feature]
+    #: 内腔补偿切（HOLE / 环带 POCKET）：REVOLVE 发射器闭合到轴 ⇒ 锥台
+    #: 恒为 r≤r(z) 实心盘，会把基体锥带的内腔填实，须按主母线内壁切回
+    restores: list[Feature]
+    evidence: tuple
+
+
+@dataclass
 class RevolvePlan:
     """``detect_revolve`` 的产出：基体 + 附属体 + 消解 ``attach_revolve`` 的材料。"""
 
@@ -103,6 +126,8 @@ class RevolvePlan:
     solids: list[Feature] = field(default_factory=list)
     #: 键槽（POCKET）
     pocket: Feature | None = None
+    #: 锥化过渡区（独立锥台 REVOLVE + 帽切 POCKET，证据不足为 None）
+    cone: ConeZone | None = None
     #: 名义同心圆半径表
     rset: tuple[float, ...] = ()
     #: 回转轴（model 系）
@@ -199,8 +224,11 @@ def _radial(p: Point3, ax_pt: Point3, dir_name: str) -> float:
 # ---------------------------------------------------------------------------
 
 def _axial_lines(d: Drawing, frame, dir_name: str,
-                 ax_pt: Point3) -> list[AxLine]:
+                 ax_pt: Point3, slant: bool = False) -> list[AxLine]:
     """一个视图里全部**轴向**（平行于回转轴）线段（model 坐标）。
+
+    ``slant=True`` 时反过来收 **drift 超限的斜线**（锥母线候选）——主扫描
+    丢弃的线，锥段 pass 单独要它（两端径向读数由调用方自算）。
 
     ``r`` 取视图平面内垂直于轴的分量（``to_model`` 对"视图看不出的那一维"
     填的是占位 0，拿它进 hypot 会得到 ~193 的伪距离——2026-10-09 实测）。
@@ -230,7 +258,10 @@ def _axial_lines(d: Drawing, frame, dir_name: str,
             drift = math.hypot(p1.y - p0.y, p1.z - p0.z)
         else:
             drift = math.hypot(p1.x - p0.x, p1.z - p0.z)
-        if drift > AXIAL_DRIFT:                       # 斜线（锥区微段等）
+        if slant:
+            if drift <= AXIAL_DRIFT:
+                continue                              # 只收斜线
+        elif drift > AXIAL_DRIFT:                     # 斜线（锥区微段等）
             continue
         r0 = {"x": p0.x, "y": p0.y, "z": p0.z}[rad_axis]
         r1 = {"x": p1.x, "y": p1.y, "z": p1.z}[rad_axis]
@@ -462,6 +493,7 @@ def detect_revolve(d: Drawing, corr: CorrespondenceResult,
         f"{', '.join(f'{r:g}' for r in rset)}）⇒ 按**回转体**读")
     _square(d, corr, plan, rep, dir_name)
     _keyway(plan, rep)
+    _cone_zone(d, corr, plan, rep, dir_name)
     return plan
 
 
@@ -714,6 +746,301 @@ def _keyway(plan: RevolvePlan, rep: RecognizeReport) -> None:
         f"键槽：宽 {2 * w_half:g}（半宽读数 {w_half:g}）、槽底 r{r_bot:g}"
         f"（朝 {'+y' if sgn > 0 else '−y'}）、z {z0:.2f}..{z1:.2f}"
         f" ⇒ POCKET 深 {z1 - z0:g}")
+
+
+def _coaxial_arc_radii(d: Drawing, corr: CorrespondenceResult,
+                       plan: RevolvePlan, dir_name: str
+                       ) -> tuple[float, tuple] | None:
+    """沿轴看的视图里、圆心与回转轴同轴的**弧**的半径（锥底圆证据）。
+
+    锥底圆常只以弧存在——PF60K r40 弧 8+16 段共 114.9°，够不上
+    ``correspondence._circles_of`` 的 170° 圆边门。取**大于主母线最大外径**
+    的最大弧半径簇（防把 r30 圆碎片当锥底）。
+    """
+    ax = plan.axis
+    c0 = ax.origin
+    radii: list[float] = []
+    handles: list[str] = []
+    for f in corr.frames.values():
+        if f.p_axis != dir_name:
+            continue
+        view = next((v for v in d.views if v.id == f.view_id), None)
+        if view is None:
+            continue
+        for h in view.evidence:
+            e = d.by_handle(h)
+            if e is None or not isinstance(e.geom, Arc2):
+                continue
+            g = e.geom
+            m = f.to_model(g.center.x, g.center.y)
+            if math.hypot(m.x - c0.x, m.y - c0.y) > AXIS_POS_TOL:
+                continue
+            if (g.end_angle - g.start_angle) % (2 * math.pi) < math.radians(1.0):
+                continue                              # 防退化弧（PF60K r40 弧每段仅 3.6°）
+            radii.append(g.radius)
+            handles.append(h)
+    if not radii:
+        return None
+    prof = plan.base.params["radius_profile"].value
+    outer_max = max((float(r) for _t, r in prof), default=0.0)
+    big = [r for r in radii if r > outer_max + 5.0]
+    if not big:
+        return None
+    r_hi = float(max(big))
+    ev = tuple(dict.fromkeys(h for h, r in zip(handles, radii)
+                             if abs(r - r_hi) <= RADIUS_TOL))
+    return r_hi, ev
+
+
+def _cone_zone(d: Drawing, corr: CorrespondenceResult, plan: RevolvePlan,
+               rep: RecognizeReport, dir_name: str) -> None:
+    """锥化过渡区：母线建到方料顶面后 r_hi→r_top 的锥台，被方料四平面削平。
+
+    判据全保守（任一步证据不足即不建，行为=现状）：
+    ① 沿轴看视图有圆心同轴的弧，半径 > 主母线最大外径 → r_hi；
+    ② 剖面视图有**成对镜像**的斜线（drift 超限被主扫描丢弃者），低端径向
+       读数落 r_hi、高端读数 r_top 与主母线锥顶外径一致（RADIUS_TOL 内）；
+    ③ 斜线低端 t 与方料顶面（square_spans 最高顶）共面（≤0.05）、
+       t1−t0 ≥ 0.5、r_hi−r_top ≥ 5。
+
+    建模（B4 方案，全复用现有词汇、发射器零改动）：
+    锥台 REVOLVE ``[(t0,0),(t0,r_hi),(t1,r_top)]`` + 4 个轴对齐 POCKET 帽切。
+    帽盒 [r_top, r_hi+0.1]×[−w,w]，w=√(r_hi²−r_top²)+0.1——中边帽
+    |y|≤√(r_hi²−r_top²) 全含，盒内基准材料（方∩锥∩{x≥30}）为空 ⇒ 多切为零。
+    """
+    if not plan.square_spans or plan.axis is None:
+        return
+    found = _coaxial_arc_radii(d, corr, plan, dir_name)
+    if found is None:
+        return
+    r_hi, ev_arc = found
+    ax = plan.axis
+    c_ax = {"x": ax.origin.x, "y": ax.origin.y, "z": ax.origin.z}
+    prof = plan.base.params["radius_profile"].value
+    tops = [b for _a, b in plan.square_spans]
+
+    def outer_at(t: float) -> float:
+        """主母线在轴向坐标 t 处的外径：找覆盖 t 的竖边/点取最大半径。
+
+        锥顶 t1 往往落在平台竖边**内部**（PF60K 主母线 r30 是 (2,30)→(95,30)
+        一整条），点列本身在 t1 处没有点，按点列搜索会扑空。
+        """
+        best = 0.0
+        for (ta, ra), (tb, rb) in zip(prof, prof[1:]):
+            if min(ta, tb) - 0.01 <= t <= max(ta, tb) + 0.01:
+                best = max(best, float(ra), float(rb))
+        return best
+
+    # 斜线收集：剖面视图里的 drift 超限线，两端径向读数（rad_axis 分量到轴距）
+    cand: list[tuple[AxLine, float]] = []
+    for f in corr.frames.values():
+        if f.p_axis == dir_name or dir_name not in (f.u_axis, f.v_axis):
+            continue
+        for ln in _axial_lines(d, f, dir_name, ax.origin, slant=True):
+            c0v = {"x": ln.p0.x, "y": ln.p0.y, "z": ln.p0.z}[dir_name]
+            c1v = {"x": ln.p1.x, "y": ln.p1.y, "z": ln.p1.z}[dir_name]
+            p_lo = ln.p0 if c0v <= c1v else ln.p1
+            p_hi = ln.p1 if c0v <= c1v else ln.p0
+            r_lo = abs({"x": p_lo.x, "y": p_lo.y, "z": p_lo.z}[ln.rad_axis]
+                       - c_ax[ln.rad_axis])
+            r_top = abs({"x": p_hi.x, "y": p_hi.y, "z": p_hi.z}[ln.rad_axis]
+                        - c_ax[ln.rad_axis])
+            if abs(r_lo - r_hi) > RADIUS_TOL:
+                continue                              # 低端必须落锥底名义半径
+            if r_hi - r_top < 5.0:
+                continue
+            if not any(abs(ln.t0 - b) <= 0.05 for b in tops):
+                continue                              # 锥底与某方料段顶共面
+            if abs(outer_at(ln.t1) - r_top) > RADIUS_TOL:
+                continue                              # 锥顶须续上主母线外径
+            cand.append((ln, r_top))
+    if not cand:
+        return
+    # 镜像成对：同签名（t 区间 + 锥顶半径）≥2 条、径向分量中点分布在轴两侧
+    by_sig: dict[tuple, list[tuple[AxLine, float, float]]] = {}
+    for ln, r_top in cand:
+        mid = ({"x": (ln.p0.x + ln.p1.x) / 2, "y": (ln.p0.y + ln.p1.y) / 2,
+                "z": (ln.p0.z + ln.p1.z) / 2}[ln.rad_axis]
+               - c_ax[ln.rad_axis])
+        sig = (round(ln.t0, 1), round(ln.t1, 1), round(r_top, 1))
+        by_sig.setdefault(sig, []).append((ln, mid, r_top))
+    pair = None
+    for sig, items in by_sig.items():
+        mids = [m for _ln, m, _r in items]
+        if len(items) >= 2 and min(mids) < -AXIS_POS_TOL \
+                and max(mids) > AXIS_POS_TOL:
+            pair = (sig, items)
+            break
+    if pair is None:
+        return
+    _sig, items = pair
+    # t0 取与斜线低端共面的方料段顶（与月牙顶面精确共面；斜线端差 0.0033）
+    t0 = min(tops, key=lambda b: abs(items[0][0].t0 - b))
+    t1 = sum(ln.t1 for ln, _m, _r in items) / len(items)
+    r_top = sum(r for _ln, _m, r in items) / len(items)
+    if t1 - t0 < 0.5:
+        return
+    ev = ev_arc + tuple(ln.handle for ln, _m, _r in items)
+    centre = Point3(c_ax["x"], c_ax["y"], c_ax["z"])
+    zdir = ax.direction
+    o_abs = ir_point(Point3(0.0, 0.0, 0.0), dir_name, centre.x, centre.y, 0.0)
+    cone = Feature(
+        id=FeatureId(-1),
+        type=Claim(FeatureType.REVOLVE, "revolve:cone_zone",
+                   Tier.PROJECTION, ev),
+        params={
+            "dir": mk_claim(dir_name, "revolve:cone_zone", Tier.PROJECTION, ev),
+            "angle_deg": mk_claim(360.0, "revolve:cone_zone",
+                                  Tier.PROJECTION, ev),
+            # 母线从轴起：发射器把母线闭合成环时"末点→轴上垂足→沿轴→
+            # 首点垂足"，首点 r>0 与 r=0 扫出的是**同一个**多边形
+            # （垂足段把 r≤首点半径全扫进来）⇒ REVOLVE 语义恒为 r≤r(z)
+            # 实心盘（实测 r_top 起环带体体积逐位不变，v0.6.25）。
+            # 锥台因此会把基体锥带内腔填实（PF60K π·234×1.763=+1,296.3
+            # 逐位对账），内腔由随后的 restores（HOLE + 环带 POCKET）切回。
+            "radius_profile": mk_claim([(t0, 0.0), (t0, r_hi), (t1, r_top)],
+                                       "revolve:cone_zone",
+                                       Tier.PROJECTION, ev),
+            "origin": mk_claim(o_abs, "revolve:cone_zone",
+                               Tier.PROJECTION, ev),
+        },
+        axis=Claim(Axis3(centre, zdir), "revolve:cone_zone",
+                   Tier.PROJECTION, ev),
+        placement=Claim(centre, "revolve:cone_zone", Tier.PROJECTION, ev),
+        source_view="", evidence=list(ev),
+    )
+    # 四帽：轴对齐盒（相对轴心），+0.1 余量防相切布尔
+    w = math.sqrt(r_hi * r_hi - r_top * r_top) + 0.1
+    rt, rh = r_top, r_hi + 0.1
+    boxes = [
+        [(rt, -w), (rh, -w), (rh, w), (rt, w)],        # +x 帽
+        [(-rh, -w), (-rt, -w), (-rt, w), (-rh, w)],    # −x 帽
+        [(-w, rt), (w, rt), (w, rh), (-w, rh)],        # +y 帽
+        [(-w, -rh), (w, -rh), (w, -rt), (-w, -rt)],    # −y 帽
+    ]
+    caps = [
+        Feature(
+            id=FeatureId(-1),
+            type=Claim(FeatureType.POCKET, "revolve:cone_cap",
+                       Tier.PROJECTION, ev),
+            params={
+                "profile": mk_claim(box, "revolve:cone_cap",
+                                    Tier.PROJECTION, ev),
+                "depth": mk_claim(t1 - t0, "revolve:cone_cap",
+                                  Tier.PROJECTION, ev),
+                "axial_at": mk_claim(t0, "revolve:cone_cap",
+                                     Tier.PROJECTION, ev),
+            },
+            axis=Claim(Axis3(centre, zdir), "revolve:cone_cap",
+                       Tier.PROJECTION, ev),
+            placement=Claim(centre, "revolve:cone_cap", Tier.PROJECTION, ev),
+            source_view="", evidence=list(ev),
+        )
+        for box in boxes
+    ]
+    # 内腔补偿切：REVOLVE 闭合到轴 ⇒ 锥台恒为 r≤r(z) 实心盘，会把基体
+    # 锥带的内腔填实（PF60K π·234×1.763=+1,296.3 逐位对账）——须按主母线
+    # 内壁把腔切回。walls = 主母线竖边（|Δr|≤RADIUS_TOL）的恒定半径，
+    # 同半径合并后**并集须覆盖整个 [t0,t1]**（半截竖边不采信）；升序后
+    # 环 [edges[j],edges[j+1]] 下方壁数 = j ⇒ j 偶为腔、j 奇为材料
+    # （锥台盘自带材料，腔须切）。PF60K：walls=[7,16,21,30] ⇒ 腔 =
+    # r≤7（HOLE）+ r∈[16,21]（C 形环带 POCKET）。
+    raw_walls: list[float] = []
+    for (ta, ra), (tb, rb) in zip(prof, prof[1:]):
+        if abs(ra - rb) > RADIUS_TOL or float(ra) <= 0.0:
+            continue
+        if min(ta, tb) > t1 + 0.05 or max(ta, tb) < t0 - 0.05:
+            continue                              # 竖边须与锥带相交
+        raw_walls.append(float(ra))
+    walls: list[float] = []
+    for r in sorted(raw_walls):
+        if not walls or abs(r - walls[-1]) > RADIUS_TOL:
+            walls.append(r)
+
+    def _covers(r: float) -> bool:
+        """同半径竖边段的 t 并集是否覆盖 [t0−0.05, t1+0.05]。"""
+        segs = sorted((min(ta, tb), max(ta, tb))
+                      for (ta, ra), (tb, rb) in zip(prof, prof[1:])
+                      if abs(ra - rb) <= RADIUS_TOL
+                      and abs(float(ra) - r) <= RADIUS_TOL)
+        cur = t0 - 0.05
+        for a, b in segs:
+            if a > cur + 1e-6:
+                return False
+            cur = max(cur, b)
+        return cur >= t1 + 0.05 - 1e-6
+
+    walls = [r for r in walls if _covers(r)]
+    restores: list[Feature] = []
+    edges = [0.0] + walls
+    for j in range(len(edges) - 1):
+        if j % 2 == 1:
+            continue                              # 奇环 = 材料，锥台盘自带
+        r_in, r_out = edges[j], edges[j + 1]
+        if r_in <= 0.0:
+            # 最内腔 = 圆孔：HOLE 自锥底 t0 朝 +轴向 钻 t1−t0（孔口契约）
+            restores.append(Feature(
+                id=FeatureId(-1),
+                type=Claim(FeatureType.HOLE, "revolve:cone_restore",
+                           Tier.PROJECTION, ev),
+                params={
+                    "radius": mk_claim(r_out, "revolve:cone_restore",
+                                       Tier.PROJECTION, ev),
+                    "depth": mk_claim(t1 - t0, "revolve:cone_restore",
+                                      Tier.PROJECTION, ev),
+                    "axial_at": mk_claim(t0, "revolve:cone_restore",
+                                         Tier.PROJECTION, ev),
+                },
+                axis=Claim(Axis3(centre, zdir), "revolve:cone_restore",
+                           Tier.PROJECTION, ev),
+                placement=Claim(centre, "revolve:cone_restore",
+                                Tier.PROJECTION, ev),
+                source_view="", evidence=list(ev),
+            ))
+        else:
+            # 环带腔：C 形单链 profile = 外圆 CCW 两半 + 径向缝 + 内圆
+            # CW 两半 + 回缝。缝零宽、落在切除区内，两发射器均支持
+            # Profile2 弧段（三点弧），无需改动
+            segs = [
+                ProfileSeg2("arc", Point2(r_out, 0.0), Point2(-r_out, 0.0),
+                            Point2(0.0, 0.0), r_out, True, 0.0, math.pi),
+                ProfileSeg2("arc", Point2(-r_out, 0.0), Point2(r_out, 0.0),
+                            Point2(0.0, 0.0), r_out, True, math.pi,
+                            2.0 * math.pi),
+                ProfileSeg2("line", Point2(r_out, 0.0), Point2(r_in, 0.0)),
+                ProfileSeg2("arc", Point2(r_in, 0.0), Point2(-r_in, 0.0),
+                            Point2(0.0, 0.0), r_in, False, 0.0, math.pi),
+                ProfileSeg2("arc", Point2(-r_in, 0.0), Point2(r_in, 0.0),
+                            Point2(0.0, 0.0), r_in, False, math.pi,
+                            2.0 * math.pi),
+                ProfileSeg2("line", Point2(r_in, 0.0), Point2(r_out, 0.0)),
+            ]
+            restores.append(Feature(
+                id=FeatureId(-1),
+                type=Claim(FeatureType.POCKET, "revolve:cone_restore",
+                           Tier.PROJECTION, ev),
+                params={
+                    "profile": mk_claim(Profile2(tuple(segs)),
+                                        "revolve:cone_restore",
+                                        Tier.PROJECTION, ev),
+                    "depth": mk_claim(t1 - t0, "revolve:cone_restore",
+                                      Tier.PROJECTION, ev),
+                    "axial_at": mk_claim(t0, "revolve:cone_restore",
+                                         Tier.PROJECTION, ev),
+                },
+                axis=Claim(Axis3(centre, zdir), "revolve:cone_restore",
+                           Tier.PROJECTION, ev),
+                placement=Claim(centre, "revolve:cone_restore",
+                                Tier.PROJECTION, ev),
+                source_view="", evidence=list(ev),
+            ))
+    plan.cone = ConeZone(t0=t0, t1=t1, r_hi=r_hi, r_top=r_top,
+                         cone=cone, caps=caps, restores=restores, evidence=ev)
+    rep.notes.append(
+        f"锥段：z{t0:.2f}..{t1:.2f} r{r_hi:g}→{r_top:g}（成对锥母线 + "
+        f"同轴弧，方料顶面 {t0:.3f}）⇒ 独立锥台 REVOLVE + {len(caps)} 个 "
+        f"POCKET 帽切 + {len(restores)} 个内腔补偿切"
+        + (f"（walls={[round(w, 2) for w in walls]}）" if restores else ""))
 
 
 # ---------------------------------------------------------------------------
