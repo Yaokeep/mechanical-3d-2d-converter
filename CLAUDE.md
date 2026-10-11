@@ -2,8 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-<!-- 最后同步：2026-10-11 @ v0.6.24（验证制度化收口发版；自 v0.6.23 起累计：
-     缺陷盒·点断言 + 阈值判红 + YZYX 三件套入库 + 例行检查 SOP，簿记见"版本号同步"节） -->
+<!-- 最后同步：2026-10-12 @ v0.6.25（PF60K 残余追平收口发版；自 v0.6.24 起累计：
+     PF60K 两表转绿（OCC 261,943.9 +0.0034% / SW 261,776.7）、SW 发射器三修
+     （推理捕捉/环带剥缝/整圆原生实体），簿记见"版本号同步"节） -->
 
 ## 项目概述
 
@@ -351,10 +352,10 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.24（git tag 为准；tag 落后 HEAD 见"版本号同步"节）。
+版本 v0.6.25（git tag 为准；tag 落后 HEAD 见"版本号同步"节）。
 代码内三处版本字符串（`app.py:15` / `main_window.py:28` / `main_window.py:535`）、
-README 与两个转换器脚本横幅已于 2026-10-11 统一 bump 至 v0.6.24。
-**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.24）——
+README 与两个转换器脚本横幅已于 2026-10-12 统一 bump 至 v0.6.25。
+**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.25）——
 本节只留仍在影响决策的部分。
 
 ### 当前精度断点
@@ -629,7 +630,7 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**（发版时全部要改，当前均为 `0.6.24`，已核对一致）:
+- **版本号同步**（发版时全部要改，当前均为 `0.6.25`，已核对一致）:
   `app.py:15` `APP_VERSION` / `main_window.py:28` `setWindowTitle` /
   `main_window.py:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
   + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
@@ -648,6 +649,12 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   全部字符串 + tag `v0.6.24` 打在收口提交上。v0.6.24 覆盖：`verify/box_probe.py`
   + 验收表 PROBES/阈值判红、yz_probe_mat/yz_hlr/yz_match/yz_accept 入库、
   CLAUDE.md SOP 节，selftest 367 项、9 绿逐位不变、破坏性证明四条判红路径）
+  （2026-10-12 收口：PF60K 残余追平（OCC 侧 DUP_TOL/锥台 REVOLVE）+ SW 发射器
+  三修入账并**发版 v0.6.25**——两提交（a99bb5e OCC 侧 + dd32a98 SW 侧/文档）
+  一次落定：bump 上述全部字符串 + tag `v0.6.25` 打在收口提交上。v0.6.25 覆盖：
+  correspondence `DUP_TOL=0.05`、revolve `_cone_zone`、sw_builder `no_snap`/
+  `_split_zero_width_slits`/`_full_circle_of`，OCC 表 9 绿 + SW 表 9 绿
+  （PF60K 261,943.9 / 261,776.7 两表转绿）、selftest 367 项）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。

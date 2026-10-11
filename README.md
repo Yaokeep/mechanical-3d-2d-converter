@@ -86,7 +86,7 @@ python main.py
 
 ## 开发路线图
 
-当前版本 **v0.6.24**（详细进度以 `CLAUDE.md` 和 git log 为准）：
+当前版本 **v0.6.25**（详细进度以 `CLAUDE.md` 和 git log 为准）：
 
 - [x] v0.1.0 — 项目脚手架（目录结构、GUI 骨架）
 - [x] v0.2.0~v0.5.9 — SolidWorks COM 自动化、DXF→SW 全流程建模、
@@ -169,6 +169,11 @@ python main.py
       阈值判红）；YZYX 无基准三件套入库（`yz_accept.py` 总入口，27 点
       材料探针 + 五视图投影评分基线判红）；CLAUDE.md 例行检查 SOP；
       自检 367 项、验收表 9 绿逐位不变、破坏性证明四条判红路径实测
+- [x] v0.6.25 — PF60K 残余追平（26 特征，OCC 261,943.9 = **+0.0034%**：
+      r8 沉孔漏切＝correspondence 同心圆合并容差收紧、锥区欠料＝锥台
+      REVOLVE + 4 帽切 + 内腔补偿切）；SW 发射器三修（切除草图关推理
+      捕捉 + 零宽缝环带剥缝/整圆原生实体），**SW 表 PF60K 转绿**——
+      两发射器口径差 +1,062 → −8（bracket 真圆路径连锁改善）
 - [ ] GUI 内 PythonOCC 集成 — `src/gui/view3d`、`projection`、
       `reconstruction` 模块骨架已就绪，待接入（核心算法已在根目录
       独立脚本 `dxf_to_3d_general.py` 等中完整实现）
