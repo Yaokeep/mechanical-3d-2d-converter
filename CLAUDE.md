@@ -586,9 +586,9 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   bump 上述全部字符串 + tag 打在收口提交上（2026-10-02 曾"先提交、后收口"致
   tag 落后 HEAD 16 个提交；v0.6.21/v0.6.22 收口已各清一次账，覆盖范围见
   docs/CHANGELOG.md 顶部两节）。
-  当前待收口：tag 落后 HEAD 4 个提交（`v0.6.22-4-g4e948b9` = 8fa7e8b
-  「HLR 重合消影推理」+ 2026-10-11 三个收口提交——CLAUDE.md 瘦身 /
-  产物刷新 / 自评文档更新，内容均已入正文或 docs/）。
+  （2026-10-11 复核：tag 落后 HEAD 4 个提交——`v0.6.22-4-g4e948b9` =
+  8fa7e8b「HLR 重合消影推理」+ 当日三个收口提交 CLAUDE.md 瘦身 / 产物刷新 /
+  自评文档更新 / 簿记校正；内容均已入正文或 docs/，待下次发版收口）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。
