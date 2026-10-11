@@ -2,8 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-<!-- 最后同步：2026-10-11 @ v0.6.22-1-g8fa7e8b（中等瘦身：历史叙事压缩为指针，
-     操作事实全保留；HEAD 领先 tag 1 个提交，簿记见"版本号同步"节） -->
+<!-- 最后同步：2026-10-11 @ v0.6.23（约定沉淀收口发版；自 v0.6.22-1-g8fa7e8b
+     中等瘦身后累计：约定层三条新规则 + MTEXT 字体码修复，簿记见"版本号同步"节） -->
 
 ## 项目概述
 
@@ -325,10 +325,10 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.22（git tag 为准；tag 落后 HEAD 1 个提交，见下方"版本号同步"节）。
+版本 v0.6.23（git tag 为准；tag 落后 HEAD 见"版本号同步"节）。
 代码内三处版本字符串（`app.py:15` / `main_window.py:28` / `main_window.py:535`）、
-README 与两个转换器脚本横幅已于 2026-10-10 统一 bump 至 v0.6.22。
-**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.22）——
+README 与两个转换器脚本横幅已于 2026-10-11 统一 bump 至 v0.6.23。
+**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.23）——
 本节只留仍在影响决策的部分。
 
 ### 当前精度断点
@@ -582,7 +582,7 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**（发版时全部要改，当前均为 `0.6.22`，已核对一致）:
+- **版本号同步**（发版时全部要改，当前均为 `0.6.23`，已核对一致）:
   `app.py:15` `APP_VERSION` / `main_window.py:28` `setWindowTitle` /
   `main_window.py:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
   + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
@@ -590,10 +590,12 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   惯例：内容入正文即可按 `v0.6.x:` 前缀提交，tag 簿记待下次发版收口；发版 =
   bump 上述全部字符串 + tag 打在收口提交上（2026-10-02 曾"先提交、后收口"致
   tag 落后 HEAD 16 个提交；v0.6.21/v0.6.22 收口已各清一次账，覆盖范围见
-  docs/CHANGELOG.md 顶部两节）。
-  （2026-10-11 复核：tag 落后 HEAD 4 个提交——`v0.6.22-4-g4e948b9` =
-  8fa7e8b「HLR 重合消影推理」+ 当日三个收口提交 CLAUDE.md 瘦身 / 产物刷新 /
-  自评文档更新 / 簿记校正；内容均已入正文或 docs/，待下次发版收口）
+  docs/CHANGELOG.md 顶部三节）。
+  （2026-10-11 收口：约定沉淀（局部剖几何推断/细实线/DIMENSION 锚点）入账并
+  **发版 v0.6.23**——v0.6.22 tag 之后的 5 个提交（8fa7e8b 消影推理 + 三个
+  收口提交 + 255e8e8 约定沉淀）一次落定：bump 上述全部字符串 + tag `v0.6.23`
+  打在收口提交上。v0.6.23 覆盖：YZYX 手工读图三约定前移进 conventions/
+  （10 条规则）+ MTEXT 字体规格码清洗修复，selftest 367 项、9 绿逐位不变）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。

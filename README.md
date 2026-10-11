@@ -86,7 +86,7 @@ python main.py
 
 ## 开发路线图
 
-当前版本 **v0.6.22**（详细进度以 `CLAUDE.md` 和 git log 为准）：
+当前版本 **v0.6.23**（详细进度以 `CLAUDE.md` 和 git log 为准）：
 
 - [x] v0.1.0 — 项目脚手架（目录结构、GUI 骨架）
 - [x] v0.2.0~v0.5.9 — SolidWorks COM 自动化、DXF→SW 全流程建模、
@@ -161,6 +161,9 @@ python main.py
 - [x] v0.6.22 — 新框架 `src/rebuild/` 阶段 7：高度分解 + 圆角/侧通道 +
       帧镜像裁决（bracket 三视图 +48.7% → **−0.01%**、剖面图 +84.1% →
       **+0.11%**）；验收表 **9 绿**（结构缺口清零），自检 331 项
+- [x] v0.6.23 — 约定沉淀进 `conventions/`：YZYX 手工读图三约定前移
+      （局部剖几何推断「c 向」+剖面线覆盖比、细实线=被盖轮廓、DIMENSION
+      尺寸锚点），自检 367 项、验收表 9 绿逐位不变
 - [ ] GUI 内 PythonOCC 集成 — `src/gui/view3d`、`projection`、
       `reconstruction` 模块骨架已就绪，待接入（核心算法已在根目录
       独立脚本 `dxf_to_3d_general.py` 等中完整实现）
