@@ -26,7 +26,7 @@ from src.rebuild.evidence.dxf_reader import (                            # noqa:
     classify_role,
     read_dxf,
 )
-from src.rebuild.evidence.model import ViewType                          # noqa: E402
+from src.rebuild.evidence.model import Role, ViewType                    # noqa: E402
 from src.rebuild.evidence.text_parser import (                           # noqa: E402
     TextKind,
     find_projection,
@@ -207,6 +207,22 @@ def test_text_parser() -> None:
     check("空文字不炸", p("").kind == TextKind.PLAIN)
     check("无数字文字", p("技术要求").kind == TextKind.PLAIN)
 
+    # B8 「c 向」式剖面标题（YZYX C—C 实测形态：MTEXT 带字体规格码）
+    r = p("c   {\\Fromans,gbcbig|c134;向}")
+    check("带字体码的「c 向」洗成剖面标题",
+          r.kind == TextKind.SECTION_TITLE and r.cut is not None
+          and r.cut.label == "C" and not r.cut.kind, str(r))
+    check("「c 向」没有切平面位置（is_located=False，对应层须优雅跳过）",
+          r.cut is not None and not r.cut.is_located)
+    check("纯文本「c 向」同样成标题",
+          p("c 向").kind == TextKind.SECTION_TITLE)
+    check("「c 向剖视」也行",
+          p("c 向剖视").kind == TextKind.SECTION_TITLE)
+    check("「x 方向」不是剖面标题（锚定结尾，防误吃描述文字）",
+          p("x 方向").kind != TextKind.SECTION_TITLE)
+    check("「按 C 向视图旋转」也不是（不锚定整串）",
+          p("按 C 向视图旋转").kind != TextKind.SECTION_TITLE)
+
 
 # ============ C. 读取器在真实靶子上 ============
 
@@ -285,6 +301,17 @@ def test_reader() -> None:
           dim_role.value.value == "unknown"
           and dim_role.method == "convention:dim_layer",
           f"{dim_role.value.value} / {dim_role.method}")
+
+    # ---- C12 细实线 / ISO 虚线 / 剖面线画成 LINE 的角色判定（YZYX 实测画法） ----
+    check("细实线层 ⇒ THIN（被盖轮廓，不是开口）",
+          classify_role("细实线", "", "TEST").value.value == "thin",
+          str(classify_role("细实线", "", "TEST").value))
+    check("AM_ISO02W050 线型 ⇒ HIDDEN（ISO 虚线覆盖）",
+          classify_role("粗实线", "AM_ISO02W050", "TEST").value.value == "hidden")
+    check("细实线层 + 虚线 ⇒ HIDDEN（被盖语义优先于细线语义）",
+          classify_role("细实线", "AM_ISO02W050", "TEST").value.value == "hidden")
+    check("剖面线层 LINE ⇒ HATCH_LINES（旧式画法填充）",
+          classify_role("剖面线", "", "TEST").value.value == "hatch_lines")
 
 
 # ============ D. 视图分离与定性 ============
@@ -683,6 +710,8 @@ _BLOCK = ROOT / "CAD" / "test_simple" / "block_3view.dxf"
 _PF60K = ROOT / "CAD" / "temp_output" / "pf60k_闭环_三视图_20260817.dxf"
 #: 自检自给的断裂视图夹具（不能依赖入库产物：一次性夹具按约定不入库）
 _FIXTURE_BREAK = ROOT / "CAD" / "temp_output" / "_selftest_break.dxf"
+#: 自检自给的局部剖夹具（同上）
+_FIXTURE_PARTIAL = ROOT / "CAD" / "temp_output" / "_selftest_partial.dxf"
 
 
 def _write_break_fixture(out: Path) -> Path:
@@ -722,6 +751,50 @@ def _write_break_fixture(out: Path) -> Path:
     return out
 
 
+def _write_partial_fixture(out: Path) -> Path:
+    """造一张**局部剖**图纸（YZYX C—C 画法的三个信号各一个正例）：
+
+    - 剖视图标题写作「c 向」——没写剖切种类，必须靠剖面线覆盖范围几何推断
+    - 剖面线画成 ``剖面线`` 图层的 LINE（旧式画法，无 HATCH 实体）且**只盖左半**
+    - 一条 ``细实线`` 层线（被盖住的槽底轮廓）
+    - 两条线性尺寸标注：图上明标 20 / 3，defpoint 精确落在几何端点上
+    """
+    import ezdxf
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc = ezdxf.new("R2010")
+    for name in ("轮廓线", "剖面线", "细实线", "标注"):
+        doc.layers.add(name)
+    msp = doc.modelspace()
+
+    # 剖视图外框 80×60 + 内部竖线 x=20（左半结构的边界，也是尺寸锚点）
+    msp.add_lwpolyline([(0, 0), (80, 0), (80, 60), (0, 60), (0, 0)],
+                       dxfattribs={"layer": "轮廓线"})
+    msp.add_line((20, 0), (20, 60), dxfattribs={"layer": "轮廓线"})
+    # 细实线：被盖住的轮廓（槽底），在右半区域
+    msp.add_line((60, 20), (70, 20), dxfattribs={"layer": "细实线"})
+    # 剖面线：只盖左半 x 0..20（+45° 短线，全在图框内）。
+    # ⚠️ 跨度有意收在 y 5..55：并集高 50/60 ≈ 0.83，与宽 10/80 ≈ 0.13
+    # 都 <0.9 —— 覆盖比几何推断必须判 local（盖到 y=60 会误判 full）
+    for y in (5, 15, 25, 35, 45):
+        msp.add_line((0, y), (10, y + 10), dxfattribs={"layer": "剖面线"})
+    # 两条线性尺寸（defpoints 落在几何端点上：竖线两端 / 底边左段）
+    dimstyle = doc.dimstyles.add("EZDXF")
+    msp.add_linear_dim(base=(0, -8), p1=(0, 0), p2=(20, 0),
+                       dimstyle=dimstyle.dxf.name,
+                       dxfattribs={"layer": "标注"})
+    # angle=90：竖尺寸必须写角度 —— ezdxf 按角度投影算实测值，
+    # 不写会拿水平方向去量 (20,0)→(20,3)，get_measurement 得 0
+    msp.add_linear_dim(base=(30, 0), p1=(20, 0), p2=(20, 3), angle=90,
+                       dimstyle=dimstyle.dxf.name,
+                       dxfattribs={"layer": "标注"})
+    # 「c 向」剖面标题（无剖切种类词 —— 几何推断的入口）
+    msp.add_text("c 向", dxfattribs={"layer": "标注", "height": 5}
+                 ).set_placement((40, -14))
+    doc.saveas(out)
+    return out
+
+
 def _prepared(path: Path):
     """读 → 分离 → 定性（约定层与对应层的共同前置）。"""
     d = read_dxf(path)
@@ -735,7 +808,7 @@ def test_conventions() -> None:
 
     # ---- G1 每条规则**独立**可跑（阶段 2 验收原文："每条规则有独立测试"） ----
     names = REG.registered()
-    check("注册表里 8 条规则", len(names) == 8, str(names))
+    check("注册表里 10 条规则", len(names) == 10, str(names))
     d = _prepared(_SEC_DWG)
     per: dict[str, Conventions] = {
         n: run_rules(RuleCtx(d=d), only=[n]) for n in names}
@@ -881,6 +954,66 @@ def test_conventions() -> None:
           not conv.of_kind(ConvKind.SYMMETRY))
     check("无剖面的三视图不产生材料/虚线结论",
           not c3.of_kind(ConvKind.MATERIAL) and not c3.of_kind(ConvKind.HIDDEN))
+
+    # ---- G11 局部剖三信号（YZYX C—C 手工读图三轮经验的前移版） ----
+    # 「c 向」标题 + LINE 画法剖面线（只盖左半）+ 细实线 + 两条尺寸标注
+    from src.rebuild.evidence.text_parser import CutSpec
+    d3 = _prepared(_write_partial_fixture(_FIXTURE_PARTIAL))
+    cv3 = run_rules(RuleCtx(d=d3))
+    check("夹具分离出 1 个视图", len(d3.views) == 1, str(len(d3.views)))
+    v3 = d3.views[0]
+    check("「c 向」标题 ⇒ 视图定性 SECTION",
+          v3.resolved_type == ViewType.SECTION, str(v3.resolved_type))
+    check("CutSpec：标签归一 C、剖切种类留空（几何推断入口）",
+          isinstance(v3.cut, CutSpec) and v3.cut.label == "C"
+          and not v3.cut.kind, str(v3.cut))
+    scs3 = cv3.of_kind(ConvKind.SECTION)
+    check("标题没写种类 ⇒ 剖面线覆盖比几何推断为 local",
+          len(scs3) == 1 and scs3[0].value.scope == "local",
+          str([(c.view, c.value.scope) for c in scs3]))
+    check("local ⇒ 不可作截面棱柱（防整幅裁真材料）",
+          bool(scs3) and scs3[0].value.usable_as_prism is False)
+    check("几何推断的剖切种类是 GUESS 级（图上没明写）",
+          bool(scs3) and scs3[0].tier is Tier.GUESS)
+    check("报出「不得整幅裁材料」待确认项",
+          bool(cv3.questions.by_kind(OpenQuestion.AMBIGUOUS_FEATURE)))
+    # 护栏：无切平面的 CutSpec（「c 向」没写位置）过全链不崩 ——
+    # 对应层必须优雅跳过（correspondence.py 的 is_located 守卫）
+    check("无切平面的剖视图过 understand 全链不崩",
+          isinstance(understand(str(_FIXTURE_PARTIAL)), tuple))
+    mat3 = cv3.of_kind(ConvKind.MATERIAL)
+    check("剖面线画成 LINE 也读成材料信号（5 条聚 1 区）",
+          len(mat3) == 1 and mat3[0].value.count == 5
+          and len(mat3[0].value.zones) == 1,
+          str([(c.value.count, len(c.value.zones)) for c in mat3]))
+    check("LINE 画法的图案记为 lines",
+          bool(mat3) and mat3[0].value.pattern == "lines")
+    th3 = cv3.of_kind(ConvKind.THIN)
+    thin_edge = next((e for e in d3.evidence
+                      if e.role.value == Role.THIN.value), None)
+    check("细实线 1 条、证据 handle 对",
+          len(th3) == 1 and th3[0].value.count == 1 and thin_edge is not None
+          and th3[0].evidence == (thin_edge.handle,),
+          str([(c.view, c.value.count) for c in th3]))
+    dims3 = cv3.of_kind(ConvKind.DIMENSION)
+    check("两条尺寸各产一条结论", len(dims3) == 2, str(len(dims3)))
+    check("尺寸值 20 / 3 逐位读出",
+          sorted(c.value.value for c in dims3) == [3.0, 20.0],
+          str([c.value.value for c in dims3]))
+    check("两条尺寸都锚到几何（defpoint ↔ 端点配对）",
+          bool(dims3) and all(c.value.anchors for c in dims3),
+          str([(c.value.value, len(c.value.anchors)) for c in dims3]))
+    check("尺寸是 ANNOTATED 级（图上明标）",
+          bool(dims3) and all(c.tier is Tier.ANNOTATED for c in dims3))
+    # 反向对照：bracket 剖面图里没有细实线/尺寸（新规则不能凭空产出结论），
+    # 且它标题明写种类的全剖**不因几何推断路径的存在而降级**
+    check("bracket 剖面图反向对照：无细实线/尺寸结论",
+          not per["linetype.thin"].of_kind(ConvKind.THIN)
+          and not per["dimension.anchors"].of_kind(ConvKind.DIMENSION))
+    check("bracket 全剖不降级：三条都仍是 full 且 CONVENTION 级",
+          len(scs) == 3 and all(c.value.scope == "full"
+                                and c.tier is Tier.CONVENTION for c in scs),
+          str([(c.view, c.value.scope, c.tier.value) for c in scs]))
 
 
 # ---- 阶段 3：特征层 ----

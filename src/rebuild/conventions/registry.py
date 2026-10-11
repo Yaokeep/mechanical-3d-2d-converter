@@ -40,6 +40,8 @@ class ConvKind(StrEnum):
     BREAK = "断裂"           # 波浪线/断裂线 ⇒ 该视图沿某轴被缩短
     SECTION = "剖切"         # 全剖/半剖/局部… ⇒ 截面材料的适用范围
     MATERIAL = "被剖到"      # HATCH ⇒ 这块是材料（不是空洞）
+    THIN = "被盖轮廓"        # 细实线 ⇒ 轮廓被前面材料盖住（不是开口）
+    DIMENSION = "尺寸"       # DIMENSION 实体 ⇒ 数值 ↔ 几何锚点的配对证据
     FILLET = "圆角"          # 未注圆角 R2 ⇒ 图上画的尖角其实是圆的
 
 

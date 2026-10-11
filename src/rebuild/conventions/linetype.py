@@ -146,3 +146,50 @@ def hidden(ctx: RuleCtx) -> list[Convention]:
             evidence=tuple(refs),
         ))
     return out
+
+
+@dataclass(frozen=True)
+class ThinProfile:
+    """细实线概况（``ConvKind.THIN`` 的 value）。"""
+
+    count: int
+    bbox: BBox2 | None = None
+
+
+@register("linetype.thin")
+def thin(ctx: RuleCtx) -> list[Convention]:
+    """细实线 ⇒ 轮廓存在但被前面材料盖住（**不是开口**）。
+
+    YZYX C—C 的教训（#1 三轮才收敛）：槽底边/被顶壁盖住的轮廓画成
+    **细实线**，把它当可见轮廓 ⇒ 在盖住它的材料区多读出一个开口；
+    把它当虚线 ⇒ 又丢了"这条轮廓就在这个位置"的定位信号。它是第三条
+    路：轮廓真实存在、位置可信、但该方向被前面材料挡住。
+
+    消费链（自动生效）：轮廓环提取只认 ``Role.VISIBLE``
+    （views/ring.py ``_PROFILE_ROLES``），细实线天然不进轮廓环，
+    既不会撑出假开口、也不会凭空造边。
+    """
+    idx = by_handle_index(ctx.d)
+    out: list[Convention] = []
+    for v in ctx.d.views:
+        refs: list[EvidenceRef] = []
+        box: BBox2 | None = None
+        for h in v.evidence:
+            e = idx.get(h)
+            if e is None or e.role.value != Role.THIN:
+                continue
+            refs.append(e.handle)
+            bb = e.exact_bbox
+            box = bb if box is None else box.union(bb)
+        if not refs:
+            continue
+        tp = ThinProfile(count=len(refs), bbox=box)
+        out.append(Convention(
+            rule="linetype.thin", kind=ConvKind.THIN, view=v.id, value=tp,
+            claim=Claim(tp, "convention:linetype", Tier.CONVENTION,
+                        evidence=tuple(refs)),
+            note=f"{len(refs)} 条细实线 ⇒ 轮廓被前面材料盖住（不是开口）"
+                 "——不参与可见轮廓环，位置信号保留",
+            evidence=tuple(refs),
+        ))
+    return out

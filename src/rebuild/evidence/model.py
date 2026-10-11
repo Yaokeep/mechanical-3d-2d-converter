@@ -47,6 +47,12 @@ class Role(StrEnum):
     HATCH_FILL = "hatch_fill"            # 剖面填充**本体**（无单一几何，只有 provenance）
     BREAK_LINE = "break_line"            # 波浪线 / 双折线：视图断裂
     SECTION_CUT = "section_cut"          # 剖切线（切平面所在位置的粗短线）
+    #: 细实线：轮廓存在但被前面材料盖住（YZYX C—C 的槽底边即此画法）。
+    #: **不是**开口、也**不是**可见轮廓 —— 环提取只认 VISIBLE，本角色天然被排除
+    THIN = "thin"
+    #: 剖面线画成 LINE 的旧式画法（YZYX C—C 无 HATCH 实体，剖面线是 24 条 +45° LINE）。
+    #: 语义同 HATCH_FILL：「这里是材料」，但几何是真的线（参与视图包围盒）
+    HATCH_LINES = "hatch_lines"
     UNKNOWN = "unknown"
 
 

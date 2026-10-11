@@ -11,6 +11,63 @@
 
 ---
 
+## 新框架 src/rebuild/（v0.6.23，约定沉淀：局部剖几何推断 + 细实线 + DIMENSION 尺寸锚点，2026-10-11）
+
+ASSESSMENT_20261006 §C1~C3（优先级①）落地：YZYX 齿箱上盖手工读图花三轮才收敛的
+三条读法，前移为约定层机器可用的规则。**约定层为主 + 轻量消费**——不新增识别器
+特征决策，消费链靠 `ring.py` `_PROFILE_ROLES = {Role.VISIBLE}` 自动生效
+（新角色天然被排除出轮廓环）。
+
+### 证据层
+
+- **`Role` 加两个成员**：`THIN`（细实线=轮廓被前面材料盖住，不是开口）与
+  `HATCH_LINES`（剖面线画成 LINE 的旧式画法，语义同 HATCH_FILL）。
+- **`classify_role`**：`_HIDDEN_WORDS` 追加 `"AM_ISO"`（YZYX 实体级线型覆盖
+  AM_ISO02W050）；新增 `_THIN_WORDS`（细实线层 → THIN，分支在 HIDDEN 之后——
+  细实线+虚线 ⇒ HIDDEN，被盖语义更强）；剖面线层 → HATCH_LINES（在 DIM 分支后，
+  kind 仍 EDGE、参与视图 bbox）。
+- **`strip_mtext_codes` 修一处真病**（探针在真实图纸上当场抓出）：MTEXT 字体
+  规格码 `\Fromans,gbcbig|c134;` 不在旧正则的 12 字符上限内，「c 向」标题
+  （YZYX 转换副本实测形态 `c   {\Fromans,gbcbig|c134;向}`）被当普通文字、
+  SECTION 定性走不到。新增 `\\[Ff][^;\\{}]*;` 前置清洗。
+- **`_DIRECTION_LABEL_RE`**：「X 向」式剖面标题 → SECTION_TITLE +
+  `CutSpec(label=字母, kind="")`——剖切种类留空，由约定层做几何推断。
+
+### 约定层（8 条 → 10 条规则）
+
+- **`section.material`**：除 Kind.HATCH 外统计 `Role.HATCH_LINES`（YZYX C—C
+  剖面线是 `剖面线` 层 24 条 +45° LINE，旧版只数 HATCH ⇒ 读 0）；`MaterialPatch`
+  加 `zones` 字段（cluster_boxes gap=15 分区）。
+- **`section.scope` 几何推断**：标题没写剖切种类（「c 向」）时从剖面线覆盖比
+  判适用范围——并集 bbox 宽 ÷ 视图宽（横向优先，防"全剖截面带空洞"误判局部），
+  ≥0.9 ⇒ full 可作棱柱、<0.9 ⇒ local 不可作棱柱 + AMBIGUOUS_FEATURE 疑问
+  （tier=GUESS）。标题明写种类时不动（bracket 三条全剖零影响）。
+- **`linetype.thin`**：细实线 ⇒ 轮廓真实存在、位置可信、但该方向被前面材料盖住
+  ——不是开口（不该多挖）、不是虚线（位置信号不能丢）。消费靠 `_PROFILE_ROLES`
+  自动排除。
+- **`dimension.py`（新模块）**：DIMENSION 实体 ⇒ 「数值 ↔ 几何锚点」配对。
+  linear/aligned 用 defpoint2/3、radius/diameter 用 defpoint(圆心)，容差 1.0mm。
+  值非 None ⇒ tier=ANNOTATED；锚不上**不报阻塞疑问**（"没锚上"≠"缺尺寸"，
+  blocking 语义不污染），只记 note。
+
+### 验证
+
+- **selftest 336 → 367 项全绿**：新增 B8（「c 向」含字体码形态 + 误报防线
+  「x 方向」）、C12（角色判定表）、G11（合成局部剖夹具全链：定性 SECTION →
+  scope 几何推断 local → 材料/细实线/尺寸三结论 + bracket 反向对照 +
+  无切平面 CutSpec 过 understand 不崩）。
+- **验收表 9 绿逐位不变**、无 [GAP]——词表/角色扩展对 9 靶子已实测零覆盖
+  （零 AM_ISO 线型、零细线/剖面线层几何实体）。
+- **YZYX 实测探针**（`CAD/temp_output/_probe_yz_conventions.py`，不入库）：
+  「c 向」标题（MTEXT 字体码形态）→ CutSpec(C, kind="") → 定性 section；
+  scope 几何推断 **local**（覆盖 52%）、usable=False；MATERIAL 36 条
+  pattern=lines（旧版读 0）；THIN 35 条；DIMENSION 52 条读出、45 锚上，
+  关键三条 20/3/120 逐位吻合（与 CLAUDE.md `_yz_*` 节 #1 定案证据一致）。
+  ⚠️ 覆盖比 52% 混入了视图未分离因素（YZYX 五视图连成 V0 一簇，本轮范围不重建
+  YZYX），"local"方向正确但数值不作为分区依据。
+
+---
+
 ## 新框架 src/rebuild/（v0.6.22，阶段 7：高度分解 + 圆角/侧通道 + 帧镜像裁决，2026-10-10）
 
 阶段 7 的目标是消灭最后一条 `[GAP]`：bracket 两条（**高度分解未做**——基体 =

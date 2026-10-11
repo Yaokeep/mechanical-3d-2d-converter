@@ -94,6 +94,11 @@ CUT_KINDS: tuple[str, ...] = (
 #: 注意**不锚定结尾** —— 这正是旧管线丢掉信息的地方
 _SECTION_LABEL_RE = re.compile(r"^\s*([A-Z])\s*[—–\-]\s*\1")
 
+#: 剖面视图标题的另一种写法：「c 向」（YZYX C—C 实测 —— 图框边放剖切标记
+#: 字母对，剖视图标题写「c 向」而不是「C—C」）。锚定结尾：只认整串恰好是
+#: 单字母+「向」的，防误吃「x 方向」这类描述文字
+_DIRECTION_LABEL_RE = re.compile(r"^\s*([A-Za-z])\s*向\s*(?:剖视|剖面)?\s*$")
+
 #: 名=值：x=121.89 / y=0.00 / z=-18.11
 #: 左边界必需 —— 否则 "max=5" 里的 x 会被捕成 ("x", 5.0)
 _KEY_VALUE_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z])\s*=\s*(-?\d+(?:\.\d+)?)")
@@ -224,7 +229,11 @@ def strip_mtext_codes(s: str) -> str:
     """
     if "\\" not in s and "{" not in s:
         return s
-    out = re.sub(r"\\[A-Za-z][^;\\{}]{0,12};", "", s)   # \T1.1; \A2; …
+    # 字体规格码（\fFontName|b…|c…;）—— 名字可含 |, 比 \T1.1; 这类短码长得多，
+    # 必须在短码正则**之前**洗：短码的 12 字符上限吃不下「\Fromans,gbcbig|c134;」
+    # （YZYX 转换副本「c 向」标题实测即此形态，不洗掉它整条标题判成普通文字）
+    out = re.sub(r"\\[Ff][^;\\{}]*;", "", s)
+    out = re.sub(r"\\[A-Za-z][^;\\{}]{0,12};", "", out)   # \T1.1; \A2; …
     out = re.sub(r"\\P", " ", out)
     out = out.replace("\\~", " ")
     out = out.replace("\\", "")
@@ -260,6 +269,15 @@ def parse_text(
         cut = _parse_cut(label, rest, raw)
         return ParsedText(handle, raw, x, y, layer,
                           TextKind.SECTION_TITLE, cut=cut, leftover=cut.raw)
+
+    # 2b) 「c 向」式剖面视图标题 —— 没有切平面描述，剖切种类留空，
+    #     由约定层（section.scope 几何检测）从剖面线覆盖范围判局部/全剖
+    m = _DIRECTION_LABEL_RE.match(t)
+    if m:
+        label = m.group(1).upper()
+        cut = CutSpec(label=label, kind="", raw=t)
+        return ParsedText(handle, raw, x, y, layer,
+                          TextKind.SECTION_TITLE, cut=cut, leftover="")
 
     # 3) 投影制标志（标题栏）—— 判错会让整个零件镜像，只认明写的符号
     proj = find_projection(t)

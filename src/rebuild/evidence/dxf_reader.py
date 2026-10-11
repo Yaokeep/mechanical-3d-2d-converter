@@ -24,11 +24,14 @@ from .text_parser import parse_text
 # 判据来自**图层名 / 线型名**（制图约定的命名习惯），故 tier=CONVENTION。
 
 _AXIS_WORDS = ("中心线", "中心", "轴线", "CENTER", "DASHDOT", "CTR")
-_HIDDEN_WORDS = ("隐藏", "虚线", "HIDDEN", "DASHED", "DASH")
+_HIDDEN_WORDS = ("隐藏", "虚线", "HIDDEN", "DASHED", "DASH",
+                 # ISO 虚线线型（实体级 linetype override 常见写法，YZYX 实测）：
+                 "AM_ISO")
 _HATCH_WORDS = ("剖面线", "填充", "HATCH", "SECTION_HATCH")
 _BREAK_WORDS = ("波浪", "断裂", "BREAK")
 _CUT_WORDS = ("剖切", "剖切线", "CUT")
 _DIM_WORDS = ("标注", "尺寸", "DIM", "DIMENSION")
+_THIN_WORDS = ("细实线", "细线")
 
 #: DIMENSION 的 dimtype 低 3 位 → 类型名
 _DIMTYPE_NAMES = {
@@ -54,6 +57,10 @@ def classify_role(layer: str, linetype: str, handle: EvidenceRef) -> Claim[Role]
 
     返回的是 **Claim（tier=CONVENTION）** 而非硬结论 —— 后续若从几何形状
     得到更强依据（如"这条线正在某个被 HATCH 的闭合环上"），可以覆盖它。
+
+    分支顺序即优先级：虚线覆盖（HIDDEN）在细实线层（THIN）之前 ——
+    「细实线 + 虚线」是"被顶壁盖住的槽轮廓"，被盖语义强于细线语义
+    （YZYX C—C 实测）。
     """
     ref = (handle,)
     if _match(_AXIS_WORDS, layer, linetype):
@@ -66,8 +73,17 @@ def classify_role(layer: str, linetype: str, handle: EvidenceRef) -> Claim[Role]
         # 尺寸线层上的几何是**标注的附属**（尺寸界线/箭头），不是零件轮廓：
         # 让它当可见轮廓会污染视图包围盒与轮廓环提取
         return Claim(Role.UNKNOWN, "convention:dim_layer", Tier.CONVENTION, ref)
+    if _match(_HATCH_WORDS, layer):
+        # 剖面线画成 LINE 的旧式画法（YZYX C—C：24 条 +45° 线，无 HATCH 实体）。
+        # 语义同剖面填充本体：「这些线覆盖的区域是材料」——
+        # 让它当可见轮廓会把剖面线当零件边提进轮廓环
+        return Claim(Role.HATCH_LINES, "convention:layer", Tier.CONVENTION, ref)
     if _match(_HIDDEN_WORDS, layer, linetype):
         return Claim(Role.HIDDEN, "convention:linetype", Tier.CONVENTION, ref)
+    if _match(_THIN_WORDS, layer):
+        # 细实线：轮廓存在但被前面材料盖住（不是开口、不是可见轮廓）。
+        # 环提取只认 VISIBLE，本角色天然被排除（views/ring.py _PROFILE_ROLES）
+        return Claim(Role.THIN, "convention:layer", Tier.CONVENTION, ref)
     return Claim(Role.VISIBLE, "default", Tier.GUESS, ref)
 
 

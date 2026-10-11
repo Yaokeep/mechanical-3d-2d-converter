@@ -443,7 +443,12 @@ ezdxf+numpy，**跑默认 python**；`verify/step_probe.py`（读 STEP 量尺寸
 `src/rebuild/` 现有：`model/`（Claim/geom/geom2d/ids/feature_tree/questions）、
 `evidence/`（dxf_reader/model + text_parser）、
 `views/`（view_detector + view_typer + correspondence 跨视图对应 + **ring 轮廓环仪器**）、
-`conventions/`、
+`conventions/`（**10 条规则**，2026-10-11 起：centerline 对称/阵列、
+linetype 断裂/虚线/**细实线**、section 剖切种类/材料、simplification 螺纹/圆角、
+**dimension 尺寸锚点**——YZYX 手工读图三约定已前移：局部剖几何推断
+（「c 向」标题 + 剖面线覆盖比 <0.9 ⇒ local）、细实线=被盖轮廓（Role.THIN，
+环提取只认 VISIBLE 自动排除）、DIMENSION「数值↔几何锚点」配对（tier=ANNOTATED），
+实测 YZYX C—C 定性 section/scope=local、52 条尺寸 45 锚上、20/3/120 逐位吻合）、
 `features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道**）、`verify/`（compare/coverage/
 gate/step_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
@@ -452,7 +457,7 @@ step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 336 项自检（2026-10-10 消影通道后实测；阶段 6 记的 333 里两条基体断言随高度分解合并），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 367 项自检（2026-10-11 约定沉淀后实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
