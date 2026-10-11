@@ -362,17 +362,34 @@ def _plane(driver: Any, frame: _Frame, offset_mm: float, tag: str) -> str:
     return name
 
 
-def _sketch_polygon(driver: Any, pts: list[tuple[float, float]]) -> None:
+def _sketch_polygon(driver: Any, pts: list[tuple[float, float]],
+                    no_snap: bool = False) -> None:
     """画闭合折线（首尾自动相连）。
 
-    普通模式（**不**用 SetAddToDB）：CLAUDE.md 记着 SetAddToDB 下线端点不自动
-    合并，多线环会开环 → 拉伸静默失败。所以"少量线段组成的轮廓"必须走吸附模式。
+    顶点对象在相邻边间**复用**（边 i 的终点就是边 i+1 的起点）⇒ 坐标逐位相等，
+    SetAddToDB 下不需要端点自动合并也能闭合。
+
+    ``no_snap=True`` 关推理捕捉（``SetAddToDB``）——**切除类草图必须关**：
+    2026-10-12 实测（`_probe_sw_e30.py`），#9 键槽矩形角点意图位置距 φ17 凸台
+    外圆 r8.5 只差 0.45mm，A 态（锥台外凸、包围盒变大、视图自动缩放）下推理
+    捕捉把该角点**吸到了 r8.5 圆上**，切出的角棱线与凸台柱面相切（零厚度）→
+    `FeatureCut3` 拒绝返回 None；B 态同参数不吸附、成功。这正是旧管线记的
+    "孔切除草图必须 no_snap、否则键槽矩形角部被吸附畸变"的同源病——而且
+    吸附与否取决于视图缩放，"不关就随时可能翻车"。而"SetAddToDB 下多线环
+    开环"只发生在相邻端点坐标有浮点噪声时（如弧端点被 SW 重算），
+    本函数的复用顶点无此问题。
     """
     if len(pts) < 3:
         raise SwBuildError(f"轮廓至少 3 点，实得 {len(pts)}")
-    for i, (x1, y1) in enumerate(pts):
-        x2, y2 = pts[(i + 1) % len(pts)]
-        driver.draw_line(x1, y1, 0.0, x2, y2, 0.0)
+    if no_snap:
+        driver.sw_model.SetAddToDB(True)
+    try:
+        for i, (x1, y1) in enumerate(pts):
+            x2, y2 = pts[(i + 1) % len(pts)]
+            driver.draw_line(x1, y1, 0.0, x2, y2, 0.0)
+    finally:
+        if no_snap:
+            driver.sw_model.SetAddToDB(False)
 
 
 def _profile_desc(profile: Any) -> str:
@@ -467,8 +484,85 @@ def _flatten_arcs(segs: list[ProfileSeg2],
     return out, had
 
 
+def _split_zero_width_slits(segs: list[ProfileSeg2]) -> list[list[ProfileSeg2]]:
+    """把单链里的"零宽缝"剥掉，断成若干独立闭环（无缝合链原样单环返回）。
+
+    环带（annulus）这类多环区域在**单链**表示里只能靠两条首尾对合、逐位重合的
+    径向边串起来（`features/revolve.py` 的锥台补偿切就是这么生成的，"缝零宽
+    落在切除区内无害"只对 OCC 成立）。SW 草图求解器拒绝自重合轮廓：
+    2026-10-12 实测（`_probe_sw_e32.py`），同一环带链式画法 194 段全落进草图后
+    `FeatureCut3` 仍返回 None；剥缝、改画两个同心整圆立过（VA 变体）。
+    剥缝后每个环各自闭合（前缀段表本就是遍历序），几何逐位不变。
+    """
+    n = len(segs)
+    if n < 4:
+        return [list(segs)]
+    alive = [True] * n
+    for i in range(n):
+        a = segs[i]
+        if not alive[i] or a.kind != "line":
+            continue
+        for j in range(i + 1, n):
+            b = segs[j]
+            if not alive[j] or b.kind != "line":
+                continue
+            if (a.p1.distance_to(b.p2) <= 1e-9
+                    and a.p2.distance_to(b.p1) <= 1e-9):
+                alive[i] = alive[j] = False
+                break
+    if all(alive):
+        return [list(segs)]
+    idx = [k for k in range(n) if alive[k]]
+    if not idx:
+        return [list(segs)]
+    start = idx[0]
+    for k in idx:                             # 从"前一格被剥"的段起走
+        if not alive[(k - 1) % n]:
+            start = k
+            break
+    loops: list[list[ProfileSeg2]] = []
+    cur: list[ProfileSeg2] = []
+    k = start
+    for _ in range(n):
+        if alive[k]:
+            cur.append(segs[k])
+        elif cur:
+            loops.append(cur)
+            cur = []
+        k = (k + 1) % n
+    if cur:
+        loops.append(cur)
+    return loops or [list(segs)]
+
+
+def _full_circle_of(loop: list[ProfileSeg2]) -> tuple[Point2, float] | None:
+    """若该闭环恰是一个整圆（全是同心同半径的弧、总跨度 2π），返回 (圆心, 半径)。
+
+    整圆画成**原生圆实体**（单实体、无端点、免疫推理捕捉）——
+    `_probe_sw_e32.py` VA 实测路径。
+    """
+    c: Point2 | None = None
+    r = 0.0
+    span = 0.0
+    for s in loop:
+        if s.kind != "arc" or s.center is None or s.radius <= 0.0:
+            return None
+        if s.sa is None or s.ea is None:
+            return None
+        if c is None:
+            c, r = s.center, float(s.radius)
+        elif (s.center.distance_to(c) > 1e-9
+              or abs(float(s.radius) - r) > 1e-9):
+            return None
+        d = (s.ea - s.sa) if s.ccw else (s.sa - s.ea)
+        span += d % (2.0 * math.pi)
+    if c is None or abs(span - 2.0 * math.pi) > 1e-9:
+        return None
+    return c, r
+
+
 def _sketch_profile(driver: Any, frame: _Frame, o: Point3, profile: Profile2,
-                    f: Feature, what: str) -> None:
+                    f: Feature, what: str, no_snap: bool = False) -> None:
     """画闭合轮廓（``Profile2``，段序 = 遍历序）到活动草图。
 
     段序连续性由 ``Profile2.chain_break`` 把关（SW 的草图比 OCC 的 MakeWire
@@ -476,6 +570,9 @@ def _sketch_profile(driver: Any, frame: _Frame, o: Point3, profile: Profile2,
 
     ⚠️ **弧一律折线化（``_flatten_arcs``，弦高 ≤0.01mm），且含弧的轮廓整条在
     ``SetAddToDB(True)`` 下画**（2026-10-10 实测定档）。三组证据：
+
+    （另：``no_snap=True`` 强制关推理——切除类调用点必须传，理由见
+    `_sketch_polygon` 的 docstring（2026-10-12 #9 键槽吸附畸变实测）。）
 
     ① **SW 会把弧改掉**：孤立单画一条 r20 87.87° 弧（L=30.6713mm，周围没有
        任何可吸附的邻居），SW 读回 GetLength = **31.3928mm**（+2.35%）；在
@@ -516,25 +613,38 @@ def _sketch_profile(driver: Any, frame: _Frame, o: Point3, profile: Profile2,
             f"({s1.p1.x:.3f},{s1.p1.y:.3f}) 相距 {s0.p2.distance_to(s1.p1):.3f}mm"
             "（段序必须是遍历序）")
     segs = _merge_collinear_segs(list(segs))
-    segs, had_arcs = _flatten_arcs(segs)
+    loops = _split_zero_width_slits(segs)
+    for lp in loops:                          # 剥缝后每环必须自身闭合
+        if lp[0].p1.distance_to(lp[-1].p2) > 1e-9:
+            loops = [list(segs)]              # 病态输入：退回原链
+            break
+    had_arcs = any(s.kind == "arc" for lp in loops for s in lp)
 
     def loc(a: float, b: float) -> tuple[float, float]:
         return frame.local(frame.ir_point(o, a, b, 0.0))
 
-    if had_arcs:                              # 推理捕捉关闭：折线几何逐字进 SW
+    close_snap = had_arcs or no_snap          # 推理捕捉关闭：几何逐字进 SW
+    if close_snap:
         driver.sw_model.SetAddToDB(True)
     try:
-        for s in segs:
-            if s.kind != "line":
-                raise SwBuildError(
-                    f"特征 #{f.id}（{f.type.value}）{what}：弧段缺圆心/半径")
-            x1, y1 = loc(s.p1.x, s.p1.y)
-            x2, y2 = loc(s.p2.x, s.p2.y)
-            if math.hypot(x2 - x1, y2 - y1) <= 1e-9:
-                continue                      # 零长段（焊接产物）：不贡献几何
-            driver.draw_line(x1, y1, 0.0, x2, y2, 0.0)
+        for lp in loops:
+            circ = _full_circle_of(lp)        # 整圆环 → 原生圆实体
+            if circ is not None:
+                cx, cy = loc(circ[0].x, circ[0].y)
+                driver.draw_circle(cx, cy, 0.0, float(circ[1]))
+                continue
+            flat, _ = _flatten_arcs(lp)
+            for s in flat:
+                if s.kind != "line":
+                    raise SwBuildError(
+                        f"特征 #{f.id}（{f.type.value}）{what}：弧段缺圆心/半径")
+                x1, y1 = loc(s.p1.x, s.p1.y)
+                x2, y2 = loc(s.p2.x, s.p2.y)
+                if math.hypot(x2 - x1, y2 - y1) <= 1e-9:
+                    continue                  # 零长段（焊接产物）：不贡献几何
+                driver.draw_line(x1, y1, 0.0, x2, y2, 0.0)
     finally:
-        if had_arcs:
+        if close_snap:
             driver.sw_model.SetAddToDB(False)
 
 
@@ -814,10 +924,10 @@ def _build_pocket(driver: Any, f: Feature) -> str:
     plane = _plane(driver, frame, offset, f"C{f.id}")
     _start_sketch(driver, plane, f, "腔切除")
     if isinstance(profile, Profile2):
-        _sketch_profile(driver, frame, o, profile, f, "腔切除")
+        _sketch_profile(driver, frame, o, profile, f, "腔切除", no_snap=True)
     else:
         pts = [frame.local(frame.ir_point(o, float(a), float(b), 0.0)) for a, b in profile]
-        _sketch_polygon(driver, pts)
+        _sketch_polygon(driver, pts, no_snap=True)
     return _cut(driver, f, cut_depth, plane, f"腔 {_profile_desc(profile)} 深{depth:g}")
 
 
@@ -846,7 +956,7 @@ def _build_slot(driver: Any, f: Feature) -> str:
     offset = frame.plane_offset(frame.ir_point(o, 0.0, 0.0, plane_t))
     plane = _plane(driver, frame, offset, f"S{f.id}")
     _start_sketch(driver, plane, f, "槽切除")
-    _sketch_polygon(driver, local)
+    _sketch_polygon(driver, local, no_snap=True)
     return _cut(driver, f, cut_depth, plane, f"槽 {length:g}×{width:g} 深{depth:g}")
 
 
