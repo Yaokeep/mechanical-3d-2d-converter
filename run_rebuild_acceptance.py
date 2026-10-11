@@ -5,7 +5,9 @@
 这是新框架的**回归入口**（与旧管线的 `run_simple_regression.py` 平行：
 那个查 `dxf_to_3d_general.py`，这个查 `src/rebuild/`）。两张表：
 
-    OCC 表（默认，需 cad-occt）  : 逐靶子重建 STEP，量体积/bbox/实体数
+    OCC 表（默认，需 cad-occt）  : 逐靶子重建 STEP，量体积/bbox/实体数，
+                                  体积/bbox 超容差（0.5%/1mm）判 [RED]，
+                                  缺陷盒·点断言（PROBES 表）自动复核
     SW  表（`--sw`，需 SW 2025）: 逐靶子建 SW 原生特征模型，量体积/bbox，
                                   并核**特征步数与特征模型一致**
 
@@ -91,6 +93,46 @@ CASES: dict[str, tuple[str, float | None, tuple | None, str]] = {
     "PF60K": ("CAD/temp_output/pf60k_闭环_三视图_20260817.dxf", 261935.0, None, "ok"),
 }
 
+#: 阈值判红（验证制度化，2026-10-11，ASSESSMENT §D）：OCC 表体积偏差 % 与
+#: bbox 差 mm 超阈值即打 [RED] 并计 FAIL——此前"偏差只打印不计分"，
+#: 是比旧套件（0.3%/1mm）还松的口径。现行 9 绿全在容差内（最大 +0.11%、
+#: bbox 差全 0.00），不受影响。**仅 expect=="ok" 生效**：gap 行保持
+#: "偏差只打印"语义（偏差本来就是预期的）。SW 表不判红——bracket +0.54%
+#: 是发射器口径差（早于阶段 7），0.5% 必误杀。
+VOL_TOL_PCT = 0.5
+BBOX_TOL_MM = 1.0
+
+#: 缺陷回归探针（验证制度化，2026-10-11，ASSESSMENT §D）：把用户目视发现的
+#: 缺陷转成盒/点断言，每次跑 OCC 表自动复核——自动指标到 99.5%+ 时局部可见
+#: 缺陷仍零命中，这些盒就是它们的守卫（闭环：viewer 标记 → 盒/点定量 → 入此表）。
+#: 坐标 = 基准系（定标盒：_probe_boxes.py 三缺陷盒 + _probe_markers.py 凸台右弧两盒）；
+#: shift = 基准min − 重建min（2026-10-11 定标探针 _probe_calib.py 实测，
+#: 两变体 y 差 3mm 各自记）；golds = 基准 Fuse 各盒实测体积（同上）；
+#: 点期望 = 基准实测分类（槽端圆心/薄壁点本身是空腔与缝隙位置，基准即 OUT——
+#: 分类一致才是断言，不是一律 IN）。⚠️ 识别侧改动导致重建整体重定位时盒断言
+#: 会全红——重定位回归哨兵，重标定即可（特性非故障，见 box_probe.py docstring）。
+#: 只挂 OCC 表：SW 表 IR 系 ≠ 图纸系，映射超范围。
+_BRACKET_CHECKS = {
+    "boxes": [
+        ("挂耳", 145, 160, 5, 9, 18, 26),                      # v0.6.18 全高怪棱
+        ("跑道槽端头", 25, 40, -6, 6, 14, 19),                  # v0.6.18 端头方形
+        ("薄壁位", 136, 140, -3, 3, 30, 37),                    # v0.6.18 0.1mm 薄壁
+        ("凸台右弧#1", 143.42, 147.42, -11.67, -7.67, 38, 42),  # v0.6.19 标记#1
+        ("凸台右弧#2", 144, 148, 6.31, 10.31, 35.43, 39.43),    # v0.6.19 标记#2
+    ],
+    "golds": {"挂耳": 366.82, "跑道槽端头": 203.81, "薄壁位": 71.34,
+              "凸台右弧#1": 32.53, "凸台右弧#2": 31.48},
+    "points": [
+        ("跑道槽端圆心", 31.89, 0, 16.47, "OUT"),    # 槽腔内部，基准即 OUT
+        ("薄壁点", 137.80, 0.04, 33.88, "OUT"),       # 0.1mm 缝隙位置
+        ("挂耳点", 145.57, 9.38, 31.35, "IN"),
+    ],
+}
+PROBES: dict[str, dict] = {
+    "bracket 三视图": {"shift": (-40.111, -151.060, -2.005), **_BRACKET_CHECKS},
+    "bracket 剖面图": {"shift": (-40.111, -148.060, -2.005), **_BRACKET_CHECKS},
+}
+
 
 def _mark(expect: str) -> str:
     return "[OK ]" if expect == "ok" else "[GAP]"
@@ -145,9 +187,27 @@ def run_occ(names: list[str]) -> int:
         dv = (m.volume - gold_v) / gold_v * 100.0 if gold_v else float("nan")
         db = (" ".join(f"{a - b:+.2f}" for a, b in zip(m.extents, gold_b))
               if (gold_b and m.extents) else "-")
-        print(f"{_mark(expect)} {name:<14} {n:>2} 特征  体积 {m.volume:>11,.1f} vs "
+        # 阈值判红（仅 expect=="ok"）：体积/bbox 超容差 ⇒ [RED] 计 FAIL
+        over_v = (expect == "ok" and gold_v
+                  and abs(m.volume - gold_v) / gold_v * 100.0 > VOL_TOL_PCT)
+        over_b = (expect == "ok" and gold_b and m.extents
+                  and any(abs(a - b) > BBOX_TOL_MM for a, b in zip(m.extents, gold_b)))
+        mark = "[RED]" if (over_v or over_b) else _mark(expect)
+        print(f"{mark} {name:<14} {n:>2} 特征  体积 {m.volume:>11,.1f} vs "
               f"{gold_v if gold_v else 0:>10,.1f} {dv:+7.2f}%  bbox 差 {db}  "
               f"实体 {m.n_solids}")
+        if over_v or over_b:
+            bad += 1
+        # 缺陷回归探针（仅登记了 PROBES 的靶子）
+        if name in PROBES:
+            from src.rebuild.verify.box_probe import probe_checks
+            cfg = PROBES[name]
+            rep = probe_checks(r.step, cfg["shift"], cfg["boxes"], cfg["golds"],
+                               lambda g: max(8.0, 0.15 * g), cfg["points"])
+            for line in rep.lines():
+                print(f"{'':<21}{line}")
+            if not rep.passed:
+                bad += 1
     return bad
 
 
@@ -233,11 +293,12 @@ def main(argv: list[str]) -> int:
     bad = run_sw(names) if sw else run_occ(names)
     print("-" * 100)
     if bad:
-        print(f"[FAIL] {bad} 个靶子疑似发射器 bug（无阻塞疑问却失败）—— 要查的不是表，是发射器")
+        print(f"[FAIL] {bad} 处未过——发射失败（无阻塞疑问）= 疑似发射器 bug；"
+              f"[RED]（体积/bbox 超 {VOL_TOL_PCT}%/{BBOX_TOL_MM}mm）与缺陷盒·点断言未过 = "
+              f"识别侧回归，查识别不查发射器")
     else:
-        print("[完成] 无发射器 bug——最后一条 [GAP]（bracket 高度分解）2026-10-10 已消灭，"
-              "当前全表应为 [OK ]；若再见 [GAP]，那是已知结构缺口或被 force 强推的欠定图纸，"
-              "不是回归")
+        print("[完成] 全表通过：发射无 bug、体积/bbox 在容差内、缺陷盒·点断言全过。"
+              "若再见 [GAP]，那是已知结构缺口或被 force 强推的欠定图纸，不是回归")
     return 1 if bad else 0
 
 

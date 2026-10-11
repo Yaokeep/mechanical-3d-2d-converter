@@ -49,8 +49,14 @@ $PY dxf_to_sw_features.py CAD/reducer.dxf [output.sldprt] [--no-step]
 $PY dxf_to_sw_features.py CAD/test_simple/flange_d80.dxf --from-model
 
 # 新框架 src/rebuild/ 验收表（回归入口，与 run_simple_regression.py 平行）
+# 2026-10-11 验证制度化起：OCC 表体积/bbox 超容差（0.5%/1mm）判 [RED]，
+# bracket 两条附缺陷盒·点断言（PROBES 表）自动复核历史缺陷
 PYTHONIOENCODING=utf-8 $PY run_rebuild_acceptance.py [靶子...]         # OCC 表
 PYTHONIOENCODING=utf-8 python run_rebuild_acceptance.py --sw [靶子...] # SW 表（需 SW 2025）
+
+# YZYX 齿箱上盖无基准定量验收三件套（27 点材料探针 + 五视图 HLR 投影评分，
+# 基线 TL 缺0/多49、BL 缺0/多50、TR 缺0/多38，判红=比 v15a 基线更差）
+PYTHONIOENCODING=utf-8 $PY yz_accept.py [stepfile] [thresh_mm]
 
 # 简单模型回归套件 — 6 个已验证用例（体积精确匹配 + 逐轴 bbox + 实体数）
 # 报告输出 CAD/temp_output/regression_report.txt；--sw 附加 SW 时间戳模型生成
@@ -289,7 +295,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 | `docs/` | `CHANGELOG.md` — v0.5.4~v0.6.22 逐版本根因叙事，倒序四段（新框架 src/rebuild 各阶段 v0.6.19~v0.6.22 在前 / 主线 v0.6.11~v0.6.20 / dxf_to_3d_general 精度收敛链 v0.5.4~v0.6.10 / dxf_to_sw_features v0.6.6~v0.6.7）。查"某阈值为何是 0.1"这类历史依据时看它；`ARCHITECTURE.md` — 新框架设计（§3 三原则、§5 分层、§8 阶段状态）；`ASSESSMENT_20261006.md` — 2026-10-06 转换能力自评（问题分级 A~F + 优先级）——"下一步做什么"看它 |
 | `.claude/` | `settings.local.json` — 预授权的 Bash 权限列表；`skills/` — 项目级启用的技能符号链接 |
 | `.agents/skills/` | 4 个技能：`mechanical-engineer`、`solidworks-cad`（泵叶轮参数化）、`python-code-review`（含 5 个参考文件）、`python-packaging`；仅前两个经符号链接在项目级启用。根目录 `skills-lock.json` 锁定 `mechanical-engineer` 来源 |
-| `CAD/` | 51 个 VBA 宏 `.bas`（本目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代；另 4 个在仓库根 `soldwork/`），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`、`20230425-160012-85913` 尼龙王 φ19×100 + 夹紧环 φ60×30——PDF 矢量化来源：线条双线、圆弧打成 LWPOLYLINE 折线（2138 条）、0 文字标注，解析须读折线顶点；`YZYX95.4-20齿箱上盖零件图.dwg`（φ220 大件靶子，与 D79307 无关；2026-10-06 手工参数化重建 v15a——用户读法三轮闭环，转换副本 `CAD/temp_output/_yz.dxf`，建模脚本根目录 `_yz_build.py`；全貌与工具链见记忆 yzyx-gearbox-cover-drawing）；`_wx_build.py`（gitignored）是按图手工建模的真值参照）、`temp_output/` 闭环验证链工作区（图纸 DXF 迭代样本——`bracket_angker_三视图_v4.dxf` 与 `bracket_angker_图纸_20260922_剖面图.dxf` 是当前两个 bracket 基线、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf`、`D79307A264FCA6D8EC32E95B1B11BDBD.dxf`/`IMU.dxf`/`轴测量.dxf`（各配 `_剖面图.dxf`；轴测量是唯一 100% 覆盖靶子）、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例 |
+| `CAD/` | 51 个 VBA 宏 `.bas`（本目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代；另 4 个在仓库根 `soldwork/`），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`、`20230425-160012-85913` 尼龙王 φ19×100 + 夹紧环 φ60×30——PDF 矢量化来源：线条双线、圆弧打成 LWPOLYLINE 折线（2138 条）、0 文字标注，解析须读折线顶点；`YZYX95.4-20齿箱上盖零件图.dwg`（φ220 大件靶子，与 D79307 无关；2026-10-06 手工参数化重建 v15a——用户读法三轮闭环，转换副本 `CAD/temp_output/_yz.dxf`，建模脚本根目录 `_yz_build.py`；无基准定量验收三件套 `yz_accept.py`（27 点材料探针 + 五视图投影评分，2026-10-11 验证制度化入库）；全貌与工具链见记忆 yzyx-gearbox-cover-drawing）；`_wx_build.py`（gitignored）是按图手工建模的真值参照）、`temp_output/` 闭环验证链工作区（图纸 DXF 迭代样本——`bracket_angker_三视图_v4.dxf` 与 `bracket_angker_图纸_20260922_剖面图.dxf` 是当前两个 bracket 基线、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf`、`D79307A264FCA6D8EC32E95B1B11BDBD.dxf`/`IMU.dxf`/`轴测量.dxf`（各配 `_剖面图.dxf`；轴测量是唯一 100% 覆盖靶子）、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例 |
 | `PDF/` | 空目录（预留放参考 PDF 文档） |
 | `三维/` | 闭环验证参考模型（gitignored）：`麒浚传动_PF60K-14-50-70-M4-L2-12.SLDPRT`、`bracket angker.stp`、`spoon.SLDPRT` / `spoon.STEP`、`勺子/`（勺子参考图 + STEP/STL 副本） |
 | `图片/` | 参考图片两张（`电机.PNG`、`齿轮罩.PNG`，2026-10-09 加入）——2026-10-11 起 gitignored（与 `三维/` 同类用户私有参考数据） |
@@ -302,6 +308,26 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 代码后运行完整 CLI（生成 STEP + SW 时间戳 .sldprt），**不以代码或日志数值吻合
 作为成功标准**。判断几何正确性可加载 STEP 用 `GProp_GProps` 体积 /
 `BRepAdaptor_Surface` 面类型做定量核对（体积与理论值精确吻合才是真通过）。
+
+**验证制度化（2026-10-11，ASSESSMENT §D）**: 自动指标（体积/bbox/重合率）到
+99.5%+ 时局部可见缺陷仍零命中（bracket 三缺陷、YZYX 五处标记全靠目视）——
+历史缺陷已转成自动断言，**每次修复的例行检查序列**：
+
+1. `python -m src.rebuild.selftest` — 367 项
+2. `PYTHONIOENCODING=utf-8 $PY run_rebuild_acceptance.py` — 9 绿 + 体积/bbox
+   阈值判红（0.5%/1mm，仅 expect=="ok"）+ bracket 缺陷盒·点断言（PROBES 表：
+   三缺陷盒 + 凸台右弧两盒 + 3 点分类；gold/shift 2026-10-11 定标实测，
+   shift=基准min−重建min，三视图/剖面图 y 差 3mm 各自记）
+3. 涉 SW 发射改动 → `--sw` 表（特征步数硬判；SW 表不判体积阈值——发射器口径差）
+4. 无基准靶子（YZYX）→ `PYTHONIOENCODING=utf-8 $PY yz_accept.py`（27 点材料
+   探针 + 五视图投影评分；判红 = 比 v15a 基线更差，缺>0 或 多>基线+10）
+5. 视觉链（自动指标再绿也不能省）：`_render_dxf.py` 看图 → `_make_viewer.py`
+   点选标记 → `_dump_sections.py`（SEC_PLANES 环境变量可覆盖平面）+
+   `_draw_sections.py`（**CWD 必须仓库根**，_viz 相对路径）截面叠加 →
+   `_probe_boxes.py` 盒定量复核（截面整片伪影必须盒探针复核，防退化假差异）
+6. 新缺陷闭环：viewer 标记 → 盒/点定量 → 入 PROBES 表（gold/shift 实测标定）
+坑：平移口径 63.56（新框架重建系）≠ 63.65（旧管线，含归一化错位）；OCC 脚本
+一律 $PY；识别侧改动导致重建重定位时盒断言会红——重标定即可（特性非故障）。
 
 **变更归因**: 图纸与代码同时变过时（典型是"重建数值变了，是修复的效果还是
 出图版本的效果"），先 `git stash` 回退代码跑**旧代码 × 新图纸**——与历史基线
@@ -426,7 +452,8 @@ x 平移伪影。补上 dx 后同一对模型是：三视图 多余 1,681.28 / �
 
 解释器分层：`model`~`features` + `verify.compare/coverage/gate` + `report` 只需
 ezdxf+numpy，**跑默认 python**；`verify/step_probe.py`（读 STEP 量尺寸）与
-`emit` 需要 OCC。**`verify/__init__.py` 不许导出 step_probe** —— 导出了就等于
+`verify/box_probe.py`（缺陷盒·点断言，2026-10-11 验证制度化）与
+`emit` 需要 OCC。**`verify/__init__.py` 不许导出 step_probe / box_probe** —— 导出了就等于
 把整包的 import 绑死在 cad-occt 上，selftest 的 E 组会把这条拉回。
 阶段 1 的 `verify.reproject` 同样归 OCC 侧。
 
@@ -450,7 +477,7 @@ linetype 断裂/虚线/**细实线**、section 剖切种类/材料、simplificat
 环提取只认 VISIBLE 自动排除）、DIMENSION「数值↔几何锚点」配对（tier=ANNOTATED），
 实测 YZYX C—C 定性 section/scope=local、52 条尺寸 45 锚上、20/3/120 逐位吻合）、
 `features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道**）、`verify/`（compare/coverage/
-gate/step_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
+gate/step_probe/box_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
 step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
 顶部「新框架 src/rebuild/」段；`docs/ARCHITECTURE.md` §8 各阶段带 ✅ 状态行。
@@ -463,7 +490,8 @@ PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
 ```
 阶段 4 实测（2026-09-28）→ 阶段 5 表（2026-10-07）→ 阶段 6 表（2026-10-09）→
-**当前表（2026-10-10，9 靶子两表全绿）**：
+**当前表（2026-10-10，9 靶子两表全绿；2026-10-11 验证制度化起 OCC 表加
+体积/bbox 阈值判红 0.5%/1mm + bracket 缺陷盒·点断言，9 绿逐位不变）**：
 6 个简单靶子**全部体积逐位吻合**（block_3view / plate_100x60 / flange_d80 /
 法兰练习 4 绿 + **l_bracket 19,800 / 图形练习 72,000** 阶段 5 转绿，bbox 差全
 0.00；SW 表另核**特征步数 = 特征模型**）；**PF60K** 由阶段 6 转绿——19 特征，

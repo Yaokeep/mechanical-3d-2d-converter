@@ -164,6 +164,11 @@ python main.py
 - [x] v0.6.23 — 约定沉淀进 `conventions/`：YZYX 手工读图三约定前移
       （局部剖几何推断「c 向」+剖面线覆盖比、细实线=被盖轮廓、DIMENSION
       尺寸锚点），自检 367 项、验收表 9 绿逐位不变
+- [x] v0.6.24 — 验证制度化（ASSESSMENT §D）：缺陷盒·点断言进验收表
+      （`verify/box_probe.py` + bracket 5 盒 3 点，体积 0.5%/bbox 1mm
+      阈值判红）；YZYX 无基准三件套入库（`yz_accept.py` 总入口，27 点
+      材料探针 + 五视图投影评分基线判红）；CLAUDE.md 例行检查 SOP；
+      自检 367 项、验收表 9 绿逐位不变、破坏性证明四条判红路径实测
 - [ ] GUI 内 PythonOCC 集成 — `src/gui/view3d`、`projection`、
       `reconstruction` 模块骨架已就绪，待接入（核心算法已在根目录
       独立脚本 `dxf_to_3d_general.py` 等中完整实现）

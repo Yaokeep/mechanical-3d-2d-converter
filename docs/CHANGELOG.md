@@ -11,6 +11,60 @@
 
 ---
 
+## 验证制度化（v0.6.24，ASSESSMENT_20261006 §D：缺陷断言 + 无基准验收 + 例行检查 SOP，2026-10-11）
+
+ASSESSMENT_20261006 §D「验证体系盲区」落地：自动指标到 99.5%+ 时局部可见
+缺陷仍零命中（bracket 三缺陷、凸台右弧空缺全是用户目视发现）——把目视缺陷
+转成自动断言，把无基准件的验收压力转成固定入口。三块：
+
+### ① 验收表缺陷盒·点断言 + 阈值判红
+
+- **`verify/box_probe.py`（新模块）**：盒体积（Common+VolumeProperties，空交→0）
+  与点分类（BRepClass3d, 1e-3）的通用机制。`probe_checks(path, shift, boxes,
+  golds, tol, points) -> ProbeReport`；shift 三元组**硬编码**——重建 STEP 在
+  图纸系、基准在自身系，平移量本身即重定位回归哨兵（特性非故障）。纪律同
+  step_probe：`verify/__init__.py` 不导出（selftest E 组红线），调用方函数体内
+  按需 import。
+- **`run_rebuild_acceptance.py` PROBES 表**：bracket 两条（三视图/剖面图各一套
+  shift，y 差 3mm）各挂 5 盒 3 点——挂耳/跑道槽端头/薄壁位（三缺陷）+ 凸台右弧
+  #1/#2（0.4947mm 归一化错位旧案），盒 gold 由基准 STEP 实测定标、容差
+  max(8, 0.15×gold)；点期望按**基准实测分类**（槽心/缝隙点基准即 OUT——分类
+  一致才是断言，不是一律 IN）。
+- **阈值判红**：`VOL_TOL_PCT=0.5` / `BBOX_TOL_MM=1.0`，仅 `expect=="ok"` 行生效
+  （gap 行保打印语义）；**SW 表不判红**——bracket +0.54% 系发射器口径差，
+  0.5% 必误杀（注释在案）。
+
+### ② YZYX 无基准靶子定量验收三件套入库
+
+- `_yz_probe_mat.py`/`_yz_hlr.py`/`_yz_match.py` → 去 `_` 入库（
+  `yz_probe_mat.py` 27 点材料探针 / `yz_hlr.py` 五视图 HLR→JSON /
+  `yz_match.py` 图纸缺·多评分 THRESH=2.0mm），主逻辑函数化、判据留脚本常量。
+- **`yz_accept.py` 总入口**：材料探针（$PY，本进程）→ HLR（$PY）→ 评分（默认
+  python 子进程）→ 基线判红。判红线：任一点 !! ⇒ 红；TL/BL/TR 缺>0 或
+  多>基线+10 ⇒ 红（基线 = v15a TL 49 / BL 50 / TR 38，不是零缺陷）。
+- **两段式的第三个坑**：numpy linalg 与 OCC 同进程 0xc06d007f；且从 cad-occt
+  python 直接 CreateProcess 的子 python 继承 DLL 搜索路径、最小 env 也崩——
+  **shell=True（cmd 中转隔断继承）修复**。坑与解法写入 yz_accept docstring。
+
+### ③ CLAUDE.md 例行检查 SOP
+
+固定序列：selftest → OCC 验收表（盒断言+阈值判红）→ 涉 SW 改动跑 --sw →
+yz_accept → 视觉链（render_dxf → viewer → dump/draw_sections → probe_boxes）。
+判读标准：99.5%+ 仍需目视；截面整片伪影必须盒探针复核；新缺陷闭环 = viewer
+标记 → 盒/点定量 → 入 PROBES。
+
+### 验证
+
+- **selftest 367 项全绿**（verify 包未破坏）；**验收表 9 绿逐位不变** +
+  bracket 两行 5 盒 3 点全 OK + 退出 0（现行 9 绿全在 0.5%/1mm 容差内）。
+- **yz_accept 复现 v15a 基线**：27/27、TL 缺0/多49、BL 缺0/多50、TR 缺0/多38，
+  退出 0。
+- **破坏性证明四条判红路径**：盒 gold 改 300 → 差 +66.9>容差 45；点期望翻转 →
+  [RED]+exit 1；VOL_TOL_PCT=0.01 → PF60K +0.06% 判红；基线 TL→0 → [RED] TL。
+  全部实测触发，还原后复绿。
+
+---
+
 ## 新框架 src/rebuild/（v0.6.23，约定沉淀：局部剖几何推断 + 细实线 + DIMENSION 尺寸锚点，2026-10-11）
 
 ASSESSMENT_20261006 §C1~C3（优先级①）落地：YZYX 齿箱上盖手工读图花三轮才收敛的
