@@ -292,7 +292,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 | `CAD/` | 51 个 VBA 宏 `.bas`（本目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代；另 4 个在仓库根 `soldwork/`），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`、`20230425-160012-85913` 尼龙王 φ19×100 + 夹紧环 φ60×30——PDF 矢量化来源：线条双线、圆弧打成 LWPOLYLINE 折线（2138 条）、0 文字标注，解析须读折线顶点；`YZYX95.4-20齿箱上盖零件图.dwg`（φ220 大件靶子，与 D79307 无关；2026-10-06 手工参数化重建 v15a——用户读法三轮闭环，转换副本 `CAD/temp_output/_yz.dxf`，建模脚本根目录 `_yz_build.py`；全貌与工具链见记忆 yzyx-gearbox-cover-drawing）；`_wx_build.py`（gitignored）是按图手工建模的真值参照）、`temp_output/` 闭环验证链工作区（图纸 DXF 迭代样本——`bracket_angker_三视图_v4.dxf` 与 `bracket_angker_图纸_20260922_剖面图.dxf` 是当前两个 bracket 基线、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf`、`D79307A264FCA6D8EC32E95B1B11BDBD.dxf`/`IMU.dxf`/`轴测量.dxf`（各配 `_剖面图.dxf`；轴测量是唯一 100% 覆盖靶子）、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例 |
 | `PDF/` | 空目录（预留放参考 PDF 文档） |
 | `三维/` | 闭环验证参考模型（gitignored）：`麒浚传动_PF60K-14-50-70-M4-L2-12.SLDPRT`、`bracket angker.stp`、`spoon.SLDPRT` / `spoon.STEP`、`勺子/`（勺子参考图 + STEP/STL 副本） |
-| `图片/` | 参考图片两张（`电机.PNG`、`齿轮罩.PNG`，2026-10-09 加入）——未入库且无 gitignore 规则（`git status` 显示 `??`），用途待用户确认 |
+| `图片/` | 参考图片两张（`电机.PNG`、`齿轮罩.PNG`，2026-10-09 加入）——2026-10-11 起 gitignored（与 `三维/` 同类用户私有参考数据） |
 | `soldwork/` | SW VBA 宏工作区：`.bas` 测试宏（入库）+ `.swp` 工程文件（**未入库**，被 `.gitignore` 的 vim-swap 规则误伤，见下方"路径与平台注意事项"） |
 | `tools/libredwg/` | LibreDWG Windows 完整发行版 — `dwg2dxf.exe` 等命令行工具 + Python 绑定；`dxf_to_3d_general.py` 遇 .dwg 输入时自动调用转换 |
 
