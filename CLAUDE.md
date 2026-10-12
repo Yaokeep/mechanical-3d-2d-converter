@@ -30,6 +30,10 @@ pytest tests/
 # ---- 根目录独立脚本（不通过 main.py，直接命令行运行） ----
 # 凡 import OCC 的脚本都必须用 $PY（cad-occt 环境），下同
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
+# ⚠️ 只要脚本可能走到 numpy.linalg（如 ezdxf 读含**拟合点 SPLINE** 的 DXF），
+#   必须把 Library/bin 加进 PATH，否则调用瞬间以 Windows 0xc06d007f 致命异常
+#   **静默杀进程**（MKL 的 LAPACK DLL 延迟加载失败；见下方"环境安装"节）：
+#   PATH=/c/Users/yaoshuo/miniconda3/envs/cad-occt/Library/bin:$PATH $PY xxx.py
 
 # DXF 阶梯轴 → SolidWorks .sldprt 原生文件（纯 DXF+COM，默认 python 即可）
 python dxf_to_sldprt.py CAD/20160112-181116-09933.dxf [output.sldprt]
@@ -98,10 +102,10 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
                                                # 用户目视标记缺陷的入口（v0.6.18 三缺陷即由此而来）。
                                                # 脚本内路径写死 bracket：换重建结果改 main() 里 read_step 的 _3d.step 路径
 # 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性脚本一律用 `_` 前缀，
-# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃（根目录现存 294 个，
-# 2026-10-09 计数，分九类：_probe 几何探针 / _sw SW COM API 探测 / _diag 根因诊断 /
+# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃（根目录现存 418 个，
+# 2026-10-12 计数，分十类：_probe 几何探针 / _sw SW COM API 探测 / _diag 根因诊断 /
 # _wx 样本真值 / _d79 D79307 探针 / _yz 齿箱上盖 / _dump+_draw 截面叠加工具链 /
-# _csg+_bak 版本备份 / 杂项）。
+# _csg+_bak 版本备份 / _z7+_z8+_z9 阶段 7 高度分解/圆角/侧通道调试 / 杂项）。
 # `_yz_*.py` YZYX95.4-20 齿箱上盖（φ220 大件，2026-10-02~06 五轮 70 个，v15a 体积
 # 7,782,529.7）：建模脚本 `_yz_build.py`，五轮闭环、评分与工具链全貌见记忆
 # yzyx-gearbox-cover-drawing（索引已含要点，召回可读全文）。
@@ -201,6 +205,15 @@ pip install -r requirements.txt
 
 判据：脚本 `import OCC` → 必须 cad-occt；只 `import ezdxf`/`win32com` → 默认 `python` 即可。
 **三个环境都没有 PyQt6**，GUI（`main.py`）当前起不来；也都没有 pytest。
+
+⚠️ **cad-occt 的 numpy 走 MKL，直接调 `$PY` 时 `Library/bin` 不在 PATH**（没经过
+`conda activate`）⇒ **任何 `numpy.linalg` 调用都会以 Windows 致命异常 0xc06d007f
+静默杀进程**（无 faulthandler 时连回溯都没有）：MKL 的 DLL 是**延迟加载**的，
+加载与 IPC 经由 `Library/bin`，PATH 里没有就解析失败；`np.dot`/OCC 几何不走
+LAPACK 所以一直没暴露。实测触发路径：ezdxf 读**拟合点 SPLINE**（`ctrl=0, fit≠0`）
+必做插值拟合 → `np.linalg.solve` → 崩——YZYX `_yz.dxf` 是第一个这样的靶子
+（`8A9/8AC/8AD` 三条 SPLINE，2026-10-12）。修法：跑之前
+`export PATH=/c/Users/yaoshuo/miniconda3/envs/cad-occt/Library/bin:$PATH`。
 
 ### 启动应用
 
@@ -314,7 +327,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 99.5%+ 时局部可见缺陷仍零命中（bracket 三缺陷、YZYX 五处标记全靠目视）——
 历史缺陷已转成自动断言，**每次修复的例行检查序列**：
 
-1. `python -m src.rebuild.selftest` — 367 项
+1. `python -m src.rebuild.selftest` — 373 项
 2. `PYTHONIOENCODING=utf-8 $PY run_rebuild_acceptance.py` — 9 绿 + 体积/bbox
    阈值判红（0.5%/1mm，仅 expect=="ok"）+ bracket 缺陷盒·点断言（PROBES 表：
    三缺陷盒 + 凸台右弧两盒 + 3 点分类；gold/shift 2026-10-11 定标实测，
@@ -468,6 +481,26 @@ ezdxf+numpy，**跑默认 python**；`verify/step_probe.py`（读 STEP 量尺寸
 `features/side_channels.py`（挂耳月牙缺口/张缝/销孔，`depends_on` 顺序契约）、
 `views/correspondence.resolve_frame_mirrors`（帧镜像裁决）——最后一条 `[GAP]`
 （bracket 两条）随之消灭，验收表 **9 绿**。
+**密集大图视图分离 2026-10-12 落地**（YZYX 齿箱上盖——新框架第一个密集大图：
+图幅 1830×1260、5 视图，此前 9 个靶子全是间距宽松的小件）——三堵墙：
+①`view_detector._frame_by_long_lines` + `_sheet_frame` 图框/家具识别（剥框后
+切分阈值 71.28/50.40 → 47.29/34.86；家具 16 handle 记进 `Drawing.sheet_frame`）；
+②两段式聚类（先全局切行、再行内切列）在"同列上下堆叠、邻列视图 y 跨度盖住空隙"
+上**结构性失效**（「c 向」与下方大拱之间空着 110.7mm 仍被俯视图盖进同一行，
+且两者 x 完全重合 ⇒ 永不切开）⇒ 改递归 `_xy_cut`（每块先问 y 再问 x），
+5 视图与打印件逐位对上；③2×N 布局下"恰好一个视图同时有行、列伙伴"的判据失效
+⇒ `view_typer._extent_score` **三等定律裁决**（列伙伴同宽=长对正、行伙伴同高=
+高平齐；满足 +1/违背 −1，唯一最大且 >0 才裁决，否则照旧报疑）⇒ V1 +2 判 FRONT。
+**特征树 0 → 22**；107 项拦路疑问 ⇒ 门控按设计拒绝发射，`--force` 照建
+**+394%**（38.4M vs v15a 7.78M，bbox z 375 vs 203）⇒ **下一堵墙 = 特征识别**
+（98 项是"V3 中心线定出 3D 轴、图纸没给半径"，即"轴线读出来了、特征没读出来"），
+立项见 `docs/ASSESSMENT_20261006.md` §C6。⚠️ 无基准三件套（`yz_accept.py`：27
+材料点 + 五视图 HLR 评分）建在 **v15a 零件系**上（探针点、`yz_hlr.SPLIT_X=−96.5`
+都是零件系常量），新框架模型在**图纸坐标系**（平移+轴序不同）——给它打分前须先
+做零件系变换，否则量的全是坐标系错位（2026-10-12 实测这个假象：11 个"期望 IN"
+点全落空、TL/TR 视图空）。顺带修正：YZYX `8A9` 是**画在细实线层的 SPLINE 波浪
+断裂线**（bbox 与「c」窗口逐位重合）⇒ ASSESSMENT §C4"真实图纸零命中断裂线"
+的按图层/线型名扫描**漏了**这种画法。
 `src/rebuild/` 现有：`model/`（Claim/geom/geom2d/ids/feature_tree/questions）、
 `evidence/`（dxf_reader/model + text_parser）、
 `views/`（view_detector + view_typer + correspondence 跨视图对应 + **ring 轮廓环仪器**）、
@@ -485,7 +518,7 @@ step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 367 项自检（2026-10-11 约定沉淀后实测），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 373 项自检（2026-10-12 视图分离守卫后实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]

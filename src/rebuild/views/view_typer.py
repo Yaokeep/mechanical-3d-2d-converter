@@ -48,9 +48,19 @@ from ..model.questions import OpenQuestion, Question, QuestionList
 #: 区间重叠容差（mm）—— 视图是精确对齐的，给一点余量防浮点比较
 ALIGN_TOL = 0.5
 
+#: 等长判据的容差（三等定律用）——相对 2% 与绝对 0.5mm 取大
+EXTENT_TOL_FRAC = 0.02
+EXTENT_TOL_ABS = 0.5
+
 
 def _overlap(a_lo: float, a_hi: float, b_lo: float, b_hi: float) -> bool:
     return min(a_hi, b_hi) - max(a_lo, b_lo) > ALIGN_TOL
+
+
+def _same_extent(a: float, b: float) -> bool:
+    """两段长度是否"等长"（同一根轴上的投影长度必然相等）。"""
+    return abs(a - b) <= max(EXTENT_TOL_ABS,
+                             EXTENT_TOL_FRAC * max(abs(a), abs(b)))
 
 
 def _partners(views: list[View]) -> tuple[dict[str, list[View]], dict[str, list[View]]]:
@@ -73,6 +83,59 @@ def _partners(views: list[View]) -> tuple[dict[str, list[View]], dict[str, list[
                 rows[a.id].append(b)
                 rows[b.id].append(a)
     return cols, rows
+
+
+def _extent_score(v: View, cols: dict[str, list[View]],
+                  rows: dict[str, list[View]]) -> int:
+    """候选主视图的"三等定律"得分：满足的伙伴数 − 违背的伙伴数。
+
+    列伙伴在共享轴（图纸横向）上应等宽（长对正），行伙伴应等高（高平齐）。
+    违背的伙伴说明它不是标准三视图的那一对 —— 局部视图/辅助视图只画零件的
+    一部分，本来就不与主视图等长，故天然被这条排除。
+    """
+    assert v.bbox is not None
+    w = v.bbox.xmax - v.bbox.xmin
+    h = v.bbox.ymax - v.bbox.ymin
+    score = 0
+    for p in cols[v.id]:
+        assert p.bbox is not None
+        score += 1 if _same_extent(w, p.bbox.xmax - p.bbox.xmin) else -1
+    for p in rows[v.id]:
+        assert p.bbox is not None
+        score += 1 if _same_extent(h, p.bbox.ymax - p.bbox.ymin) else -1
+    return score
+
+
+def _pick_front_by_extent(cands: list[View], cols: dict[str, list[View]],
+                          rows: dict[str, list[View]]) -> View | None:
+    """多候选时用**三等定律**裁决主视图（长对正/高平齐）。
+
+    为什么需要（2026-10-12，YZYX 齿箱上盖）：判据"恰好一个视图同时有行、列
+    伙伴"只对三视图 L 型布局成立。YZYX 是两列多行的 5 视图布局，**五个视图
+    全都有行有列伙伴** ⇒ 判据失效 ⇒ 全表 UNKNOWN ⇒ 特征树 0 条。
+
+    补充依据是投影本身的性质（GB 制图"三等定律"）：
+      · 长对正：主视图与俯视图**同宽**（都量零件的 X 向）
+      · 高平齐：主视图与左视图**同高**（都量零件的 Z 向）
+      · 宽相等：俯视图的高 = 左视图的宽（本函数未用，留作后续加严）
+    换个说法：**真正的锚点，它的每个对齐伙伴都在共享轴上与它等长**。
+
+    YZYX 实测（尺寸取自检测出的视图包围盒，只含轮廓图元）：
+      V1 345×187.5 —— 列伙伴 V3(345×395) 同宽 ✓、行伙伴 V0(395×187.5) 同高 ✓ ⇒ +2
+      V0 395×187.5 —— V4(395×187.5) ✓、V1 同高 ✓、V2(224×121) ✗ ⇒ +1
+      V3 345×395、V4 395×187.5 ⇒ −1（其伙伴是 V2 局部视图 / 异向视图）
+    唯一最大者 V1 ⇒ 主视图 —— 与手工读图一致（A—A 全剖即主视图）。
+
+    最高分不唯一（如正方形零件几个视图全同尺寸）或 ≤0 时返回 None，
+    让 ``_type_without_front`` 照旧报疑 —— 不硬猜。
+    """
+    if len(cands) < 2:
+        return None
+    scored = sorted(cands, key=lambda v: -_extent_score(v, cols, rows))
+    best = _extent_score(scored[0], cols, rows)
+    if best <= 0 or _extent_score(scored[1], cols, rows) == best:
+        return None
+    return scored[0]
 
 
 def _y_center(b: BBox2) -> float:
@@ -219,6 +282,13 @@ def _type_by_layout(d: Drawing, qs: QuestionList,
             front.type = Claim(ViewType.FRONT, "layout:both_partners",
                                Tier.CONVENTION,
                                evidence=tuple(front.evidence[:1]))
+        elif len(cands) > 1:
+            # 多候选（2×2 以上的网格布局）：用三等定律裁决，裁不出就照旧报疑
+            front = _pick_front_by_extent(cands, cols, rows)
+            if front is not None:
+                front.type = Claim(ViewType.FRONT, "layout:equal_extent",
+                                   Tier.CONVENTION,
+                                   evidence=tuple(front.evidence[:1]))
 
     if front is None:
         _type_without_front(views, untyped, cols, qs)

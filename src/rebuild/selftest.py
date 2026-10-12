@@ -26,7 +26,7 @@ from src.rebuild.evidence.dxf_reader import (                            # noqa:
     classify_role,
     read_dxf,
 )
-from src.rebuild.evidence.model import Role, ViewType                    # noqa: E402
+from src.rebuild.evidence.model import Role, View, ViewType              # noqa: E402
 from src.rebuild.evidence.text_parser import (                           # noqa: E402
     TextKind,
     find_projection,
@@ -51,7 +51,7 @@ from src.rebuild.model.feature_tree import (                             # noqa:
     Part,
 )
 from src.rebuild.model.geom import Axis3, Point3, Vector3                # noqa: E402
-from src.rebuild.model.geom2d import profile_span                        # noqa: E402
+from src.rebuild.model.geom2d import BBox2, profile_span                 # noqa: E402
 from src.rebuild.model.ids import FeatureId                              # noqa: E402
 from src.rebuild.features import (                                       # noqa: E402
     PARAMS,
@@ -71,6 +71,12 @@ from src.rebuild.views import (                                          # noqa:
     detect_views,
     extract_ring,
     type_views,
+)
+from src.rebuild.views.view_detector import _cluster_1d, _xy_cut         # noqa: E402
+from src.rebuild.views.view_typer import (                               # noqa: E402
+    _extent_score,
+    _partners,
+    _pick_front_by_extent,
 )
 from src.rebuild.pipeline import rebuild, understand                     # noqa: E402
 
@@ -411,6 +417,47 @@ def test_views() -> None:
     # D5 三视图 v4 无文字 ⇒ 标注数必须为 0（不能凭空造出标签来定性）
     check("三视图 v4 无任何标注",
           all(len(v.annotations) == 0 for v in d.views))
+
+    # ---- D6 递归 XY 切分：同列上下堆叠的视图必须切开（YZYX 布局，2026-10-12）----
+    # 两段式（先切行、再在行内切列）在"同列上下堆叠、且邻列视图的 y 跨度盖住
+    # 这两视图之间的空隙"上结构性失效：YZYX 的「c 向」与下方大拱视图空着 110.7mm
+    # （阈值才 34.9）仍被并进同一行，行内按 X 切时两者 x 完全重合 ⇒ 永远切不开。
+    # 递归切分在每个子块上重新问"还有没有 y 向空隙"，故 5 个视图逐层切出。
+    # 窗口尺寸取自 _yz.dxf 实测（_yz.dxf 已 gitignore，故此处用同形合成盒）。
+    yz_boxes = [
+        BBox2(3265.4, 1541.2, 3660.4, 1728.7),   # 0 右上 C—C 复合投影
+        BBox2(2478.3, 1541.2, 2823.3, 1728.7),   # 1 左上 A—A 全剖
+        BBox2(3337.4, 1194.3, 3561.5, 1315.3),   # 2 「c 向」局部视图
+        BBox2(2478.3,  857.3, 2823.3, 1252.3),   # 3 俯视
+        BBox2(3265.4,  896.1, 3660.4, 1083.6),   # 4 右下大拱视图
+    ]
+    groups = _xy_cut(list(range(len(yz_boxes))), yz_boxes, 47.29, 34.86)
+    check("递归 XY 切分：YZYX 布局切出 5 簇", len(groups) == 5, str(groups))
+    g_of = {i: k for k, g in enumerate(groups) for i in g}
+    check("递归 XY 切分：「c 向」与下方大拱不在同一簇（两段式在此失效）",
+          g_of.get(2) != g_of.get(4), str(groups))
+    # 对照：两段式的第一步（全局按 Y 切行）就会把 2 与 4 并进同一行 —— 这是失效点
+    rows_old = _cluster_1d([(b.ymin, b.ymax) for b in yz_boxes], 34.86)
+    check("对照：两段式第一步把「c 向」与下方大拱并进同一行",
+          any(2 in r and 4 in r for r in rows_old), str(rows_old))
+
+    # ---- D7 三等定律裁决主视图（YZYX 布局，2026-10-12）----
+    # 判据"恰好一个视图同时有行、列伙伴"只对三视图 L 型布局成立；YZYX 两列多行
+    # 5 视图 ⇒ 五个全是"有行有列" ⇒ 旧判据失效 ⇒ 全表 UNKNOWN、特征树 0 条。
+    # 补充依据取自投影本身：真锚点的**每个**对齐伙伴都在共享轴上与它等长。
+    yz_views = [View(id=f"V{i}", bbox=b) for i, b in enumerate(yz_boxes)]
+    cols, rows = _partners(yz_views)
+    scores = {v.id: _extent_score(v, cols, rows) for v in yz_views}
+    check("三等定律打分：V1 = +2 且唯一最大",
+          scores == {"V0": 1, "V1": 2, "V2": -3, "V3": -1, "V4": -1}, str(scores))
+    check("三等定律裁决主视图 = V1（与手工读图一致）",
+          _pick_front_by_extent(yz_views, cols, rows) is yz_views[1])
+    # 负例：最高分并列（正方形零件的视图全同尺寸）不许硬猜
+    square = [View(id="A", bbox=BBox2(0, 0, 100, 100)),
+              View(id="B", bbox=BBox2(0, 200, 100, 300))]
+    cols2, rows2 = _partners(square)
+    check("三等定律最高分并列 ⇒ 返回 None（不硬猜）",
+          _pick_front_by_extent(square, cols2, rows2) is None)
 
 
 # ============ E. 验证层 ============
