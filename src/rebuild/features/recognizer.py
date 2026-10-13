@@ -1013,6 +1013,9 @@ def merge_section_axes(corr: CorrespondenceResult, rep: RecognizeReport,
        圆图元的特征，只记账。
     3. 都没有且**带半径** ⇒ 图纸明写的一处孔/凸台，建成新特征；
        不带半径的中心线（``radius is None``）⇒ 别硬造特征，只记待确认。
+       半径来自十字中心线交点上的圆（method ``centerline:*``）时**不建** ——
+       那只是圆通道的复述，圆没建成特征是圆通道自己的结论（无轮廓对/已被
+       分区表达），疑问在那边已经报过，这里再报一次是同一桩事的第二种问法。
     """
     for c in corr.axes():
         axis = c.mapping.value
@@ -1047,8 +1050,13 @@ def merge_section_axes(corr: CorrespondenceResult, rep: RecognizeReport,
                 if e not in owner.evidence:
                     owner.evidence.append(e)
             rep.notes.append(
-                f"剖面标题 r{r_new.value:g} 轴与已读圆柱重合（宿主 #{owner.id}）"
-                f"⇒ 只并证据，不另建特征")
+                f"r{r_new.value:g} 轴（{'中心线交点' if str(r_new.method).startswith('centerline:') else '剖面标题'}）"
+                f"与已读圆柱重合（宿主 #{owner.id}）⇒ 只并证据，不另建特征")
+            continue
+        if str(r_new.method).startswith("centerline:"):
+            rep.notes.append(
+                f"十字中心线交点 r{r_new.value:g} 处不另建特征"
+                "（半径是圆通道的复述，该圆未成特征 —— 疑问在圆通道那边）")
             continue
         f = Feature(
             id=part.next_id(),

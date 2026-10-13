@@ -80,6 +80,10 @@ MATCH_TOL = 0.6
 DUP_TOL = 0.05
 #: 视图间共享轴的取值一致性容差（比 MATCH_TOL 松：视图间可能有出图偏差）
 AGREE_TOL = 1.0
+#: 中心线"线段真的交叉"判定容差（mm）。中心线是**有限长线段**，交点必须
+#: 落在双方跨度内才算数（无限延长线相交不算）——见 axes_from_centerlines。
+#: 0.5 只留给端点噪声；放大它会把"某孔的十字标记纵线"与别处的横线错配成伪轴。
+EXT_TOL = 0.5
 
 #: 镜像投票的门槛（mm）：翻面解释必须比现行解释多解释这么长的轮廓线，才动
 #: 帧的朝向。对称零件上两解同分（差 0），按此纪律保持现行解释不动。
@@ -937,20 +941,40 @@ def _centerline_orient(geom: Line2) -> tuple[str, float] | None:
     return None
 
 
+def _dedup_centerlines(segs: list[tuple[EvidenceRef, float, float, float]]
+                       ) -> list[tuple[list[EvidenceRef], float, float, float]]:
+    """同一条中心线被画了两遍（逐位重合的重复实体）⇒ 并成一条，图元并列。
+
+    YZYX 实测：V3 的竖、横中心线各有一对逐位重合的重复实体（8AA/8BA、
+    8AB/8BB）—— 不去重的话每处真交点在疑问表里都翻倍成两条。
+    """
+    groups: dict[tuple[int, int, int],
+                 list[tuple[EvidenceRef, float, float, float]]] = {}
+    for h, pos, lo, hi in segs:
+        key = (round(pos / DUP_TOL), round(lo / DUP_TOL), round(hi / DUP_TOL))
+        groups.setdefault(key, []).append((h, pos, lo, hi))
+    return [([h for h, *_ in items], items[0][1], items[0][2], items[0][3])
+            for items in groups.values()]
+
+
 def axes_from_centerlines(d: Drawing, frames: dict[str, ViewFrame],
                           qs: QuestionList) -> list[Correspondence]:
     """中心线 ⇒ 3D 轴（同视图十字交叉）或 ⇒ 位置约束（跨视图共线）。
 
-    **本仓库的图纸一条中心线都没有**（见下方"实测"），所以这条路径只能靠
-    合成证据单测；它保留的原因是真图纸（用户手画的）一定有中心线。
+    框架首批九张靶子里只有 block_3view 带中心线（6 条，不成网）；YZYX 是
+    第一张**中心线成网**的真图纸（V3 一张里 35 条），两条纪律由它实测定下：
 
-    实测（2026-09-28）：bracket 三视图/剖面图纸、spoon、pf60k、block_3view
-    六张图逐张查过，`Kind.AXIS` 数分别是 0/0/0/0/6 —— 前五张是 HLR 机器出图，
-    根本不画中心线；block_3view 有 6 条但它们不参与轮廓（白名单已排除）。
+    * **交叉要"线段真的交叉"**——中心线是有限长线段。把每个竖线×每个横线
+      按无限延长线全组合（V3 得 306 对）只剩 18 处是真交点，其余全是把各孔
+      十字标记的纵线与别处的横线错配出来的伪轴（98 条"参考轴还是特征轴
+      未定"疑问里 90 条出自这里）；
+    * **交点上的圆给出半径**——真交点处图上有圆（YZYX 18/18），半径不必猜。
+      挂到轴上走 ``merge_section_axes`` 与特征/分区并轴：图上的十字标记与圆
+      本就是同一个特征的两种画法，合起来才是完整声明。
     """
-    # 收集：每个视图里的竖直/水平中心线
-    vert: dict[str, list[tuple[EvidenceRef, float]]] = {}   # 图纸 x
-    horiz: dict[str, list[tuple[EvidenceRef, float]]] = {}  # 图纸 y
+    # 收集：每个视图里的竖直/水平中心线（连线段跨度一起收，交叉判定要用）
+    vert: dict[str, list[tuple[EvidenceRef, float, float, float]]] = {}
+    horiz: dict[str, list[tuple[EvidenceRef, float, float, float]]] = {}
     for e in d.evidence:
         if e.kind != Kind.AXIS or not isinstance(e.geom, Line2):
             continue
@@ -960,9 +984,16 @@ def axes_from_centerlines(d: Drawing, frames: dict[str, ViewFrame],
         o = _centerline_orient(e.geom)
         if o is None:
             continue            # 斜中心线（斜视图用）暂不处理
-        (vert if o[0] == "v" else horiz).setdefault(v.id, []).append((e.handle, o[1]))
+        g = e.geom
+        if o[0] == "v":
+            vert.setdefault(v.id, []).append(
+                (e.handle, o[1], min(g.start.y, g.end.y), max(g.start.y, g.end.y)))
+        else:
+            horiz.setdefault(v.id, []).append(
+                (e.handle, o[1], min(g.start.x, g.end.x), max(g.start.x, g.end.x)))
 
     out: list[Correspondence] = []
+    idx: dict[str, Evidence] | None = None
 
     # ---- 3a 同视图交叉 ⇒ 一条垂直于该视图的 3D 轴 ----
     for vid, vs in vert.items():
@@ -972,34 +1003,64 @@ def axes_from_centerlines(d: Drawing, frames: dict[str, ViewFrame],
         hs = horiz.get(vid, [])
         if not hs:
             continue
-        for h_v, x_l in vs:
-            for h_h, y_l in hs:
+        if idx is None:
+            idx = _index(d)
+        view = next((x for x in d.views if x.id == vid), None)
+        circles: list[tuple[Point3, float, EvidenceRef]] = []
+        if view is not None:                      # 视图里的圆（模型坐标）
+            for h, c2, r2 in _circles_of(d, idx, view):
+                circles.append((f.to_model(c2.x, c2.y), r2, h))
+        vs_u = _dedup_centerlines(vs)
+        hs_u = _dedup_centerlines(hs)
+        for v_hs, x_l, vy0, vy1 in vs_u:
+            for h_hs, y_l, hx0, hx1 in hs_u:
+                # 线段真的交叉吗？（无限延长线相交不算 —— 见 docstring）
+                if not (hx0 - EXT_TOL <= x_l <= hx1 + EXT_TOL
+                        and vy0 - EXT_TOL <= y_l <= vy1 + EXT_TOL):
+                    continue
                 um, vm = f.u_to_model(x_l), f.v_to_model(y_l)
                 coords = {f.u_axis: um, f.v_axis: vm, f.p_axis: 0.0}
                 origin = Point3(coords["x"], coords["y"], coords["z"])
                 dirs = {"x": Vector3(1, 0, 0), "y": Vector3(0, 1, 0),
                         "z": Vector3(0, 0, 1)}
-                mapping = Claim(
-                    Axis3(origin, dirs[f.p_axis]),
-                    "convention:centerline_cross", Tier.CONVENTION,
-                    evidence=(h_v, h_h),
-                )
-                out.append(Correspondence(
-                    CorrKind.AXIS, ((vid, h_v), (vid, h_h)), mapping,
-                    note=f"{vid} 十字中心线交点 ⇒ 垂直于该视图的轴",
-                ))
+                refs = tuple((vid, h) for h in [*v_hs, *h_hs])
+                ev = tuple(h for _, h in refs)
+                # 交点上正好有圆 ⇒ 半径由图给出（同心组取**最小**者：最内圈
+                # 是孔本体；其余同心圆的声明在圆通道那边各走各的）
+                near = [(r2, h2) for mc, r2, h2 in circles
+                        if abs(mc.x - origin.x) <= MATCH_TOL
+                        and abs(mc.y - origin.y) <= MATCH_TOL]
+                note = f"{vid} 十字中心线交点 ⇒ 垂直于该视图的轴"
+                if near:
+                    near.sort(key=lambda t: t[0])
+                    r2, h2 = near[0]
+                    mapping = Claim(
+                        Axis3(origin, dirs[f.p_axis],
+                              Claim(r2, "centerline:circle_at_cross",
+                                    Tier.PROJECTION, evidence=(h2,))),
+                        "convention:centerline_cross", Tier.CONVENTION,
+                        evidence=(h2, *ev),
+                    )
+                    note += f"，半径由图上的 r{r2:g} 圆给出"
+                else:
+                    mapping = Claim(
+                        Axis3(origin, dirs[f.p_axis]),
+                        "convention:centerline_cross", Tier.CONVENTION,
+                        evidence=ev,
+                    )
+                out.append(Correspondence(CorrKind.AXIS, refs, mapping, note=note))
 
     # ---- 3b 跨视图共线 ⇒ 同一位置约束（轴方向由第三视图或圆补） ----
     pos: dict[tuple[str, str], list[tuple[str, EvidenceRef, float]]] = {}
     for vid, vs in vert.items():
         f = frames[vid]
-        for h, x_l in vs:
+        for h, x_l, _lo, _hi in vs:      # 4 元组：跨段判定只用位置
             val = f.u_to_model(x_l)
             key = (f.u_axis, f"{val:.1f}")
             pos.setdefault(key, []).append((vid, h, val))
     for vid, hs in horiz.items():
         f = frames[vid]
-        for h, y_l in hs:
+        for h, y_l, _lo, _hi in hs:
             val = f.v_to_model(y_l)
             key = (f.v_axis, f"{val:.1f}")
             pos.setdefault(key, []).append((vid, h, val))
