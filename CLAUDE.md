@@ -688,6 +688,11 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   correspondence `DUP_TOL=0.05`、revolve `_cone_zone`、sw_builder `no_snap`/
   `_split_zero_width_slits`/`_full_circle_of`，OCC 表 9 绿 + SW 表 9 绿
   （PF60K 261,943.9 / 261,776.7 两表转绿）、selftest 367 项）
+  （2026-10-12 内容已入正文、**未收口**：v0.6.26 提交（5692df4 密集大图视图分离
+  ——递归 XY 切分 + 图框/家具剔除 + 三等定律主视图裁决）按惯例只带 `v0.6.x:`
+  前缀——tag 仍 `v0.6.25`、8 处版本字符串仍 0.6.25，待下次发版一并 bump。
+  该提交已同步更新本文件：新框架节「密集大图视图分离」段、MKL PATH 环境坑、
+  8A9 细实线断裂线修正，selftest 367→373（OCC 验收表 9 绿逐位不变））
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。
