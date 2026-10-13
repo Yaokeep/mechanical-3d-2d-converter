@@ -13,7 +13,11 @@
     少算不进判红：消影/剖切制备差异会让"多"波动，"缺"才是硬信号）
   判红项打印 [RED]；全过退出码 0，否则 1。
 
-用法: PYTHONIOENCODING=utf-8 $PY yz_accept.py [stepfile] [thresh_mm]
+用法: PYTHONIOENCODING=utf-8 $PY yz_accept.py [stepfile] [thresh_mm] [--frame auto|part|fw]
+
+坐标系：三件套常量全在 v15a 零件系；新框架 src/rebuild 发射的模型在图纸
+坐标系（平移差 x−2650.80 / y−3462.94 / z−1541.25）——'auto'（默认）按 bbox
+自动识别并平移进零件系（yz_frame.py），'--frame' 可显式指定。
 
 两段式：本脚本用 $PY 跑（材料探针 + HLR 都要 OCC）；图纸对比评分部分
 ezdxf/numpy 在**默认 python** 子进程里跑——numpy linalg 与 OCC 同进程会
@@ -31,8 +35,12 @@ MORE_SLACK = 10
 
 
 def main(argv: list[str]) -> int:
-    src = argv[1] if len(argv) > 1 else "CAD/temp_output/_yz_3d.step"
-    thresh = float(argv[2]) if len(argv) > 2 else 2.0
+    from yz_frame import pop_frame_argv
+
+    argv = argv[1:]
+    frame = pop_frame_argv(argv)
+    src = argv[0] if argv else "CAD/temp_output/_yz_3d.step"
+    thresh = float(argv[1]) if len(argv) > 1 else 2.0
 
     bad = 0
     print("=" * 80)
@@ -42,7 +50,7 @@ def main(argv: list[str]) -> int:
     # 1. 材料探针（OCC，本进程）
     from yz_probe_mat import run_probe
     print("[1/3] 材料探针 27 点")
-    fails, total = run_probe(src)
+    fails, total = run_probe(src, frame)
     if fails:
         print(f"  [RED] {fails} 点与期望不符")
         bad += 1
@@ -50,7 +58,7 @@ def main(argv: list[str]) -> int:
     # 2. HLR 投影（OCC，本进程）
     from yz_hlr import run_hlr
     print("[2/3] 五视图 HLR")
-    run_hlr(src, "CAD/temp_output/_yz_hlr.json")
+    run_hlr(src, "CAD/temp_output/_yz_hlr.json", frame=frame)
 
     # 3. 图纸对比评分（默认 python 子进程，两段式 + shell=True——见 docstring）
     print("[3/3] 图纸对比评分")

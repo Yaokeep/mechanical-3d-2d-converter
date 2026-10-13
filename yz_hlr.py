@@ -6,7 +6,9 @@
   {"TL": [[[u,v],...], ...], "BL": [...], "TR": [...]}
 TL 为 A—A 全剖（保留 y>=0 半，从 -Y 看）；BL 俯视；
 TR 为 C—C 复合投影（见下）；TRW 为其反方向备选（评分对照用）。
-用法: PYTHONIOENCODING=utf-8 $PY yz_hlr.py [stepfile] [out.json]
+用法: PYTHONIOENCODING=utf-8 $PY yz_hlr.py [stepfile] [out.json] [--frame auto|part|fw]
+坐标系：切平面 SPLIT_X 为零件系常量；新框架模型在图纸系，自动平移进零件系
+（yz_frame.py），'--frame' 可显式指定。
 总入口见 yz_accept.py（三件套一起跑 + 基线判红）。
 """
 import sys
@@ -104,13 +106,23 @@ def project(shp, N, Vx):
     return discretize(hs.VCompound()) + discretize(hs.OutLineVCompound())
 
 
-def run_hlr(src: str, dst: str, verbose: bool = True) -> dict:
-    """读 STEP → 五视图 HLR 折线 → 写 JSON。返回 res dict。"""
+def run_hlr(src: str, dst: str, verbose: bool = True,
+            frame: str = "auto") -> dict:
+    """读 STEP → 五视图 HLR 折线 → 写 JSON。返回 res dict。
+
+    ``frame``：'auto' 按 bbox 识别坐标系（新框架模型在图纸系，自动平移进
+    零件系——切平面 SPLIT_X 与评分映射都是零件系常量，见 yz_frame.py）。
+    """
+    from yz_frame import to_part_frame, frame_note
+
     rd = STEPControl_Reader()
     if rd.ReadFile(src) != IFSelect_RetDone:
         raise RuntimeError("STEP 读取失败")
     rd.TransferRoots()
     shape = rd.OneShape()
+    shape, used = to_part_frame(shape, frame)
+    if verbose:
+        print(frame_note(used))
 
     VIEWS = [
         ("TL", half_yplus(shape), gp_Dir(0, -1, 0), gp_Dir(1, 0, 0)),
@@ -158,9 +170,13 @@ def run_hlr(src: str, dst: str, verbose: bool = True) -> dict:
 
 
 def main() -> int:
-    src = sys.argv[1] if len(sys.argv) > 1 else "CAD/temp_output/_yz_3d.step"
-    dst = sys.argv[2] if len(sys.argv) > 2 else "CAD/temp_output/_yz_hlr.json"
-    run_hlr(src, dst)
+    from yz_frame import pop_frame_argv
+
+    argv = sys.argv[1:]
+    frame = pop_frame_argv(argv)
+    src = argv[0] if argv else "CAD/temp_output/_yz_3d.step"
+    dst = argv[1] if len(argv) > 1 else "CAD/temp_output/_yz_hlr.json"
+    run_hlr(src, dst, frame=frame)
     return 0
 
 

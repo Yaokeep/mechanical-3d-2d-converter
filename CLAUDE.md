@@ -61,7 +61,10 @@ PYTHONIOENCODING=utf-8 python run_rebuild_acceptance.py --sw [靶子...] # SW �
 
 # YZYX 齿箱上盖无基准定量验收三件套（27 点材料探针 + 五视图 HLR 投影评分，
 # 基线 TL 缺0/多49、BL 缺0/多50、TR 缺0/多38，判红=比 v15a 基线更差）
-PYTHONIOENCODING=utf-8 $PY yz_accept.py [stepfile] [thresh_mm]
+# --frame auto（默认）按 bbox 自动识别零件系/图纸系（yz_frame.py，2026-10-13）——
+# 新框架 src/rebuild 模型在图纸系，直接可评，不必手工转换
+PYTHONIOENCODING=utf-8 $PY yz_accept.py [stepfile] [thresh_mm] [--frame auto|part|fw]
+$PY yz_frame.py in.step [out.step] [--to part|fw]   # 独立坐标系转换器
 
 # 简单模型回归套件 — 6 个已验证用例（体积精确匹配 + 逐轴 bbox + 实体数）
 # 报告输出 CAD/temp_output/regression_report.txt；--sw 附加 SW 时间戳模型生成
@@ -309,7 +312,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 | `docs/` | `CHANGELOG.md` — v0.5.4~v0.6.22 逐版本根因叙事，倒序四段（新框架 src/rebuild 各阶段 v0.6.19~v0.6.22 在前 / 主线 v0.6.11~v0.6.20 / dxf_to_3d_general 精度收敛链 v0.5.4~v0.6.10 / dxf_to_sw_features v0.6.6~v0.6.7）。查"某阈值为何是 0.1"这类历史依据时看它；`ARCHITECTURE.md` — 新框架设计（§3 三原则、§5 分层、§8 阶段状态）；`ASSESSMENT_20261006.md` — 2026-10-06 转换能力自评（问题分级 A~F + 优先级）——"下一步做什么"看它 |
 | `.claude/` | `settings.local.json` — 预授权的 Bash 权限列表；`skills/` — 项目级启用的技能符号链接 |
 | `.agents/skills/` | 4 个技能：`mechanical-engineer`、`solidworks-cad`（泵叶轮参数化）、`python-code-review`（含 5 个参考文件）、`python-packaging`；仅前两个经符号链接在项目级启用。根目录 `skills-lock.json` 锁定 `mechanical-engineer` 来源 |
-| `CAD/` | 51 个 VBA 宏 `.bas`（本目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代；另 4 个在仓库根 `soldwork/`），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`、`20230425-160012-85913` 尼龙王 φ19×100 + 夹紧环 φ60×30——PDF 矢量化来源：线条双线、圆弧打成 LWPOLYLINE 折线（2138 条）、0 文字标注，解析须读折线顶点；`YZYX95.4-20齿箱上盖零件图.dwg`（φ220 大件靶子，与 D79307 无关；2026-10-06 手工参数化重建 v15a——用户读法三轮闭环，转换副本 `CAD/temp_output/_yz.dxf`，建模脚本根目录 `_yz_build.py`；无基准定量验收三件套 `yz_accept.py`（27 点材料探针 + 五视图投影评分，2026-10-11 验证制度化入库）；全貌与工具链见记忆 yzyx-gearbox-cover-drawing）；`_wx_build.py`（gitignored）是按图手工建模的真值参照）、`temp_output/` 闭环验证链工作区（图纸 DXF 迭代样本——`bracket_angker_三视图_v4.dxf` 与 `bracket_angker_图纸_20260922_剖面图.dxf` 是当前两个 bracket 基线、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf`、`D79307A264FCA6D8EC32E95B1B11BDBD.dxf`/`IMU.dxf`/`轴测量.dxf`（各配 `_剖面图.dxf`；轴测量是唯一 100% 覆盖靶子）、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例 |
+| `CAD/` | 51 个 VBA 宏 `.bas`（本目录 24 含 VerifySW2025_v33~v45 验证系列 + `verify_log/` 27 个早期迭代；另 4 个在仓库根 `soldwork/`），全部入库、`SW2025_API_REFERENCE.md`、测试样本 DXF/DWG（`20160112` 阶梯轴、`reducer`、`法兰练习`、`图形练习`、`20230425-160012-85913` 尼龙王 φ19×100 + 夹紧环 φ60×30——PDF 矢量化来源：线条双线、圆弧打成 LWPOLYLINE 折线（2138 条）、0 文字标注，解析须读折线顶点；`YZYX95.4-20齿箱上盖零件图.dwg`（φ220 大件靶子，与 D79307 无关；2026-10-06 手工参数化重建 v15a——用户读法三轮闭环，转换副本 `CAD/temp_output/_yz.dxf`，建模脚本根目录 `_yz_build.py`；无基准定量验收三件套 `yz_accept.py`（27 点材料探针 + 五视图投影评分，2026-10-11 验证制度化入库；2026-10-13 起经 `yz_frame.py` 零件系↔图纸系自动变换，新框架模型直接可评）；全貌与工具链见记忆 yzyx-gearbox-cover-drawing）；`_wx_build.py`（gitignored）是按图手工建模的真值参照）、`temp_output/` 闭环验证链工作区（图纸 DXF 迭代样本——`bracket_angker_三视图_v4.dxf` 与 `bracket_angker_图纸_20260922_剖面图.dxf` 是当前两个 bracket 基线、`spoon_三视图.dxf`、`pf60k_闭环_三视图_20260817.dxf`、`D79307A264FCA6D8EC32E95B1B11BDBD.dxf`/`IMU.dxf`/`轴测量.dxf`（各配 `_剖面图.dxf`；轴测量是唯一 100% 覆盖靶子）、`generate_engineering_drawing.py` 等验证工具，源文件入库、输出产物 gitignored）、`test_simple/` 简单用例 |
 | `PDF/` | 空目录（预留放参考 PDF 文档） |
 | `三维/` | 闭环验证参考模型（gitignored）：`麒浚传动_PF60K-14-50-70-M4-L2-12.SLDPRT`、`bracket angker.stp`、`spoon.SLDPRT` / `spoon.STEP`、`勺子/`（勺子参考图 + STEP/STL 副本） |
 | `图片/` | 参考图片两张（`电机.PNG`、`齿轮罩.PNG`，2026-10-09 加入）——2026-10-11 起 gitignored（与 `三维/` 同类用户私有参考数据） |
@@ -334,7 +337,8 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
    shift=基准min−重建min，三视图/剖面图 y 差 3mm 各自记）
 3. 涉 SW 发射改动 → `--sw` 表（特征步数硬判；SW 表不判体积阈值——发射器口径差）
 4. 无基准靶子（YZYX）→ `PYTHONIOENCODING=utf-8 $PY yz_accept.py`（27 点材料
-   探针 + 五视图投影评分；判红 = 比 v15a 基线更差，缺>0 或 多>基线+10）
+   探针 + 五视图投影评分；判红 = 比 v15a 基线更差，缺>0 或 多>基线+10；
+   新框架模型直接喂——坐标系按 bbox 自动识别并平移，yz_frame.py）
 5. 视觉链（自动指标再绿也不能省）：`_render_dxf.py` 看图 → `_make_viewer.py`
    点选标记 → `_dump_sections.py`（SEC_PLANES 环境变量可覆盖平面）+
    `_draw_sections.py`（**CWD 必须仓库根**，_viz 相对路径）截面叠加 →
@@ -494,11 +498,15 @@ ezdxf+numpy，**跑默认 python**；`verify/step_probe.py`（读 STEP 量尺寸
 **特征树 0 → 22**；107 项拦路疑问 ⇒ 门控按设计拒绝发射，`--force` 照建
 **+394%**（38.4M vs v15a 7.78M，bbox z 375 vs 203）⇒ **下一堵墙 = 特征识别**
 （98 项是"V3 中心线定出 3D 轴、图纸没给半径"，即"轴线读出来了、特征没读出来"），
-立项见 `docs/ASSESSMENT_20261006.md` §C6。⚠️ 无基准三件套（`yz_accept.py`：27
+立项见 `docs/ASSESSMENT_20261006.md` §C6。✅ 无基准三件套（`yz_accept.py`：27
 材料点 + 五视图 HLR 评分）建在 **v15a 零件系**上（探针点、`yz_hlr.SPLIT_X=−96.5`
-都是零件系常量），新框架模型在**图纸坐标系**（平移+轴序不同）——给它打分前须先
-做零件系变换，否则量的全是坐标系错位（2026-10-12 实测这个假象：11 个"期望 IN"
-点全落空、TL/TR 视图空）。顺带修正：YZYX `8A9` 是**画在细实线层的 SPLINE 波浪
+都是零件系常量），新框架模型在**图纸坐标系**——2026-10-13 **零件系变换已落地**
+（`yz_frame.py`：推导为**纯平移**、轴序相同，`part = model − (2650.80, 3462.94,
+1541.25)`；三件套 `--frame auto` 按 bbox 自动识别，直接可评新框架模型）。
+`--force` 模型首评（§C6 起点基线）：**探针 11/27**（11 个"期望 IN"点全过、
+16 个"期望 OUT"点全失败——过实，与 +394% 一致）+ **HLR 缺 TL 205 / BL 359 /
+TR 179**；横向 ±172.5/±197.5/顶 187.5 已逐位对，缺的全在特征识别。
+顺带修正：YZYX `8A9` 是**画在细实线层的 SPLINE 波浪
 断裂线**（bbox 与「c」窗口逐位重合）⇒ ASSESSMENT §C4"真实图纸零命中断裂线"
 的按图层/线型名扫描**漏了**这种画法。
 `src/rebuild/` 现有：`model/`（Claim/geom/geom2d/ids/feature_tree/questions）、

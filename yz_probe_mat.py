@@ -7,7 +7,9 @@
 27 点期望由 v13/v14/v15/v15a 四轮用户读法修复逐一定案（2026-10-02~06），
 是"无基准件验收"里最接近金值的东西——**改动建模/重建后必须复跑**。
 
-用法: PYTHONIOENCODING=utf-8 $PY yz_probe_mat.py [stepfile]
+用法: PYTHONIOENCODING=utf-8 $PY yz_probe_mat.py [stepfile] [--frame auto|part|fw]
+坐标系：探针点为零件系常量；新框架发射的模型在图纸系，自动平移进零件系
+（yz_frame.py），'--frame' 可显式指定。
 总入口见 yz_accept.py（三件套一起跑 + 基线判红）。
 """
 import sys
@@ -55,13 +57,21 @@ PTS = [
 ]
 
 
-def run_probe(src: str) -> tuple[int, int]:
-    """逐点分类，打印 OK/!!。返回 (失败数, 总点数)。"""
+def run_probe(src: str, frame: str = "auto") -> tuple[int, int]:
+    """逐点分类，打印 OK/!!。返回 (失败数, 总点数)。
+
+    ``frame``：'auto' 按 bbox 识别坐标系（新框架模型在图纸系，自动平移进
+    零件系，见 yz_frame.py）；'part'/'fw' 显式指定。
+    """
+    from yz_frame import to_part_frame, frame_note
+
     rd = STEPControl_Reader()
     if rd.ReadFile(src) != IFSelect_RetDone:
         raise RuntimeError(f"STEP 读取失败: {src}")
     rd.TransferRoots()
     shape = rd.OneShape()
+    shape, used = to_part_frame(shape, frame)
+    print("  " + frame_note(used))
 
     fails = 0
     for name, x, y, z, exp in PTS:
@@ -76,8 +86,12 @@ def run_probe(src: str) -> tuple[int, int]:
 
 
 def main() -> int:
-    src = sys.argv[1] if len(sys.argv) > 1 else "CAD/temp_output/_yz_3d.step"
-    fails, total = run_probe(src)
+    from yz_frame import pop_frame_argv
+
+    argv = sys.argv[1:]
+    frame = pop_frame_argv(argv)
+    src = argv[0] if argv else "CAD/temp_output/_yz_3d.step"
+    fails, total = run_probe(src, frame)
     return 1 if fails else 0
 
 
