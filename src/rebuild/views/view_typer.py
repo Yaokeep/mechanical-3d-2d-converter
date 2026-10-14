@@ -40,7 +40,7 @@
 from __future__ import annotations
 
 from ..evidence.model import Drawing, ProjectionMethod, View, ViewType
-from ..evidence.text_parser import CutSpec, TextKind
+from ..evidence.text_parser import CutSpec, TextKind, strip_mtext_codes
 from ..model.claim import Claim, Tier
 from ..model.geom2d import BBox2
 from ..model.questions import OpenQuestion, Question, QuestionList
@@ -199,6 +199,22 @@ def _side_label_of(d: Drawing, v: View):
     return None
 
 
+def _direction_label_of(d: Drawing, v: View):
+    """本视图的标签若是**向视图标题**（「c 向」），返回它。
+
+    向视图按箭头方向投射、配置位置自由 ⇒ **对齐关系对它不成立**，
+    不许按"在主视图下方/右侧"去定它的类型（YZYX 实测：V2「c 向」既与
+    V0/V4 同列、又与大拱同列，任何对齐读法都是巧合）。它的类型来自
+    图上的箭头标记，那是另一条证据链；在那之前如实报"未定性"即可。
+    """
+    if v.label_handle is None:
+        return None
+    t = d.text_by_handle(v.label_handle)
+    if t is not None and t.kind == TextKind.DIRECTION_VIEW:
+        return t
+    return None
+
+
 # ---- 主入口 ----
 
 def type_views(d: Drawing, qs: QuestionList | None = None) -> QuestionList:
@@ -248,6 +264,19 @@ def type_views(d: Drawing, qs: QuestionList | None = None) -> QuestionList:
     # ---- 3) 兜底：还是没定性的一律报出来，绝不静默当成主视图 ----
     for v in d.views:
         if v.resolved_type is None and v.type.value == ViewType.UNKNOWN:
+            dl = _direction_label_of(d, v)
+            if dl is not None:
+                # 向视图：缺口说清楚是"投射方向没读出来"，不是"这是个谜"。
+                # 标题按洗净文本显示（ParsedText.text 存的是原始串，YZYX 实测
+                # 带 ``\Fromans,gbcbig|c134;`` 字体码，直接印出来是噪声）
+                questions.add(Question(
+                    OpenQuestion.UNKNOWN_VIEW,
+                    f"{v.id} 是向视图（标题「{strip_mtext_codes(dl.text)}」）："
+                    "按图上箭头方向投射、配置位置自由 ⇒ 不属于三视图对齐关系，"
+                    "类型与投射方向要另从箭头标记读",
+                    view=v.id, evidence=(dl.handle,),
+                ))
+                continue
             questions.add(Question(
                 OpenQuestion.UNKNOWN_VIEW, "视图类型未能判定",
                 view=v.id, evidence=tuple(v.evidence[:1]),
@@ -267,7 +296,11 @@ def _type_by_layout(d: Drawing, qs: QuestionList,
     views = [v for v in d.views if v.bbox is not None]
     if not views:
         return
-    untyped = [v for v in d.views if v.resolved_type is None]
+    # 向视图（「c 向」）不参与对齐定性 —— 但**留在 views 里**：它的包围盒
+    # 与主视图不等长，正是"三等定律"排除非三视图伙伴的依据（YZYX 实测：
+    # 拿掉 V2 后 V0 与 V1 的得分打平，主视图就裁不出来了）
+    untyped = [v for v in d.views if v.resolved_type is None
+               and _direction_label_of(d, v) is None]
     if not untyped:
         return
 

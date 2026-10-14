@@ -465,6 +465,12 @@ def _assign(d: Drawing, views: list[View], clustered: set[str],
         v.annotations.append(t.handle)
         if t.kind == TextKind.VIEW_LABEL:
             _set_label(v, t, pt, label_dist)
+        elif t.kind == TextKind.DIRECTION_VIEW:
+            # 向视图标题（「c 向」）—— 标识本视图，但**不是**剖视图、也不给
+            # 类型（投射方向在别处的箭头标记上）。只在没有正式视图标签时
+            # 兜底挂上：正式标签（主视图/俯视图…）哪怕更远也该赢
+            if v.label_handle is None:
+                v.label_handle = t.handle
         elif t.kind == TextKind.SECTION_TITLE and t.cut is not None:
             v.cut = t.cut
 

@@ -213,21 +213,57 @@ def test_text_parser() -> None:
     check("空文字不炸", p("").kind == TextKind.PLAIN)
     check("无数字文字", p("技术要求").kind == TextKind.PLAIN)
 
-    # B8 「c 向」式剖面标题（YZYX C—C 实测形态：MTEXT 带字体规格码）
+    # B8 「c 向」= **向视图**标题（YZYX 实测形态：MTEXT 带字体规格码）。
+    #    v0.6.29 更正：它曾被读成剖面标题，Phase A 证据推翻了这一读法 ——
+    #    该视图零剖面线、带波浪断裂线、内容是 R30 弧 + 40/15/30 尺寸，
+    #    剖面读法只会产出三条"缺信息"的伪阻塞疑问
     r = p("c   {\\Fromans,gbcbig|c134;向}")
-    check("带字体码的「c 向」洗成剖面标题",
-          r.kind == TextKind.SECTION_TITLE and r.cut is not None
-          and r.cut.label == "C" and not r.cut.kind, str(r))
-    check("「c 向」没有切平面位置（is_located=False，对应层须优雅跳过）",
-          r.cut is not None and not r.cut.is_located)
-    check("纯文本「c 向」同样成标题",
-          p("c 向").kind == TextKind.SECTION_TITLE)
-    check("「c 向剖视」也行",
-          p("c 向剖视").kind == TextKind.SECTION_TITLE)
-    check("「x 方向」不是剖面标题（锚定结尾，防误吃描述文字）",
-          p("x 方向").kind != TextKind.SECTION_TITLE)
+    check("带字体码的「c 向」洗成向视图标题",
+          r.kind == TextKind.DIRECTION_VIEW and r.direction_label == "C"
+          and r.cut is None, str(r))
+    check("纯文本「c 向」同样是向视图标题",
+          p("c 向").kind == TextKind.DIRECTION_VIEW)
+    check("「c 向」不得产出 CutSpec（没有切平面、没有剖面材料）",
+          p("c 向").cut is None)
+    check("明写「剖」的「c 向剖视」仍按剖面标题解析（种类留空 ⇒ 几何推断入口）",
+          p("c 向剖视").kind == TextKind.SECTION_TITLE
+          and p("c 向剖视").cut is not None
+          and not p("c 向剖视").cut.kind)
+    check("「x 方向」两个都不是（锚定结尾，防误吃描述文字）",
+          p("x 方向").kind not in (TextKind.SECTION_TITLE,
+                                   TextKind.DIRECTION_VIEW))
     check("「按 C 向视图旋转」也不是（不锚定整串）",
-          p("按 C 向视图旋转").kind != TextKind.SECTION_TITLE)
+          p("按 C 向视图旋转").kind not in (TextKind.SECTION_TITLE,
+                                           TextKind.DIRECTION_VIEW))
+
+    # B9 AutoCAD 转义：\U+XXXX 码点 + %%C/%%D/%%P（大小写都认）。
+    #    实测 YZYX 孔标注写作 ``8~\U+220513``、直径文字写 ``%%C215`` ——
+    #    两者此前都被洗成噪声文本 ⇒ 整条标注读不出（Phase D 的前提修复）
+    r = p("8~\\U+220513")
+    check("\\U+2205 解成 ∅ 且「8~∅13」读出 n=8、φ=13",
+          ("n", 8.0) in r.values and ("φ", 13.0) in r.values, str(r.values))
+    # 注意 ParsedText.text 存的是**原始串**（忠实抽取契约），洗净结果体现在
+    # values/kind 上 —— 所以这里断言抽出的数值而非文本
+    r = p("1{\\fSimSun|b0|i0|c0|p2;\\U+00D7}45%%D")
+    check("\\U+00D7 解成 ×、45%%D 解成 °（1×45° 读得出角度）",
+          r.kind == TextKind.NOTE and ("°", 45.0) in r.values
+          and ("n", 1.0) not in r.values, str(r.values))
+    r = p("\\pt32;1.5{\\fSimSun|b0|i0|c134|p2;×}45%%D")
+    check("大写 %%D 解成 °（1.5×45°）",
+          ("°", 45.0) in r.values and ("n", 1.0) not in r.values, str(r.values))
+    r = p("%%C215")
+    check("大写 %%C 解成 φ（φ215 不再落进 PLAIN）",
+          ("φ", 215.0) in r.values and r.kind == TextKind.NOTE, str(r))
+    check("小写 %%c/%%d/%%p 仍照旧",
+          ("φ", 8.0) in p("4%%c8").values
+          and ("°", 90.0) in p("90%%d").values
+          and ("±", 0.1) in p("±0.1").values)
+    r = p("4~\\U+220510-7H\\P{\\Fromans,gbcbig|c134;深25}")
+    check("「4~∅10-7H 深25」读出 n=4、φ=10，且保留 7H/深25 原文",
+          ("n", 4.0) in r.values and ("φ", 10.0) in r.values
+          and "7H" in r.text and "深25" in r.text, str(r.text))
+    check("「\\U+220516锥孔」单独一条也读出 φ16（无数量）",
+          ("φ", 16.0) in p("\\U+220516{\\Fromans,gbcbig|c134;锥孔，与\\P齿箱壳配作}").values)
 
 
 # ============ C. 读取器在真实靶子上 ============
@@ -759,6 +795,8 @@ _PF60K = ROOT / "CAD" / "temp_output" / "pf60k_闭环_三视图_20260817.dxf"
 _FIXTURE_BREAK = ROOT / "CAD" / "temp_output" / "_selftest_break.dxf"
 #: 自检自给的局部剖夹具（同上）
 _FIXTURE_PARTIAL = ROOT / "CAD" / "temp_output" / "_selftest_partial.dxf"
+#: 自检自给的向视图夹具（「c 向」，同上）
+_FIXTURE_DIRECTION = ROOT / "CAD" / "temp_output" / "_selftest_direction.dxf"
 
 
 def _write_break_fixture(out: Path) -> Path:
@@ -801,7 +839,8 @@ def _write_break_fixture(out: Path) -> Path:
 def _write_partial_fixture(out: Path) -> Path:
     """造一张**局部剖**图纸（YZYX C—C 画法的三个信号各一个正例）：
 
-    - 剖视图标题写作「c 向」——没写剖切种类，必须靠剖面线覆盖范围几何推断
+    - 剖视图标题写作「c 向剖视」——明写"剖"才成剖面标题，而剖切种类留空，
+      必须靠剖面线覆盖范围几何推断
     - 剖面线画成 ``剖面线`` 图层的 LINE（旧式画法，无 HATCH 实体）且**只盖左半**
     - 一条 ``细实线`` 层线（被盖住的槽底轮廓）
     - 两条线性尺寸标注：图上明标 20 / 3，defpoint 精确落在几何端点上
@@ -835,7 +874,46 @@ def _write_partial_fixture(out: Path) -> Path:
     msp.add_linear_dim(base=(30, 0), p1=(20, 0), p2=(20, 3), angle=90,
                        dimstyle=dimstyle.dxf.name,
                        dxfattribs={"layer": "标注"})
-    # 「c 向」剖面标题（无剖切种类词 —— 几何推断的入口）
+    # 「c 向剖视」剖面标题（无剖切种类词 —— 几何推断的入口）
+    msp.add_text("c 向剖视", dxfattribs={"layer": "标注", "height": 5}
+                 ).set_placement((40, -14))
+    doc.saveas(out)
+    return out
+
+
+def _write_direction_fixture(out: Path) -> Path:
+    """造一张**向视图**图纸（YZYX V2「c 向」实测形态）：
+
+    - 标题「c 向」—— 向视图（按箭头方向投射、位置自由），**不是剖视图**
+    - 一条波浪断裂线（细实线层折线）—— 视图被截短
+    - **零剖面线**：没有 HATCH、也没有剖面线层 LINE
+    - 两条轮廓线 + 一个尺寸
+
+    这是 v0.6.29 的更正靶子：这三个信号曾被整体读成"局部剖视图"，于是
+    产出三条**全是伪的**阻塞疑问 —— section.scope 的"剖切种类读不出来"、
+    section.material 的"是剖视图但图上没有剖面线"、correspondence 的
+    "切平面位置未知"。判据就是这三条不许再出现。
+    """
+    import ezdxf
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc = ezdxf.new("R2010")
+    for name in ("轮廓线", "细实线", "标注"):
+        doc.layers.add(name)
+    msp = doc.modelspace()
+
+    # 视图内容：一段外轮廓 + 一个局部特征（R30 弧的直线化替身）
+    msp.add_lwpolyline([(0, 0), (60, 0), (60, 40), (0, 40), (0, 0)],
+                       dxfattribs={"layer": "轮廓线"})
+    msp.add_line((15, 0), (15, 40), dxfattribs={"layer": "轮廓线"})
+    # 波浪断裂线（细实线层折线，锯齿形）—— 视图沿横向被截短
+    wave = [(0.0, 50.0), (7.5, 46.0), (7.5, 54.0), (15.0, 46.0),
+            (15.0, 54.0), (22.5, 46.0)]
+    msp.add_lwpolyline(wave, dxfattribs={"layer": "细实线"})
+    # 一个尺寸 + 标题
+    dimstyle = doc.dimstyles.add("EZDXF")
+    msp.add_linear_dim(base=(0, -8), p1=(0, 0), p2=(15, 0),
+                       dimstyle=dimstyle.dxf.name, dxfattribs={"layer": "标注"})
     msp.add_text("c 向", dxfattribs={"layer": "标注", "height": 5}
                  ).set_placement((40, -14))
     doc.saveas(out)
@@ -1003,13 +1081,13 @@ def test_conventions() -> None:
           not c3.of_kind(ConvKind.MATERIAL) and not c3.of_kind(ConvKind.HIDDEN))
 
     # ---- G11 局部剖三信号（YZYX C—C 手工读图三轮经验的前移版） ----
-    # 「c 向」标题 + LINE 画法剖面线（只盖左半）+ 细实线 + 两条尺寸标注
+    # 「c 向剖视」标题 + LINE 画法剖面线（只盖左半）+ 细实线 + 两条尺寸标注
     from src.rebuild.evidence.text_parser import CutSpec
     d3 = _prepared(_write_partial_fixture(_FIXTURE_PARTIAL))
     cv3 = run_rules(RuleCtx(d=d3))
     check("夹具分离出 1 个视图", len(d3.views) == 1, str(len(d3.views)))
     v3 = d3.views[0]
-    check("「c 向」标题 ⇒ 视图定性 SECTION",
+    check("「c 向剖视」标题 ⇒ 视图定性 SECTION",
           v3.resolved_type == ViewType.SECTION, str(v3.resolved_type))
     check("CutSpec：标签归一 C、剖切种类留空（几何推断入口）",
           isinstance(v3.cut, CutSpec) and v3.cut.label == "C"
@@ -1024,7 +1102,7 @@ def test_conventions() -> None:
           bool(scs3) and scs3[0].tier is Tier.GUESS)
     check("报出「不得整幅裁材料」待确认项",
           bool(cv3.questions.by_kind(OpenQuestion.AMBIGUOUS_FEATURE)))
-    # 护栏：无切平面的 CutSpec（「c 向」没写位置）过全链不崩 ——
+    # 护栏：无切平面的 CutSpec（「c 向剖视」没写位置）过全链不崩 ——
     # 对应层必须优雅跳过（correspondence.py 的 is_located 守卫）
     check("无切平面的剖视图过 understand 全链不崩",
           isinstance(understand(str(_FIXTURE_PARTIAL)), tuple))
@@ -1061,6 +1139,41 @@ def test_conventions() -> None:
           len(scs) == 3 and all(c.value.scope == "full"
                                 and c.tier is Tier.CONVENTION for c in scs),
           str([(c.view, c.value.scope, c.tier.value) for c in scs]))
+
+    # ---- G12 向视图（YZYX V2「c 向」实测形态：三条伪疑问的更正靶子） ----
+    # 标题「c 向」+ 波浪断裂线 + **零剖面线**。此前被整条读成局部剖视图，
+    # 产出："剖切种类读不出来"（section.scope）、"是剖视图但图上没有剖面线"
+    # （section.material）、"切平面位置未知"（correspondence）—— 全是伪的。
+    from src.rebuild.evidence.text_parser import TextKind
+    d4 = read_dxf(_write_direction_fixture(_FIXTURE_DIRECTION))
+    detect_views(d4)
+    qs4 = type_views(d4)
+    check("向视图夹具分离出 1 个视图", len(d4.views) == 1, str(len(d4.views)))
+    v4 = d4.views[0]
+    t4 = next((t for t in d4.texts
+               if t.kind == TextKind.DIRECTION_VIEW), None)
+    check("「c 向」读成 DIRECTION_VIEW 标题、标签归一 C",
+          t4 is not None and t4.direction_label == "C", str(t4))
+    check("向视图不带 CutSpec（图上没有切平面）", v4.cut is None, str(v4.cut))
+    check("向视图不被定性为 SECTION（无剖面含义）",
+          v4.resolved_type != ViewType.SECTION, str(v4.resolved_type))
+    check("向视图产出专用 UNKNOWN_VIEW 疑问（点明投射方向）",
+          any(q.kind == OpenQuestion.UNKNOWN_VIEW and "向视图" in q.detail
+              for q in qs4.items),
+          str([q.detail for q in qs4.items]))
+    cv4 = run_rules(RuleCtx(d=d4))
+    check("向视图不产 SECTION 结论（不套剖面语义）",
+          not cv4.of_kind(ConvKind.SECTION),
+          str([(c.rule, c.value) for c in cv4.of_kind(ConvKind.SECTION)]))
+    check("向视图不产 MATERIAL 结论（零剖面线不报缺）",
+          not cv4.of_kind(ConvKind.MATERIAL))
+    dets4 = [q.detail for q in cv4.questions.items]
+    check("不再有「剖切种类读不出来」伪疑问",
+          not any("剖切种类" in s for s in dets4), str(dets4))
+    check("不再有「是剖视图但图上没有剖面线」伪疑问",
+          not any("没有剖面线" in s for s in dets4), str(dets4))
+    check("向视图过 understand 全链不崩",
+          isinstance(understand(str(_FIXTURE_DIRECTION)), tuple))
 
 
 # ---- 阶段 3：特征层 ----
