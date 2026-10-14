@@ -707,6 +707,13 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   前缀——tag 仍 `v0.6.25`、8 处版本字符串仍 0.6.25，待下次发版一并 bump。
   该提交已同步更新本文件：新框架节「密集大图视图分离」段、MKL PATH 环境坑、
   8A9 细实线断裂线修正，selftest 367→373（OCC 验收表 9 绿逐位不变））
+  （2026-10-13 续未收口：v0.6.27 提交（3b814ac 零件系变换 `yz_frame.py`——三件套
+  `--frame auto` 直接可评新框架模型，`--force` 首评 11/27）+ v0.6.28 提交
+  （f3ae0ec 中心线交点判真 + 交点圆补半径——YZYX 拦路 107→10、疑问 113→16、
+  缺尺寸标注 98→1，特征树逐位不变）同样按 `v0.6.x:` 前缀提交。至此 tag 落后
+  HEAD **4 个提交**（5692df4 / b14124e / 3b814ac / f3ae0ec）、8 处版本字符串仍
+  0.6.25。两版正文已入本文件新框架节（含 §C6 第一刀收口段）+ ASSESSMENT §C6、
+  CHANGELOG 各一节，selftest 373 项、OCC 验收表 9 绿逐位不变）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。
