@@ -4,6 +4,8 @@
     library.py     特征词典：参数契约（PARAMS/OPTIONAL_PARAMS）、轮廓基向量、
                    建造顺序、逐类型"该在各视图里长什么样"的预测
     recognizer.py  识别：把三路来源（剖面标题 / 跨视图对应 / 约定）装成 Part
+    callouts.py    孔标注绑定：约定的「n~∅d 深h」落到具体的圆上（cylinder 特征
+                   的**第四路来源**：半剖/简化画法省了轮廓线时由它补类型与深度）
     prior.py       标准值先验：图纸没写但标准里有的信息（R8 vs R8.5 的落点）
     solver.py      约束传播 + 一致性检查（合并带冲突检测、关系抽取）
 
@@ -13,7 +15,8 @@
 """
 from __future__ import annotations
 
-from . import library, prior, recognizer, solver
+from . import callouts, library, prior, recognizer, solver
+from .callouts import CalloutBindings, HoleBinding, bind_hole_groups
 from .library import (
     LAYER, OPTIONAL_PARAMS, PARAMS, Prim3, build_order, ir_coords, ir_point,
     predict_in_view, profile_plane,
@@ -27,9 +30,11 @@ from .solver import (
 )
 
 __all__ = [
-    "Conflict", "DRILL_D", "LAYER", "OPTIONAL_PARAMS", "PARAMS", "PREFERRED_R",
+    "CalloutBindings", "Conflict", "DRILL_D", "HoleBinding", "LAYER",
+    "OPTIONAL_PARAMS", "PARAMS", "PREFERRED_R",
     "Prim3", "RecognizeReport", "Refinement", "Snap", "SolveReport",
-    "build_order", "ir_coords", "ir_point", "library", "merge_with_conflict",
+    "bind_hole_groups", "build_order", "callouts", "ir_coords", "ir_point",
+    "library", "merge_with_conflict",
     "predict_in_view", "prior", "profile_plane", "recognize", "recognizer",
     "snap_claim", "snap_diameter", "snap_radius", "solve", "solver",
 ]

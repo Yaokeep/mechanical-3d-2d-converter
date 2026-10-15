@@ -797,6 +797,8 @@ _FIXTURE_BREAK = ROOT / "CAD" / "temp_output" / "_selftest_break.dxf"
 _FIXTURE_PARTIAL = ROOT / "CAD" / "temp_output" / "_selftest_partial.dxf"
 #: 自检自给的向视图夹具（「c 向」，同上）
 _FIXTURE_DIRECTION = ROOT / "CAD" / "temp_output" / "_selftest_direction.dxf"
+#: 自检自给的孔标注夹具（`n~∅d 深h` 绑定链，同上）
+_FIXTURE_CALLOUT = ROOT / "CAD" / "temp_output" / "_selftest_callout.dxf"
 
 
 def _write_break_fixture(out: Path) -> Path:
@@ -920,6 +922,48 @@ def _write_direction_fixture(out: Path) -> Path:
     return out
 
 
+def _write_callout_fixture(out: Path) -> Path:
+    """造一张**孔组标注**图纸（YZYX「n~∅d 深h」形态的最小复刻，首角投影）。
+
+    - 主视图 (0,80)-(60,110)：外框 + 圆 A 的孔壁**虚线对**（x 15..25，图上
+      y 98..110 —— 从顶面往下 12）；圆 B 在主视图里**不画**轮廓对（简化画法）
+    - 俯视图 (0,0)-(60,40)：两个可见 r5 圆（x=20 / x=40）—— 圆 A 的 span 由
+      投影直接量到，圆 B 只靠"同组同构"的组内传播（tier 差一档）
+    - 左视图 (250,80)-(290,110)：一个可见 r3 圆，全图无轮廓对 ⇒ 绑定成立但
+      "孔口位置未知" ⇒ 按设计**拒绝发射**（这条正是"不许按 0 起硬切"的靶子）
+    - 两条孔标注：`2~∅10 深12`（贴俯视图，数量对得上）/ `3~∅6 深25`
+      （贴左视图，图上只有 1 个圆 —— 数量不符照绑只记账）
+    """
+    import ezdxf
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc = ezdxf.new("R2010")
+    for name in ("轮廓线", "虚线", "标注"):
+        doc.layers.add(name)
+    msp = doc.modelspace()
+
+    def rect(x0: float, y0: float, x1: float, y1: float) -> None:
+        msp.add_lwpolyline([(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)],
+                           dxfattribs={"layer": "轮廓线"})
+
+    rect(0, 80, 60, 110)                     # 主视图 60×30
+    rect(0, 0, 60, 40)                       # 俯视图 60×40
+    rect(250, 80, 290, 110)                  # 左视图 40×30
+    # 圆 A 的孔壁对（虚线）：x=15/25 间距 2r=10，自顶面向下 12
+    msp.add_line((15, 98), (15, 110), dxfattribs={"layer": "虚线"})
+    msp.add_line((25, 98), (25, 110), dxfattribs={"layer": "虚线"})
+    msp.add_circle((20, 20), 5, dxfattribs={"layer": "轮廓线"})   # 圆 A
+    msp.add_circle((40, 20), 5, dxfattribs={"layer": "轮廓线"})   # 圆 B
+    msp.add_circle((270, 95), 3, dxfattribs={"layer": "轮廓线"})  # 左视图 r3
+    for text, pos in (("主视图", (18, 114)), ("俯视图", (12, -12)),
+                      ("左视图", (258, 114)), ("2~∅10 深12", (44, -12)),
+                      ("3~∅6 深25", (300, 95))):
+        msp.add_text(text, dxfattribs={"layer": "标注", "height": 5}
+                     ).set_placement(pos)
+    doc.saveas(out)
+    return out
+
+
 def _prepared(path: Path):
     """读 → 分离 → 定性（约定层与对应层的共同前置）。"""
     d = read_dxf(path)
@@ -933,7 +977,8 @@ def test_conventions() -> None:
 
     # ---- G1 每条规则**独立**可跑（阶段 2 验收原文："每条规则有独立测试"） ----
     names = REG.registered()
-    check("注册表里 10 条规则", len(names) == 10, str(names))
+    check("注册表里 11 条规则", len(names) == 11, str(names))
+    check("孔标注规则已注册", "callout.hole_groups" in names, str(names))
     d = _prepared(_SEC_DWG)
     per: dict[str, Conventions] = {
         n: run_rules(RuleCtx(d=d), only=[n]) for n in names}
@@ -1175,6 +1220,35 @@ def test_conventions() -> None:
     check("向视图过 understand 全链不崩",
           isinstance(understand(str(_FIXTURE_DIRECTION)), tuple))
 
+    # ---- G13 孔标注「n~∅d 深h」：读取与门（YZYX 六条实测 + 反例防线） ----
+    # 只有"孔才有的说法"（数量前缀 / 深 / 孔类关键词）才构成孔标注；
+    # 光秃秃的直径与螺纹是零件尺寸（φ96.5 / M16 可能是轴），不许混进孔组。
+    from src.rebuild.conventions.callout import parse_callout
+    for s, n, dia, dep in (("8~∅13", 8, 13.0, None),
+                           ("4~∅10-7H 深25", 4, 10.0, 25.0),
+                           ("3~∅10-7H 深20", 3, 10.0, 20.0),
+                           ("2~∅6锥销孔", 2, 6.0, None),
+                           ("∅16锥孔", 1, 16.0, None)):   # 数量缺省 = 1
+        hc = parse_callout("H0", s)
+        check(f"孔标注「{s}」读得出来",
+              hc is not None and hc.count == n and hc.depth == dep
+              and abs(hc.diameter - dia) < 1e-9, str(hc))
+    hc_t = parse_callout("H1", "2~M16-7H (通孔)")
+    check("「2~M16-7H (通孔)」：螺纹大径当名义直径、公差带与显式通孔都在",
+          hc_t is not None and hc_t.thread == "M16" and hc_t.tolerance == "7H"
+          and abs(hc_t.diameter - 16.0) < 1e-9 and "kw:通孔" in hc_t.matched,
+          str(hc_t))
+    hc_k = parse_callout("H2", "2~∅6锥销孔")
+    check("「锥销孔」读出孔种（不是普通孔）",
+          hc_k is not None and hc_k.kind == "taper_pin_hole", str(hc_k))
+    hc_d = parse_callout("H3", "4~∅10-7H 深25")
+    check("「深25」⇒ 盲孔（through=False）", hc_d is not None
+          and hc_d.depth == 25.0 and hc_d.through is False, str(hc_d))
+    for s in ("φ96.5", "R15", "1.5×45°", "φ5.5×90°", "M16",
+              "技术要求：未注圆角 R3"):
+        check(f"「{s}」不是孔标注（误报防线）",
+              parse_callout("H4", s) is None, s)
+
 
 # ---- 阶段 3：特征层 ----
 
@@ -1412,6 +1486,95 @@ def test_features() -> None:
         check(f"{name}：同一参数只被一条待确认项点名", not dup, str(dup))
     check("识别层末尾自动跑求解（rep.solved 非空）",
           rep_b.solved is not None and rep_p.solved is not None)
+
+    # ---- H9 孔标注绑定（图上明写的「n~∅d 深h」压过投影反推） ----
+    # 夹具（_write_callout_fixture）：圆 A 有孔壁虚线对（span 直接量到）、
+    # 圆 B 主视图里不画轮廓对（只靠"同组同构"传播）、左视图 r3 全图无轮廓对
+    # ⇒ 绑定成立但孔口位置无依据 ⇒ 按设计拒绝发射。三档一次全测到。
+    from src.rebuild.features.callouts import (HoleBinding, bind_hole_groups,
+                                               bound_hole_params)
+    from src.rebuild.conventions.callout import HoleCallout
+    d9, conv9, corr9, rep9 = _recognized(
+        _write_callout_fixture(_FIXTURE_CALLOUT))
+    cos = conv9.of_kind(ConvKind.CALLOUT)
+    top9 = next(v.id for v in d9.views if v.resolved_type == ViewType.TOP)
+    left9 = next((v.id for v in d9.views if v.resolved_type == ViewType.LEFT),
+                 None)
+    check("两条孔标注各归到唯一视图（俯视图/左视图独立各自归属）",
+          len(cos) == 2
+          and {c.value.text for c in cos} == {"2~∅10 深12", "3~∅6 深25"}
+          and {c.view for c in cos} == {top9, left9},
+          str([(c.value.text, c.view) for c in cos]))
+    binds9 = bind_hole_groups(conv9, corr9, d9)
+    uni9 = list({id(b): b for b in binds9.by_handle.values()}.values())
+    b10 = next((b for b in uni9 if abs(b.radius - 5.0) < 1e-9), None)
+    b3 = next((b for b in uni9 if abs(b.radius - 3.0) < 1e-9), None)
+    check("「2~∅10 深12」半径严合绑上 2 个圆（数量与标注相符）",
+          b10 is not None and len(b10.handles) == 2 and b10.count_ok,
+          str(b10))
+    check("span 由有轮廓对的圆读出（12 = 孔壁虚线对间距）、传播给全组",
+          b10 is not None and b10.span is not None
+          and abs(b10.span_len - 12.0) < 1e-9 and b10.propagated
+          and b10.span_from in b10.handles, str(b10))
+    check("「3~∅6 深25」图上只数到 1 个圆 ⇒ 照绑、只记账（不当闸门）",
+          b3 is not None and not b3.count_ok and b3.span is None, str(b3))
+    holes9 = [f for f in rep9.part.features if f.type.value == "hole"]
+    check("两个绑定圆各建一条孔特征，无 span 的 r3 拒绝发射 ⇒ 共 2 条",
+          len(holes9) == 2
+          and all(abs(f.params["radius"].value - 5.0) < 1e-9
+                  for f in holes9),
+          str([(str(f.id), f.params.get("radius")) for f in
+               rep9.part.features]))
+    check("深度都按画出来的区间切（12 盲孔，不再按通孔切穿）",
+          all(f.params["depth"].value is not None
+              and abs(f.params["depth"].value - 12.0) < 1e-9
+              and f.params["through"].value is False for f in holes9),
+          str([(f.params.get("depth"), f.params.get("through"))
+               for f in holes9]))
+    check("span 来源圆 PROJECTION、同组传播圆降一档 CONVENTION（tier 可追）",
+          sorted(f.params["axial_at"].method for f in holes9)
+          == ["callout:group_span", "projection:outline_pair"],
+          str([f.params["axial_at"].method for f in holes9]))
+    check("类型由标注定：hole/ANNOTATED（annotation:hole_callout）",
+          all(f.type.tier is Tier.ANNOTATED
+              and f.type.method == "annotation:hole_callout" for f in holes9),
+          str([(f.type.tier.name, f.type.method) for f in holes9]))
+    md9 = rep9.questions.by_kind(OpenQuestion.MISSING_DIMENSION)
+    check("r3「孔口位置未知」⇒ 拦路疑问（按设计拒绝，不按 0 起硬切）",
+          len(md9) == 1 and "3~∅6 深25" in md9[0].detail
+          and "孔口位置未知" in md9[0].detail,
+          str([q.detail for q in md9]))
+    cb9 = [a for a in rep9.questions.resolved
+           if a.by == "recognize:callout_bind"]
+    check("两条「找不到轮廓对」之疑由标注裁决（含无 span 的 r3）",
+          len(cb9) == 2 and all("hole" in str(a.answer) for a in cb9),
+          str([str(a.question.detail)[:40] for a in cb9]))
+    check("被绑定的圆不再当分区依据（高度分解只记账、不消费）",
+          any("孔标注绑定" in n and "不当分区依据" in n for n in rep9.notes),
+          str([n for n in rep9.notes if "高度分解" in n]))
+    check("孔标注夹具过 understand 全链不崩",
+          isinstance(understand(str(_FIXTURE_CALLOUT)), tuple))
+    # 第三条出路（夹具里没有）：未注深度且无 span ⇒ 通孔。图上明写「通孔」
+    # 是 ANNOTATED，只靠制图惯例（不写深度即通孔）才是 CONVENTION 级。
+    hc_thr = HoleCallout(text_ref="H9", text="2~∅8 (通孔)", count=2,
+                         diameter=8.0, matched=("count:2", "kw:通孔"))
+    p_thr, why_thr = bound_hole_params(
+        HoleBinding(callout=hc_thr, handles=("A", "B"), radius=4.0,
+                    count_ok=True), ("A",))
+    check("未注深度且无 span ⇒ 通孔（明写「通孔」⇒ ANNOTATED）",
+          not why_thr and p_thr["through"].value is True
+          and p_thr["through"].tier is Tier.ANNOTATED
+          and p_thr["axial_at"].value == 0.0, str(p_thr))
+    hc_nd = HoleCallout(text_ref="H9b", text="2~∅8", count=2,
+                        diameter=8.0, matched=("count:2",))
+    p_nd, _ = bound_hole_params(
+        HoleBinding(callout=hc_nd, handles=("A", "B"), radius=4.0,
+                    count_ok=True), ("A",))
+    check("未注深度、图上也没写「通孔」⇒ 按制图惯例（CONVENTION 级）",
+          p_nd["through"].value is True
+          and p_nd["through"].tier is Tier.CONVENTION
+          and p_nd["through"].method == "convention:no_depth_means_through",
+          str(p_nd))
 
 
 # ---- 阶段 4：汇流（理解层；发射层要 OCC/SW，见 emit 自己的 --demo） ----

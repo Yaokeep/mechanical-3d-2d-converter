@@ -7,8 +7,9 @@
 依赖：``conventions → model, evidence, views``；默认 python 即可跑。
 """
 from . import (  # noqa: F401 注册用
-    centerline, dimension, linetype, section, simplification,
+    callout, centerline, dimension, linetype, section, simplification,
 )
+from .callout import HoleCallout
 from .centerline import Pattern, Symmetry
 from .dimension import DimClaim
 from .linetype import HiddenProfile, ThinProfile
@@ -21,7 +22,7 @@ from .simplification import FilletSpec, ThreadSpec
 
 __all__ = [
     "BrokenView", "Convention", "Conventions", "ConvKind", "DimClaim",
-    "FilletSpec", "HiddenProfile", "MaterialPatch", "Pattern", "RuleCtx",
-    "SectionScope", "Symmetry", "ThinProfile", "ThreadSpec", "registered",
-    "run_rules",
+    "FilletSpec", "HiddenProfile", "HoleCallout", "MaterialPatch", "Pattern",
+    "RuleCtx", "SectionScope", "Symmetry", "ThinProfile", "ThreadSpec",
+    "registered", "run_rules",
 ]

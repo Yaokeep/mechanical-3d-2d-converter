@@ -225,6 +225,12 @@ class CylinderHint:
     profile_method: str = ""
     #: 这个解释的全部图元 handle（圆边 + 轮廓对）—— 下游建 Feature 时当证据用
     evidence: tuple[str, ...] = ()
+    #: 轴向跨度（**模型坐标**，已排序 (lo, hi)）—— 由轮廓对的 ``_Pair.span``
+    #: 经该视图 frame 换算而来。`length` 只说"多长"，`span` 才说"从哪儿到
+    #: 哪儿"：盲孔发射器要的 ``axial_at`` 是后者（YZYX 的 4×Ø10 深25 在
+    #: z120..145，只有 length 就只好按 0 起、横切法兰）。None = 没读到 ——
+    #: 下游与 length=None 同等对待，不许拿 0 顶替。
+    span: tuple[float, float] | None = None
 
     @property
     def resolved(self) -> bool:
@@ -1167,6 +1173,11 @@ class _Pair:
     perp_mid: float     # 间距中点（图纸坐标，沿"垂直于线"的方向）
     length: float       # 两线长度的较小者 = 圆柱轴向长度
     visible: bool
+    #: 较短那条线**沿线方向**的端点区间（图纸坐标）—— 换算到模型系就是
+    #: 这根圆柱的轴向跨度。只有长度是不够的：`axial_at` 需要的是"从哪儿到
+    #: 哪儿"，缺了它发射器只能按 0 起（YZYX 的 4×Ø10 深25 在 z120..145，
+    #: 按 0 起会横切法兰）。默认 (0,0) = 没读到（老调用方不受影响）。
+    span: tuple[float, float] = (0.0, 0.0)
 
 
 def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
@@ -1180,7 +1191,8 @@ def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
     （实测卡死），改为按垂直坐标分桶，只查 ±want_sep 那几个桶 —— O(n)。
     """
     horizontal = along == "h"
-    bucketed: dict[int, list[tuple[EvidenceRef, float, float, bool]]] = {}
+    bucketed: dict[int, list[tuple[EvidenceRef, float, float, bool,
+                                   tuple[float, float]]]] = {}
     for h in v.evidence:
         e = idx.get(h)
         if e is None or e.kind != Kind.EDGE or not isinstance(e.geom, Line2):
@@ -1202,16 +1214,21 @@ def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
         line_len = major
         if line_len <= 1e-9:
             continue
+        # 沿线方向的端点区间（图纸坐标）—— 圆柱的轴向跨度（见 _Pair.span）
+        a0, a1 = ((g.start.x, g.end.x) if horizontal
+                  else (g.start.y, g.end.y))
+        along_span = (min(a0, a1), max(a0, a1))
         bucketed.setdefault(round(perp / MATCH_TOL),
                             []).append((h, perp, line_len,
-                                        e.role.value == Role.VISIBLE))
+                                        e.role.value == Role.VISIBLE,
+                                        along_span))
 
     out: list[_Pair] = []
     span = round(want_sep / MATCH_TOL)
     for b, items in bucketed.items():
-        for h1, p1, len1, vis1 in items:
+        for h1, p1, len1, vis1, sp1 in items:
             for nb in range(b + span - 1, b + span + 2):
-                for h2, p2, len2, vis2 in bucketed.get(nb, []):
+                for h2, p2, len2, vis2, sp2 in bucketed.get(nb, []):
                     if h1 == h2 or vis1 != vis2:
                         continue
                     if nb == b and h1 > h2:
@@ -1226,8 +1243,12 @@ def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
                     sep = abs(p2 - p1)
                     if abs(sep - want_sep) > MATCH_TOL:
                         continue
+                    # 跨度取**较短那条线**的区间（与 length 同一条线：
+                    # 长度是 min(len1,len2)，跨度也必须是它的，否则"长 12"
+                    # 和"从 z=0 到 z=145"这对矛盾数据会一起流下去）
                     out.append(_Pair(h1, h2, sep, (p1 + p2) / 2.0,
-                                     min(len1, len2), vis1))
+                                     min(len1, len2), vis1,
+                                     sp1 if len1 <= len2 else sp2))
     return out
 
 
@@ -1407,6 +1428,16 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
         wid = w.id
         refs += [(wid, pr.h1), (wid, pr.h2)]
         solid: bool | None = pr.visible
+        # 轴向跨度：轮廓对的沿线区间经**该视图自己的 frame** 换算到模型系。
+        # ⚠️ 不能复用循环里的 `along`——best 是历遍所有 w 后的最优，along 却
+        # 停留在最后一个被扫到的视图上（换视图就会把 x 区间读成 y 区间）。
+        wfr = frames[wid]
+        along_w = "h" if wfr.u_axis == f.p_axis else "v"
+        conv = wfr.u_to_model if along_w == "h" else wfr.v_to_model
+        span: tuple[float, float] | None = None
+        if pr.span[1] > pr.span[0]:
+            a0m, a1m = conv(pr.span[0]), conv(pr.span[1])
+            span = (min(a0m, a1m), max(a0m, a1m))
         # 实/虚轮廓冲突：同一条圆柱轮廓在图上既有实线对又有虚线对、两者
         # 量级又可比时，"实线=凸台、虚线=孔"这条判据在这张图上失效 ——
         # 实线对很可能是**另一条棱**恰在该位置的重合投影（实测 bracket：
@@ -1466,12 +1497,14 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
                     break      # 一壁报一条就够了
         hint = CylinderHint(hint.axis, r, length=pr.length, solid=solid,
                             radius_method=marker, profile_method=f"outline:{wid}",
-                            evidence=tuple(h for _, h in refs))
+                            evidence=tuple(h for _, h in refs), span=span)
         return Correspondence(
             CorrKind.FEATURE, tuple(refs),
             Claim(hint, f"corr:circle+outline({v.id}+{wid})", Tier.PROJECTION,
                   evidence=tuple(h for _, h in refs)),
-            note=f"r{r:g} 圆柱，长 {pr.length:.2f}，"
+            note=f"r{r:g} 圆柱，长 {pr.length:.2f}"
+                 + (f"，轴向 {span[0]:.2f}..{span[1]:.2f}" if span else "")
+                 + "，"
                  + ("孔/凸台未定（实/虚轮廓证据相当）" if solid is None
                     else ("凸台（轮廓实线）" if solid else "孔（轮廓虚线）")),
         )

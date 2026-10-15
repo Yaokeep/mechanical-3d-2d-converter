@@ -53,6 +53,7 @@ from .library import ir_point, mk_claim
 from .solver import Conflict, SolveReport, merge_with_conflict, solve
 
 if TYPE_CHECKING:
+    from .callouts import CalloutBindings, HoleBinding
     from .revolve import RevolvePlan
 
 #: 两条轴"是同一条"的判据：垂直距离 + 方向夹角
@@ -743,10 +744,62 @@ def _base_outline(base: Feature):
     return skip
 
 
+def _bound_hole_feature(b: "HoleBinding", hint: CylinderHint, c,
+                        next_id: int, rep: RecognizeReport) -> Feature | None:
+    """孔标注绑定的圆 ⇒ HOLE 特征（拒绝发射时返回 None 并报拦路疑问）。
+
+    **标注压过投影**：绑定成立时即便投影侧把该圆读成了凸台（轮廓实线），
+    也按标注建孔 —— 实测 YZYX 的 φ13 组有两处正是这样（半剖的剖切侧孔壁
+    画在可见层，被读成"凸台"）。相悖时只记账，不去改写投影侧的结论：别的
+    圆还可能靠那一路，分歧留在报告里给人看。
+
+    深度出口见 ``callouts.bound_hole_params``：有 span ⇒ 按画出来的区间切；
+    只有标注深度 ⇒ 孔口位置无依据 ⇒ **拒绝发射**（拦路疑问），不许按 0 起
+    硬切（YZYX 的 4×Ø10 深25 若从 z=0 起，会横切掉整段法兰）。
+    """
+    from .callouts import bound_hole_params
+    hc = b.callout
+    ev = tuple(hint.axis.radius.evidence) if hint.axis.radius else ()
+    params, why = bound_hole_params(b, ev)
+    if not params:
+        rep.notes.append(
+            f"圆 r{hint.radius:g}：已绑孔标注「{hc.text}」但{why}")
+        rep.questions.add(Question(
+            OpenQuestion.MISSING_DIMENSION,
+            f"#{next_id}：孔标注「{hc.text}」的孔口位置未知（{why}）",
+            view=c.views[0] if c.views else "", evidence=ev))
+        return None
+    if hint.axis.radius is not None:
+        params["radius"] = hint.axis.radius
+    if hint.solid is True:
+        rep.notes.append(
+            f"圆 r{hint.radius:g}：投影侧读成凸台（轮廓实线），但孔标注"
+            f"「{hc.text}」明写是孔 ⇒ 按标注建孔")
+    f = Feature(
+        id=FeatureId(next_id), type=Claim(FeatureType.HOLE, "annotation:hole_callout",
+                                          Tier.ANNOTATED, evidence=ev),
+        params=params,
+        axis=Claim(hint.axis, "projection:circle_plus_outline",
+                   Tier.PROJECTION, ev),
+        placement=Claim(hint.axis.origin, "projection:cylinder",
+                        Tier.PROJECTION, ev),
+        source_view=c.views[0] if c.views else "",
+        evidence=list(ev),
+    )
+    rep.notes.append(
+        f"圆 r{hint.radius:g}：孔标注「{hc.text}」⇒ 建为孔"
+        + (f"（轴向 {params['axial_at'].value:.2f}.."
+           f"{params['axial_at'].value + params['depth'].value:.2f}，"
+           "轮廓对读出的）" if "depth" in params
+           else "（按通孔发射）"))
+    return f
+
+
 def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
                       next_id: int, skip=None,
                       no_feature: list[CylinderHint] | None = None,
-                      draws_hidden: bool = False) -> list[Feature]:
+                      draws_hidden: bool = False,
+                      bindings=None) -> list[Feature]:
     """一个 ``CylinderHint`` 一条特征。``skip`` 是基体外轮廓的判据（见上）。
 
     ``no_feature`` 收下"**没有建成特征**的圆"（供 ``_resolve_questions``
@@ -758,12 +811,26 @@ def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
     是强负证据还是空证据 —— 画了隐藏线的图纸（HLR 出图）里，真圆柱被遮挡的
     轮廓线**本该出现**；不画隐藏线的简图上什么都不出现（实测 block_3view：
     4 个 Ø10 孔的轮廓线全图都没有，但孔是真的 —— 那种情况照旧走 GUESS）。
+
+    ``bindings``：``features.callouts`` 的孔标注绑定（``CalloutBindings``）。
+    绑定的圆**走另一条路**（见 ``_bound_hole_feature``）：图上明写的直径/深度
+    是 ``Tier.ANNOTATED`` 的证据，比"从轮廓反推"更具体，而且这类圆之所以
+    需要绑定，恰恰因为投影侧什么都没有（半剖省了孔壁、简化画法不画轮廓对）
+    —— 所以绑定分支必须在下面那条"没有轮廓对 ⇒ 不建特征"的强负证据**之前**。
     """
     out: list[Feature] = []
     for c in corr.cylinders():
         hint = c.mapping.value
         assert isinstance(hint, CylinderHint)
         if skip is not None and skip(hint):
+            continue
+        ev = tuple(hint.axis.radius.evidence) if hint.axis.radius else ()
+        b = bindings.of(ev) if bindings is not None else None
+        if b is not None:
+            f = _bound_hole_feature(b, hint, c, next_id, rep)
+            if f is not None:
+                out.append(f)
+                next_id += 1
             continue
         if hint.length is None and hint.solid is None and draws_hidden:
             # 图纸画了隐藏线，而正交视图里**一条**间距 2r 的轮廓线都没有
@@ -780,7 +847,6 @@ def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
                 "间距 2r 的轮廓对 ⇒ 孔/凸台与轴向长度都判不出，**不建特征**"
                 "（记缺口，待确认项交 _resolve_questions 裁决）")
             continue
-        ev = tuple(hint.axis.radius.evidence) if hint.axis.radius else ()
         t = _cyl_claim(hint)
         params: dict[str, Claim] = {}
         if hint.axis.radius is not None:
@@ -813,7 +879,8 @@ def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
 
 def _resolve_questions(rep: RecognizeReport, plan,
                        no_feature: list[CylinderHint],
-                       corr: "CorrespondenceResult | None" = None) -> int:
+                       corr: "CorrespondenceResult | None" = None,
+                       bindings: "CalloutBindings | None" = None) -> int:
     """分区/轮廓证据已把圆的角色定死 ⇒ **裁决** corr 层留下的歧义疑问。
 
     ``QuestionList.resolve`` 不删条目：把它移进已裁决区并记下答案与裁决者
@@ -832,7 +899,9 @@ def _resolve_questions(rep: RecognizeReport, plan,
         虚线被可见优先去重吃掉的图面），按分区/特征剪影裁决；与特征现值
         相悖时回流改写 type（``_settle_cyl_type``）；
       * 「找不到间距 2r 的轮廓对」→ ``neither``：图纸画了隐藏线仍然全无
-        轮廓 ⇒ 非圆柱特征（曲面切边/圆角足迹，实测 r9 = R3 环面相切圆）。
+        轮廓 ⇒ 非圆柱特征（曲面切边/圆角足迹，实测 r9 = R3 环面相切圆）；
+        **已被孔标注绑定的除外** ⇒ ``hole``：图上明写了这是什么孔
+        （半剖/简化画法省掉轮廓线，正因如此才需要标注来补）。
     """
     qs = rep.questions
     roles: dict[str, tuple[str, str]] = {}      # 圆边 handle → (种类, 人话)
@@ -916,7 +985,21 @@ def _resolve_questions(rep: RecognizeReport, plan,
                 _settle_cyl_type(rep, str(ev[0]), kind,
                                  rad_map.get(str(ev[0])))
         elif "找不到间距 2r 的轮廓对" in q.detail:
-            if all(h in roles and roles[h][0] == "none" for h in ev):
+            bnd = bindings.of(ev) if bindings is not None else None
+            if bnd is not None:
+                # 绑定在场：疑问问的"是孔还是凸台、轴向多长"已被图上那句话说清
+                # （同类圆同视图同半径 ⇒ 疑问按 (kind, view, detail) 去重合并时
+                # 绑定的圆全在同一组里，拿合并后的代表 handle 判定成立）
+                ans = (f"hole（孔标注「{bnd.callout.text}」："
+                       + (f"深 {bnd.callout.depth:g}"
+                          if bnd.callout.depth is not None else "未注深度⇒通孔")
+                       + (f"，轴向 {bnd.span[0]:.2f}..{bnd.span[1]:.2f} 由轮廓对读出"
+                          if bnd.span is not None
+                          else "；孔口位置另见疑问")
+                       + "—— 图线缺失是半剖/简化画法所致）")
+                if qs.resolve(q, ans, "recognize:callout_bind"):
+                    n += 1
+            elif all(h in roles and roles[h][0] == "none" for h in ev):
                 ans = ("neither（图纸画了隐藏线却没有任何间距 2r 的轮廓 ⇒ "
                        "不是孔也不是凸台，是曲面切边/圆角足迹）")
                 if qs.resolve(q, ans, "recognize:no_outline_pair"):
@@ -1362,6 +1445,15 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
     part = rep.part
     if conv is not None:                    # 约定先行：对称/阵列要挂到特征上
         symmetries(conv, corr, part, rep)
+    # 孔标注绑定（``conventions.callout`` 的消费端）：图上明写的「n~∅d 深h」
+    # 落到具体的圆上。**必须先于高度分解**——被绑定的圆不再当分区依据
+    # （见 height_zones.decompose 的 exclude），否则它们会被分区消费掉，
+    # 轮不到 cylinder_features 按标注建孔（实测 YZYX：23 个分区吃掉了
+    # **全部** 23 条圆提示）。
+    from .callouts import bind_hole_groups
+    binds = bind_hole_groups(conv, corr, d)
+    for nt in binds.notes:
+        rep.notes.append("孔标注：" + nt)
 
     base = base_feature(d, corr, rep)
     part.add(base)
@@ -1396,7 +1488,7 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
         # 每块的顶/底，轮廓里的圆给出分区边界。成立时基体就地降高、
         # 抬升区与切除区作为 BASE/HOLE/POCKET 紧随基体进树；不成立只记账。
         from .height_zones import decompose, side_axis_spans
-        plan = decompose(d, corr, base, rep)
+        plan = decompose(d, corr, base, rep, exclude=binds.handles())
         rep.zones = plan
         if plan is not None:
             first = next_id
@@ -1429,7 +1521,7 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
     no_feature: list[CylinderHint] = []
     for f in cylinder_features(corr, rep, next_id=next_id, skip=skip,
                                no_feature=no_feature,
-                               draws_hidden=draws_hidden):
+                               draws_hidden=draws_hidden, bindings=binds):
         part.add(f)
     if rep.zones is not None:
         n = side_axis_spans(d, corr, part, rep.zones.dir_name, rep)
@@ -1443,11 +1535,11 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
         if m:
             rep.notes.append(f"侧轴凸台：月牙缺口/张缝/销孔共 {m} 个特征进树")
     merge_section_axes(corr, rep, part)
-    if rep.zones is not None or no_feature:
+    if rep.zones is not None or no_feature or binds.by_handle:
         # 分区/轮廓证据把圆的角色定死之后，把 corr 层的歧义疑问**裁决**掉
         # （移进 resolved 并记答案+裁决者）—— 不删条目，报告里仍可追"当时
         # 怎么想的"。只在图元全部有结论时裁决，缺一条就保留疑问。
-        n = _resolve_questions(rep, rep.zones, no_feature, corr)
+        n = _resolve_questions(rep, rep.zones, no_feature, corr, binds)
         if n:
             rep.notes.append(
                 f"疑问消解：{n} 条圆歧义由分区角色/负轮廓证据裁决（见 resolved）")

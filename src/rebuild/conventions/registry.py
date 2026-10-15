@@ -43,6 +43,7 @@ class ConvKind(StrEnum):
     THIN = "被盖轮廓"        # 细实线 ⇒ 轮廓被前面材料盖住（不是开口）
     DIMENSION = "尺寸"       # DIMENSION 实体 ⇒ 数值 ↔ 几何锚点的配对证据
     FILLET = "圆角"          # 未注圆角 R2 ⇒ 图上画的尖角其实是圆的
+    CALLOUT = "孔标注"       # n~∅d 深h ⇒ 孔的直径/数量/深度/通盲（图上明写）
 
 
 @dataclass(frozen=True)

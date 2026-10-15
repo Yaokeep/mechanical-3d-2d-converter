@@ -763,12 +763,31 @@ def _footprint_hints(corr: CorrespondenceResult, dir_name: str, b1_axis: str,
     return out
 
 
+def _bound(h: CylinderHint, exclude: frozenset[str]) -> bool:
+    """该圆是否已被**孔标注**绑定（圆边 handle 落在排除集里）。
+
+    排除的依据是"图上另有一句话明写了这是什么"：分区只能按同轴圆的半径序
+    猜材料/切除，而孔标注是 ``Tier.ANNOTATED`` 的明写 —— 两者都有话说的
+    时候**明写的赢**（同 tier 规则本意：越来越具体的依据压过越来越粗的）。
+    """
+    if not exclude or h.axis.radius is None:
+        return False
+    return any(str(x) in exclude for x in h.axis.radius.evidence)
+
+
 def decompose(d: "Drawing", corr: CorrespondenceResult, base: Feature,
-              rep: "RecognizeReport") -> HeightPlan | None:
+              rep: "RecognizeReport",
+              exclude: frozenset[str] = frozenset()) -> HeightPlan | None:
     """给出高度分解方案；不该分解 / 读不出 ⇒ None（并记账）。
 
     成立时**就地**把基体的 ``length`` 改短（改为 ``base_top − t_lo``）——
     与原 origin 一起就是"降到最低公共顶面"的那块底板。
+
+    ``exclude``：已被**孔标注**绑定的圆边 handle（见 ``_bound``）—— 这些圆
+    不该再当分区依据。分区是"轮廓内的圆 ⇒ 这块区域高低不同"的猜测，而绑定
+    是"图上明写这里是个孔"；把孔当分区边界只会造出伪分区。实测 YZYX：23 个
+    分区把**全部** 23 条圆提示都消费了（4×Ø10H7 深25 变成某分区的边界），
+    排除后才回到 cylinder_features 手里按标注建孔。
     """
     dir_name = base.params["dir"].value
     if base.type.value == FeatureType.REVOLVE.value or "taper_scale" in base.params:
@@ -807,7 +826,14 @@ def decompose(d: "Drawing", corr: CorrespondenceResult, base: Feature,
             f"（极差 ≤ {UNIFORM_TOL}）⇒ 轮廓内没有高低分区，基体照旧一次拉伸")
         return None
     # ---- ② 分区（俯视轮廓里的圆） ----
-    hints = _footprint_hints(corr, dir_name, b1_axis, b2_axis, r1, r2)
+    all_hints = _footprint_hints(corr, dir_name, b1_axis, b2_axis, r1, r2)
+    hints = [h for h in all_hints if not _bound(h, exclude)]
+    if len(hints) < len(all_hints):
+        dropped = sorted({f"r{h.radius:g}" for h in all_hints if _bound(h, exclude)})
+        rep.notes.append(
+            f"高度分解：{len(all_hints) - len(hints)} 个圆（{'/'.join(dropped)}）"
+            "已被孔标注绑定 ⇒ 不当分区依据（图上明写的孔压过'轮廓内圆'的猜测），"
+            "它们留给 cylinder_features 按标注建孔")
     if not hints:
         rep.notes.append(
             f"高度分解：{b1_axis} 向剪影顶面 {min(tops):.2f}..{max(tops):.2f} "
