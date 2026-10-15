@@ -39,7 +39,7 @@ tier 规则在孔上的落地：投影侧读不出（半剖省了孔壁、简图
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..conventions import ConvKind
 from ..conventions.callout import HoleCallout
@@ -53,6 +53,13 @@ BIND_TOL = 0.05
 #: 通孔要给的 ``axial_at``：轴原点即圆的投影原点（第三坐标恒为 0），
 #: 对通孔而言它只是**切刀下界**（材料必在 + 轴向一侧），不是图纸读数
 _THROUGH_START = 0.0
+
+#: span 来源方法 → Claim tier（未列出的一律 CONVENTION —— 传播与分区推断
+#: 都是从"同组同构"/"顶面即孔口"这类约定走出来的，不是投影直读）
+_SPAN_TIER = {"projection:outline_pair": Tier.PROJECTION}
+
+#: "同心分区定孔口"的轴距容差（mm）：分区圆与孔圆共轴才认
+_MOUTH_AXIS_TOL = 0.1
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,9 @@ class HoleBinding:
     span_from: str = ""
     #: 组内各圆到 span 的距离同不同源 —— 只有 span_from 那条是投影直接量到的
     propagated: bool = False
+    #: span 的**来源方法**（空 = 由轮廓对读出、按 span_from 定 tier）；
+    #: ``infer_callout_mouth_spans`` 推出的 span 写 "zone:concentric_mouth"
+    span_how: str = ""
 
     @property
     def span_len(self) -> float | None:
@@ -177,8 +187,9 @@ def bound_hole_params(b: HoleBinding, handles: tuple[str, ...]
     """
     ev = tuple(handles)
     if b.span is not None:
-        claim_tier, how = (Tier.PROJECTION, "projection:outline_pair") \
-            if b.span_from in handles else (Tier.CONVENTION, "callout:group_span")
+        how = b.span_how or ("projection:outline_pair"
+                             if b.span_from in handles else "callout:group_span")
+        claim_tier = _SPAN_TIER.get(how, Tier.CONVENTION)
         return ({
             "depth": mk(b.span[1] - b.span[0], how, claim_tier, ev),
             "axial_at": mk(b.span[0], how, claim_tier, ev),
@@ -201,3 +212,119 @@ def bound_hole_params(b: HoleBinding, handles: tuple[str, ...]
 def mk(value, how: str, tier: Tier, ev: tuple) -> Claim:
     """本模块内部的小工厂（与 recognizer.mk_claim 同形，避免反向依赖）。"""
     return Claim(value, how, tier, evidence=ev)
+
+
+# ---------------------------------------------------------------------------
+# 孔口定位：同心材料分区的顶面（§C6 第三段）
+# ---------------------------------------------------------------------------
+
+def infer_callout_mouth_spans(binds: CalloutBindings, corr: CorrespondenceResult,
+                              plan, notes: list[str]) -> int:
+    """给"标注给了深度、轮廓对却没读到"的孔组，用俯视**材料分区顶面**定孔口。
+
+    这是 ``bound_hole_params`` 第 2 条出路（"孔口在哪一端没有依据 ⇒ 拒绝发射"
+    —— 不许按 0 起硬切）的补法：孔口其实还在别处写着。俯视圆分区里，与孔
+    **同轴、半径更大**的那块**材料**分区，它的实测顶面（``Zone.t_hi``）就是
+    孔口面 —— 孔从这块材料的顶面下钻，深度按标注。
+
+    YZYX 实测（`4~∅10-7H 深25`）：三个绑定的 r5 圆里两个的同心材料分区顶面
+    = 1686.25（图纸系，= v15a 真值 z145 顶面），一个（东下孔位）的分区读数
+    1589.50 —— 与真值矛盾。故取**组内多数派**：2:1 ⇒ 推得 span (1661.25,
+    1686.25) ≡ 真值 z[120,145]。打平或没多数时不推，维持"拒绝发射" ——
+    宁可少建不可错建（与剖视规则同一条原则）。
+
+    守卫（防循环证据）：同心分区的圆半径必须**大于**孔半径 —— 与孔同半径的
+    圆是孔自己，更小的同心圆是孔里的沉头/底孔轮廓（也不构成孔口）。
+
+    返回推断成功的组数；``notes`` 追加记账。
+    """
+    zones = getattr(plan, "zones", None) or ()
+    if not zones:
+        return 0
+    hint_by_handle: dict[str, CylinderHint] = {}
+    for c in corr.cylinders():
+        h = c.mapping.value
+        if not isinstance(h, CylinderHint) or h.axis.radius is None:
+            continue
+        for e in h.axis.radius.evidence:
+            hint_by_handle.setdefault(str(e), h)
+    uniq: dict[int, HoleBinding] = {}
+    for b in binds.by_handle.values():
+        uniq.setdefault(id(b), b)
+    n = 0
+    for b in uniq.values():
+        if b.span is not None or b.callout.depth is None:
+            continue
+        votes: dict[float, list[str]] = {}
+        voters = 0
+        for h in b.handles:
+            hint = hint_by_handle.get(h)
+            if hint is None:
+                continue
+            z = _concentric_material_zone(zones, hint)
+            if z is None:
+                continue
+            voters += 1
+            if z.t_hi - b.callout.depth < z.t_lo - 1e-9:
+                continue          # 从该顶面下钻会钻出分区 ⇒ 它不是孔口面
+            votes.setdefault(round(z.t_hi, 2), []).append(h)
+        if not votes:
+            continue
+        mouth, who = max(votes.items(), key=lambda kv: len(kv[1]))
+        if len(who) * 2 <= voters:
+            notes.append(
+                f"孔标注「{b.callout.text}」：同心材料分区的顶面读数不一致"
+                f"（{len(votes)} 种），不构成多数 ⇒ 维持拒绝发射（宁可少建）")
+            continue
+        nb = replace(b, span=(mouth - b.callout.depth, mouth),
+                     span_from=who[0], propagated=bool(len(b.handles) > 1),
+                     span_how="zone:concentric_mouth")
+        for h, cur in list(binds.by_handle.items()):
+            if cur is b:
+                binds.by_handle[h] = nb
+        notes.append(
+            f"孔标注「{b.callout.text}」：轮廓对没读到，孔口由同心材料分区"
+            f"顶面定出（{mouth:.2f}，{len(who)}/{voters} 个圆一致）⇒ 轴向区间 "
+            f"{mouth - b.callout.depth:.2f}..{mouth:.2f}，深度按标注 "
+            f"{b.callout.depth:g} 下钻")
+        n += 1
+    return n
+
+
+def _concentric_material_zone(zones, hint: CylinderHint):
+    """与 ``hint`` 同轴、半径更大的**材料**分区里，半径最小的那个。
+
+    "同心" = 轴共垂距 ≤ ``_MOUTH_AXIS_TOL``（``_axis_gap``，纯浮点）。
+    取半径最小者 = 最贴近孔口的那层材料（实测同轴材料分区常有 r50 大环台
+    与 r6.5 小凸台两层，孔口在小的那层上）。
+    """
+    best: tuple[float, object] | None = None
+    for z in zones:
+        if z.role != "material":
+            continue
+        for h2 in z.hints:
+            if h2.axis.radius is None:
+                continue
+            r2 = h2.axis.radius.value
+            if not isinstance(r2, (int, float)) or r2 <= hint.radius + 1e-9:
+                continue
+            if _axis_gap(hint.axis, h2.axis) > _MOUTH_AXIS_TOL:
+                continue
+            if best is None or r2 < best[0]:
+                best = (float(r2), z)
+    return best[1] if best is not None else None
+
+
+def _axis_gap(a1, a2) -> float:
+    """两条 3D 轴的公垂距（不平行取异面公垂距；近平行取点线距）。纯浮点。"""
+    u, v = a1.direction.normalized(), a2.direction.normalized()
+    w = a2.origin - a1.origin
+    cx = u.y * v.z - u.z * v.y
+    cy = u.z * v.x - u.x * v.z
+    cz = u.x * v.y - u.y * v.x
+    c = (cx * cx + cy * cy + cz * cz) ** 0.5
+    if c < 1e-9:                      # 平行：|w − (w·u)u|
+        t = w.x * u.x + w.y * u.y + w.z * u.z
+        dx, dy, dz = w.x - t * u.x, w.y - t * u.y, w.z - t * u.z
+        return (dx * dx + dy * dy + dz * dz) ** 0.5
+    return abs(w.x * cx + w.y * cy + w.z * cz) / c

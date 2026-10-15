@@ -786,12 +786,15 @@ def _bound_hole_feature(b: "HoleBinding", hint: CylinderHint, c,
         source_view=c.views[0] if c.views else "",
         evidence=list(ev),
     )
+    _how_cn = {"projection:outline_pair": "轮廓对读出的",
+               "callout:group_span": "组内轮廓对读出（传播）",
+               "zone:concentric_mouth": "孔口＝同心材料分区顶面、深度按标注"}
     rep.notes.append(
         f"圆 r{hint.radius:g}：孔标注「{hc.text}」⇒ 建为孔"
         + (f"（轴向 {params['axial_at'].value:.2f}.."
            f"{params['axial_at'].value + params['depth'].value:.2f}，"
-           "轮廓对读出的）" if "depth" in params
-           else "（按通孔发射）"))
+           + _how_cn.get(params["axial_at"].method, "轮廓对读出的") + "）"
+           if "depth" in params else "（按通孔发射）"))
     return f
 
 
@@ -901,7 +904,9 @@ def _resolve_questions(rep: RecognizeReport, plan,
       * 「找不到间距 2r 的轮廓对」→ ``neither``：图纸画了隐藏线仍然全无
         轮廓 ⇒ 非圆柱特征（曲面切边/圆角足迹，实测 r9 = R3 环面相切圆）；
         **已被孔标注绑定的除外** ⇒ ``hole``：图上明写了这是什么孔
-        （半剖/简化画法省掉轮廓线，正因如此才需要标注来补）。
+        （半剖/简化画法省掉轮廓线，正因如此才需要标注来补）；
+        **角色已由分区/特征剪影定死的除外** ⇒ ``boss``/``hole``：
+        轮廓对缺席是半剖/简化画法的省笔，不是"非圆柱"的证据（YZYX 5 条）。
     """
     qs = rep.questions
     roles: dict[str, tuple[str, str]] = {}      # 圆边 handle → (种类, 人话)
@@ -1003,6 +1008,22 @@ def _resolve_questions(rep: RecognizeReport, plan,
                 ans = ("neither（图纸画了隐藏线却没有任何间距 2r 的轮廓 ⇒ "
                        "不是孔也不是凸台，是曲面切边/圆角足迹）")
                 if qs.resolve(q, ans, "recognize:no_outline_pair"):
+                    n += 1
+            elif all(h in roles and roles[h][0] in ("material", "cut")
+                     for h in ev):
+                # 第三出口（v0.6.31）：圆边角色已被分区/特征剪影定死（材料/
+                # 切除）—— 半剖省孔壁、简化画法不画轮廓对，让"找不到间距 2r
+                # 的轮廓对"成了空证据，由分区剪影裁决（YZYX 5 条：815 材料
+                # ⇒ boss，813/82D 切除 ⇒ hole，82B/82C 材料 ⇒ boss）。
+                # 混合角色（部分 none）仍保留疑问。
+                ks = [roles[h][0] for h in ev]
+                kind = "material" if "material" in ks else "cut"
+                text = "；".join(dict.fromkeys(roles[h][1] for h in ev))
+                ans = ("boss（" if kind == "material" else "hole（") + text \
+                    + "——轮廓对缺席之疑由分区/特征剪影裁决）"
+                bg = "height:zone" if plan is not None \
+                    else "recognize:circle_roles"
+                if qs.resolve(q, ans, bg):
                     n += 1
     return n
 
@@ -1504,6 +1525,14 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
             rep.notes.append(
                 f"高度分解：{len(plan.raises)} 块抬升区、{len(plan.cuts)} 块"
                 f"切除区自 #{first} 号续编（这些圆已由分区表达，不再重复建圆柱）")
+    if rep.zones is not None:
+        # 孔口定位（§C6 第三段）：标注给了深度、轮廓对却没读到的孔组，用
+        # **同心材料分区的顶面**定孔口（4~∅10-7H 深25 ⇒ z[120,145]）。
+        # 必须在 cylinder_features 之前 —— 那里按绑定建孔，无 span 即拒绝发射。
+        from .callouts import infer_callout_mouth_spans
+        if infer_callout_mouth_spans(binds, corr, rep.zones, rep.notes):
+            rep.notes.append(
+                "孔口定位：轮廓对缺席的标注孔由同心材料分区顶面定出孔口")
     # 圆角（阶段 7 第四笔）：基体顶边的凸 R 与抬升区根部的凹 R —— 依据分别是
     # 「z = 顶−R」与「z = 顶+R」两条切线层线。分解不做时 base_top = 全高，
     # 半径门（TOP_R/ROOT_R 范围）自然把不成立的层线挡掉。

@@ -48,6 +48,10 @@ class SectionScope:
     scope: str                # full / half / local / multi / unknown
     usable_as_prism: bool     # 能否当"单平面截面棱柱"用于裁材料
     reason: str = ""
+    #: "title" = 标题明写种类；"inferred" = 无标题、从剖面线分布几何推断
+    origin: str = "title"
+    #: 几何推断为半剖时，剖面材料占图面的哪一半（"左半"/"右半"，图纸方向）
+    side: str = ""
 
 
 def _classify(kind: str) -> tuple[str, bool, str]:
@@ -86,6 +90,10 @@ def scope(ctx: RuleCtx) -> list[Convention]:
     标题**明写**种类（"横剖 x=…"）时只认标题；标题没写（如「c 向」式
     标题，YZYX C—C）时从剖面线覆盖范围做**几何推断**：剖面线横跨整个
     视图 ⇒ 全剖，只盖一部分 ⇒ 局部剖（不可作截面棱柱）。
+
+    无标题路径（v0.6.31，本规则的第二条判据）：视图**连剖切标题都没有**
+    但有剖面材料时，同样从剖面线分布几何推断 —— 判据见
+    ``_infer_untitled``（YZYX V0 半剖由此第一次被识别出来）。
     """
     titles = {t.handle: t for t in ctx.d.texts
               if t.kind == TextKind.SECTION_TITLE and t.cut is not None}
@@ -93,6 +101,9 @@ def scope(ctx: RuleCtx) -> list[Convention]:
     for v in ctx.d.views:
         cut = v.cut
         if not isinstance(cut, CutSpec):
+            c = _infer_untitled(ctx, v)
+            if c is not None:
+                out.append(c)
             continue
         kind = cut.kind or ""
         sc, usable, reason = _classify(kind)
@@ -141,6 +152,82 @@ def scope(ctx: RuleCtx) -> list[Convention]:
             evidence=refs,
         ))
     return out
+
+
+#: 无标题半剖的判据：剖面材料与中心线的间隙 —— 材料越线即非半剖
+_HALF_GAP = 2.0
+
+
+def _center_axis_x(ctx: RuleCtx, v, cx: float) -> float | None:
+    """视图中心处的**竖直中心线**的图面 x（半剖的分界线候选）。
+
+    判据：轴线角色、近竖直（跨度 ≥ 30% 视图高）、x 落在视图横向中心
+    ±max(2mm, 2% 宽) 内。YZYX V0 实测：中心线 82E/82F 拼合于
+    x=3462.94，恰是视图 bbox 横向中心。
+    """
+    idx = by_handle_index(ctx.d)
+    tol = max(2.0, 0.02 * v.bbox.width)
+    for h in v.evidence:
+        e = idx.get(h)
+        if e is None or e.role.value != Role.AXIS.value:
+            continue
+        g = e.geom
+        st, en = getattr(g, "start", None), getattr(g, "end", None)
+        if st is None or en is None:
+            continue
+        if abs(en.x - st.x) > 1e-6:
+            continue
+        if abs(en.y - st.y) < 0.3 * v.bbox.height:
+            continue
+        if abs(st.x - cx) <= tol:
+            return st.x
+    return None
+
+
+def _infer_untitled(ctx: RuleCtx, v) -> Convention | None:
+    """无剖面标题的视图 ⇒ 从剖面线分布几何推断剖视（``section.scope`` 第二条判据）。
+
+    判据（YZYX V0/V1 实测标定）：
+      * **半剖**：视图中心处有贯穿的竖直中心线，剖面材料整体落在它的
+        一侧、且与该线留 ≥2mm 间隙（另一侧是外形半，按制图法不画剖面线）
+      * **全剖**：剖面材料横跨视图全幅（覆盖比 ≥ 0.9）
+
+    判不出就不产出（既不误报也不拦 —— 迄今没有消费者拿它去裁材料）。
+    **一律 usable_as_prism=False**：几何推断、没有标题背书，宁可不裁
+    不可错裁。也不产疑问：这不是歧义，是缺信息的保守默认。
+    """
+    refs, boxes, _ = _material_boxes(ctx, v)
+    if not refs or v.bbox is None:
+        return None
+    tot = union_boxes(boxes)
+    bb = v.bbox
+    cx = (bb.xmin + bb.xmax) / 2
+    axis_x = _center_axis_x(ctx, v, cx)
+    side = ""
+    if axis_x is not None and tot.xmax <= axis_x - _HALF_GAP:
+        sc, side = "half", "左半"
+        reason = (f"无剖面标题：剖面材料只在中心线（x={axis_x:.2f}）左侧、"
+                  "右侧一条剖面线都没有 ⇒ 几何推断为半剖（右半为外形视）")
+    elif axis_x is not None and tot.xmin >= axis_x + _HALF_GAP:
+        sc, side = "half", "右半"
+        reason = (f"无剖面标题：剖面材料只在中心线（x={axis_x:.2f}）右侧、"
+                  "左侧一条剖面线都没有 ⇒ 几何推断为半剖（左半为外形视）")
+    else:
+        ratio = _coverage_ratio(v, boxes)
+        if ratio is None or ratio < 0.9:
+            return None
+        sc = "full"
+        reason = f"无剖面标题：剖面材料横跨视图全幅（覆盖 {ratio:.0%}）⇒ 几何推断为全剖"
+    info = SectionScope(label="", kind="", scope=sc, usable_as_prism=False,
+                        reason=reason + "；无标题背书，一律不作截面棱柱",
+                        origin="inferred", side=side)
+    return Convention(
+        rule="section.scope", kind=ConvKind.SECTION, view=v.id, value=info,
+        claim=Claim(info, "convention:section_infer", Tier.GUESS,
+                    evidence=tuple(refs)),
+        note=f"（无标题几何推断）{sc}{f'、{side}为剖面' if side else ''}：{reason}",
+        evidence=tuple(refs),
+    )
 
 
 @dataclass(frozen=True)

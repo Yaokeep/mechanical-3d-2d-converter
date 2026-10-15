@@ -799,6 +799,8 @@ _FIXTURE_PARTIAL = ROOT / "CAD" / "temp_output" / "_selftest_partial.dxf"
 _FIXTURE_DIRECTION = ROOT / "CAD" / "temp_output" / "_selftest_direction.dxf"
 #: 自检自给的孔标注夹具（`n~∅d 深h` 绑定链，同上）
 _FIXTURE_CALLOUT = ROOT / "CAD" / "temp_output" / "_selftest_callout.dxf"
+#: 自检自给的**无标题**剖视夹具（半剖/全剖几何推断，同上）
+_FIXTURE_HALF = ROOT / "CAD" / "temp_output" / "_selftest_half.dxf"
 
 
 def _write_break_fixture(out: Path) -> Path:
@@ -960,6 +962,42 @@ def _write_callout_fixture(out: Path) -> Path:
                       ("3~∅6 深25", (300, 95))):
         msp.add_text(text, dxfattribs={"layer": "标注", "height": 5}
                      ).set_placement(pos)
+    doc.saveas(out)
+    return out
+
+
+def _write_half_fixture(out: Path) -> Path:
+    """造一张**无剖切标题**的图纸（YZYX V0/V1 实测形态的最小复刻）：
+
+    - 视图 A：贯穿的竖直中心线 + 剖面线**只盖中心线左侧**（留 4mm 间隙）
+      ⇒ 几何推断半剖（另一侧是外形视，按制图法不画剖面线）
+    - 视图 B：剖面线横跨全幅（覆盖比 1.0）⇒ 几何推断全剖
+    - 视图 C：一条剖面线都没有 ⇒ 不许凭空产出剖视结论（反向对照：
+      越界推断的后果正是把普通视图当剖视图去裁材料）
+
+    三个视图都**没有**剖面标题 —— 这正是 v0.6.31 补的缺口：此前
+    scope 只处理 ``isinstance(cut, CutSpec)`` 的视图，半剖从未被识别。
+    """
+    import ezdxf
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc = ezdxf.new("R2010")
+    for name in ("轮廓线", "剖面线", "中心线"):
+        doc.layers.add(name)
+    msp = doc.modelspace()
+
+    def rect(x0: float, y0: float, x1: float, y1: float) -> None:
+        msp.add_lwpolyline([(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)],
+                           dxfattribs={"layer": "轮廓线"})
+
+    rect(0, 0, 80, 60)                       # 视图 A（半剖候选）
+    msp.add_line((40, 0), (40, 60), dxfattribs={"layer": "中心线"})
+    for y in (5, 15, 25, 35, 45):            # 剖面线只盖左半（≤x=36）
+        msp.add_line((0, y), (36, y), dxfattribs={"layer": "剖面线"})
+    rect(150, 0, 230, 60)                    # 视图 B（全剖候选）
+    for y in (5, 15, 25, 35, 45):
+        msp.add_line((150, y), (230, y), dxfattribs={"layer": "剖面线"})
+    rect(300, 0, 380, 60)                    # 视图 C（反向对照：无剖面线）
     doc.saveas(out)
     return out
 
@@ -1248,6 +1286,33 @@ def test_conventions() -> None:
               "技术要求：未注圆角 R3"):
         check(f"「{s}」不是孔标注（误报防线）",
               parse_callout("H4", s) is None, s)
+
+    # ---- G14 无标题剖视的几何推断（YZYX V0 半剖 / V1 全剖实测形态） ----
+    # 缺口：scope 此前只认"有剖面标题"的视图（isinstance(cut, CutSpec)），
+    # 无标题的半剖从未被识别。判据：中心线 + 材料整体单侧 ⇒ 半剖；材料
+    # 横跨全幅 ⇒ 全剖；判不出不产出（反例：视图 C 零剖面线）。
+    d14 = _prepared(_write_half_fixture(_FIXTURE_HALF))
+    cv14 = run_rules(RuleCtx(d=d14))
+    scs14 = cv14.of_kind(ConvKind.SECTION)
+    check("无标题：半剖/全剖各推断一条、零剖面线的视图不产结论",
+          len(scs14) == 2 and all(c.value.origin == "inferred"
+                                  for c in scs14),
+          str([(c.view, c.value.scope, c.value.origin) for c in scs14]))
+    half14 = next((c for c in scs14 if c.value.scope == "half"), None)
+    check("中心线 + 材料单侧 ⇒ 半剖，记下剖面在左半",
+          half14 is not None and half14.value.side == "左半"
+          and half14.value.kind == ""
+          and half14.value.usable_as_prism is False,
+          str(half14 and half14.value))
+    full14 = next((c for c in scs14 if c.value.scope == "full"), None)
+    check("材料横跨全幅 ⇒ 全剖（覆盖比 ≥0.9）",
+          full14 is not None, str(full14 and full14.value))
+    check("几何推断一律 GUESS 级 + 不作截面棱柱 + 不额外报疑问（缺信息≠歧义）",
+          all(c.tier is Tier.GUESS for c in scs14)
+          and all(c.value.usable_as_prism is False for c in scs14)
+          and not [q for q in cv14.questions.by_kind(
+                       OpenQuestion.AMBIGUOUS_FEATURE) if "剖" in q.detail],
+          str([(c.tier.name, c.value.usable_as_prism) for c in scs14]))
 
 
 # ---- 阶段 3：特征层 ----
@@ -1575,6 +1640,92 @@ def test_features() -> None:
           and p_nd["through"].tier is Tier.CONVENTION
           and p_nd["through"].method == "convention:no_depth_means_through",
           str(p_nd))
+
+    # ---- H10 孔口定位：同心材料分区顶面（§C6 第三段，4~∅10-7H 深25） ----
+    # 轮廓对没读到 ⇒ 此前按设计"拒绝发射"（不许按 0 起硬切）。可孔口还在
+    # 俯视材料分区里写着：与孔**同轴、半径更大**的材料分区，其顶面就是
+    # 孔口面（孔从这块材料顶面下钻，深度按标注）。实测 YZYX 三个圆 2:1
+    # ⇒ 取多数派 1686.25（= v15a 真值 z145 顶面的图纸系）。
+    from types import SimpleNamespace
+
+    from src.rebuild.features.callouts import (CalloutBindings,
+                                               infer_callout_mouth_spans)
+    from src.rebuild.model.geom import Axis3 as _A3, Point3 as _P3, \
+        Vector3 as _V3
+    from src.rebuild.views.correspondence import CylinderHint
+
+    def _hint10(x, y, r, handle):
+        ax = _A3(_P3(x, y, 0.0), _V3(0.0, 0.0, 1.0),
+                 Claim(r, "projection:circle", Tier.PROJECTION, (handle,)))
+        return CylinderHint(axis=ax, radius=r)
+
+    def _corr10(hints):
+        return SimpleNamespace(cylinders=lambda: [
+            SimpleNamespace(mapping=SimpleNamespace(value=h)) for h in hints])
+
+    def _zone10(role, hint, lo, hi):
+        return SimpleNamespace(role=role, hints=(hint,), t_lo=lo, t_hi=hi)
+
+    hc10 = HoleCallout(text_ref="H10", text="4~∅10-7H 深25", count=4,
+                       diameter=10.0, depth=25.0, matched=("count:4",))
+    holes10 = [_hint10(0, 0, 5, "k1"), _hint10(30, 0, 5, "k2"),
+               _hint10(60, 0, 5, "k3")]
+    b10 = HoleBinding(callout=hc10, handles=("k1", "k2", "k3"), radius=5.0,
+                      count_ok=False)
+    bd10 = CalloutBindings(by_handle={"k1": b10, "k2": b10, "k3": b10})
+    plan10 = SimpleNamespace(zones=(
+        _zone10("material", _hint10(0, 0, 6.5, "p1"), 1541.25, 1686.25),
+        _zone10("material", _hint10(30, 0, 6.5, "p2"), 1541.25, 1686.25),
+        _zone10("material", _hint10(60, 0, 6.5, "p3"), 1541.25, 1589.50)))
+    nt10: list[str] = []
+    n10 = infer_callout_mouth_spans(bd10, _corr10(holes10), plan10, nt10)
+    check("三个圆 2:1 多数派 ⇒ 孔口取 1686.25、span 深 25（= z120..145）",
+          n10 == 1 and abs(bd10.by_handle["k1"].span[0] - 1661.25) < 1e-9
+          and abs(bd10.by_handle["k1"].span[1] - 1686.25) < 1e-9
+          and bd10.by_handle["k1"].span_how == "zone:concentric_mouth",
+          f"n={n10} span={bd10.by_handle['k1'].span}")
+    check("全组 handle 同步换成新绑定（发射端按圆边查）",
+          all(bd10.by_handle[h].span is not None for h in ("k1", "k2", "k3")))
+    p10, why10 = bound_hole_params(bd10.by_handle["k1"], ("k1",))
+    check("分区推断的 span：CONVENTION 级、method=zone:concentric_mouth",
+          not why10 and p10["axial_at"].method == "zone:concentric_mouth"
+          and p10["axial_at"].tier is Tier.CONVENTION
+          and abs(p10["depth"].value - 25.0) < 1e-9, str(p10))
+    b11 = HoleBinding(callout=hc10, handles=("k1", "k2"), radius=5.0,
+                      count_ok=False)
+    bd11 = CalloutBindings(by_handle={"k1": b11, "k2": b11})
+    nt11: list[str] = []
+    n11 = infer_callout_mouth_spans(bd11, _corr10(holes10[:2]),
+                                    SimpleNamespace(zones=(
+                                        _zone10("material",
+                                                _hint10(0, 0, 6.5, "p1"),
+                                                1541.25, 1686.25),
+                                        _zone10("material",
+                                                _hint10(30, 0, 6.5, "p2"),
+                                                1541.25, 1589.50))), nt11)
+    check("1:1 打平 ⇒ 不推、记账后维持拒绝发射（宁可少建不可错建）",
+          n11 == 0 and bd11.by_handle["k1"].span is None
+          and any("不构成多数" in s for s in nt11), str(nt11))
+    b12 = HoleBinding(callout=hc10, handles=("k1",), radius=5.0,
+                      count_ok=False)
+    bd12 = CalloutBindings(by_handle={"k1": b12})
+    n12 = infer_callout_mouth_spans(
+        bd12, _corr10(holes10[:1]),
+        SimpleNamespace(zones=(_zone10("material",
+                                       _hint10(0, 0, 5.0, "self"),
+                                       1541.25, 1686.25),)), [])
+    check("同半径的同心圆是孔自己 ⇒ 不算孔口（防循环证据，H9 的 r3 由此守住）",
+          n12 == 0 and bd12.by_handle["k1"].span is None)
+    b13 = HoleBinding(callout=hc10, handles=("k1",), radius=5.0,
+                      count_ok=False)
+    bd13 = CalloutBindings(by_handle={"k1": b13})
+    n13 = infer_callout_mouth_spans(
+        bd13, _corr10(holes10[:1]),
+        SimpleNamespace(zones=(_zone10("material",
+                                       _hint10(0, 0, 6.5, "p1"),
+                                       1589.50, 1600.0),)), [])
+    check("分区厚度不够（顶面−深 < 分区底）⇒ 不是孔口面、不推",
+          n13 == 0 and bd13.by_handle["k1"].span is None)
 
 
 # ---- 阶段 4：汇流（理解层；发射层要 OCC/SW，见 emit 自己的 --demo） ----

@@ -534,6 +534,26 @@ r5/r8/r3 三条"找不到间距"被标注定案消解（已裁决 12 条中 4 �
 多270→57，仍 [RED]（缺>0：孔建出来了，特征识别整体离达标还远）。OCC 表 9 绿
 逐位不变（9 靶子图纸零标注文字，Phase D 对旧路径是 no-op）、selftest 421 项；
 SW 表跳过（emit 未改）。
+**§C6 第二刀第三段（v0.6.31）收官：拦路 8 → 0**——两个缺口一并补上。
+①**无标题半剖推断**（`conventions/section.py` 的 `_infer_untitled`，`section.scope`
+的第二条判据路径：视图中心处贯穿竖直中心线 + 剖面材料只在它一侧留 ≥2mm 间隙
+⇒ half；材料横跨全幅 ⇒ full；一律 `usable_as_prism=False`、Tier.GUESS、
+不产疑问）——**V0 半剖图第一次被识别**（实测 V0=half/左半@中心线 x=3462.94、
+V1=full）；②**孔口由同心材料分区顶面定出**（`features/callouts.py` 的
+`infer_callout_mouth_spans`：与孔同轴（轴共垂距 ≤0.1mm）、半径更大的**材料**
+分区，其实测顶面即孔口面；组内多数派投票）——`4~∅10-7H 深25` 三个圆 2:1 ⇒
+span (1661.25, 1686.25) ≡ v15a 真值 z[120,145] 逐位一致（span_how=
+`zone:concentric_mouth` ⇒ CONVENTION；同半径圆（孔自己）与"下钻会钻出分区"
+的顶面均不算、打平不推）；③`_resolve_questions` 加第三出口：圆边角色被分区/
+特征剪影定死（material/cut）时"不存在轮廓对"不再保留疑问——半剖/简化省笔
+不是"非圆柱"证据。**特征树 21 → 24**（+3 条 ∅10 孔，axial 1661.25 图纸系）；
+零回归对照（`git stash` A/B，HEAD×同图纸×`--force`）：旧 38,309,638.24 / 新
+38,303,747.73，差 **5,890.51 = 3×π×5²×25 逐位吻合**（3 孔切出），YZYX 三件套
+逐位持平（探针 11/27、TL 205/32、BL 451/42、TR 165/57）；OCC 表 9 绿逐位不变、
+selftest **421 → 431**（G14 夹具 4 + H10 推断 6；破坏性证明两条精确判红）。
+余 6 条非拦路疑问不变（投影制×3、视图未定性×3）。**下一堵墙**：模型仍
+38.3M vs v15a 7.78M、bbox z 375 vs 203——拦路已零，缺口全在非拦路疑问
+（V1 剖切面、塔顶三孔族、#7 的 depth 48.25 疑误）与未读出的特征。
 ✅ 无基准三件套（`yz_accept.py`：27
 材料点 + 五视图 HLR 评分）建在 **v15a 零件系**上（探针点、`yz_hlr.SPLIT_X=−96.5`
 都是零件系常量），新框架模型在**图纸坐标系**——2026-10-13 **零件系变换已落地**
@@ -549,13 +569,14 @@ TR 179**；横向 ±172.5/±197.5/顶 187.5 已逐位对，缺的全在特征识
 `evidence/`（dxf_reader/model + text_parser）、
 `views/`（view_detector + view_typer + correspondence 跨视图对应 + **ring 轮廓环仪器**）、
 `conventions/`（**11 条规则**，2026-10-11 起：centerline 对称/阵列、
-linetype 断裂/虚线/**细实线**、section 剖切种类/材料、simplification 螺纹/圆角、
+linetype 断裂/虚线/**细实线**、section 剖切种类/材料（v0.6.31 起含**无标题
+半剖/全剖几何推断** `_infer_untitled`）、simplification 螺纹/圆角、
 **dimension 尺寸锚点**、**callout 孔标注**（2026-10-15 Phase D：`n~∅d 深h`
 → 直径/数量/深度）——YZYX 手工读图三约定已前移：局部剖几何推断
 （「c 向」标题 + 剖面线覆盖比 <0.9 ⇒ local）、细实线=被盖轮廓（Role.THIN，
 环提取只认 VISIBLE 自动排除）、DIMENSION「数值↔几何锚点」配对（tier=ANNOTATED），
 实测 YZYX C—C 定性 section/scope=local、52 条尺寸 45 锚上、20/3/120 逐位吻合）、
-`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定**）、`verify/`（compare/coverage/
+`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）**）、`verify/`（compare/coverage/
 gate/step_probe/box_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
 step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
@@ -757,6 +778,12 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   3b814ac / f3ae0ec / d34997f / 7418203 + 本次）、8 处版本字符串仍 0.6.25。
   本版正文已入本文件新框架节（§C6 第二刀第二段），v0.6.29 的两处欠账
   （ASSESSMENT §C6 / CHANGELOG）于本次一并补为 v0.6.29 + v0.6.30 各一节）
+  （2026-10-15 续未收口：v0.6.31 提交（半剖语义识别 + 孔口由同心材料分区顶面
+  定出——YZYX 拦路 8→0、特征树 21→24、selftest 421→431、OCC 验收表 9 绿逐位
+  不变）同样按 `v0.6.x:` 前缀提交。至此 tag 落后 HEAD **8 个提交**（5692df4 /
+  b14124e / 3b814ac / f3ae0ec / d34997f / 7418203 / 1c06418 + 本次）、8 处版本
+  字符串仍 0.6.25。本版正文已入本文件新框架节（§C6 第二刀第三段）+ CHANGELOG
+  与 ASSESSMENT §C6 各一节）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。
