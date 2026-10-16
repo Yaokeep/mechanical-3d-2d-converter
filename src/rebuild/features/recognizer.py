@@ -1578,6 +1578,13 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
         m = side_channels(d, corr, part, rep)
         if m:
             rep.notes.append(f"侧轴凸台：月牙缺口/张缝/销孔共 {m} 个特征进树")
+        # 侧凹槽族（YZYX 式）：甲板抬升 / 深腔 / 浅腔平台 / 唇外修剪 / 壁根圆角。
+        # 依据 = 俯视「隐藏壁面 + 可见唇线 + 带内端面线」+ 剖面（法向 ∥ 凹槽长轴）
+        # 的槽底/斜肩/甲板顶/平台/壁根圆角。读不齐只记账、不建（见该模块 docstring）。
+        from .side_recess import side_recess
+        k = side_recess(d, corr, part, rep)
+        if k:
+            rep.notes.append(f"侧凹槽族：{k} 个特征进树")
     merge_section_axes(corr, rep, part)
     if rep.zones is not None or no_feature or binds.by_handle:
         # 分区/轮廓证据把圆的角色定死之后，把 corr 层的歧义疑问**裁决**掉

@@ -70,7 +70,7 @@ from ..model.geom2d import Line2, Point2, Profile2, ProfileSeg2
 from ..model.ids import FeatureId
 from ..model.questions import OpenQuestion, Question
 from ..views.correspondence import CorrespondenceResult, CylinderHint, ViewFrame
-from ..views.ring import extract_ring
+from ..views.ring import _profile_edges, extract_ring
 from .library import ir_point, mk_claim
 from .recognizer import AXIS_POS_TOL, _PLANE_AXES, _axis_name
 
@@ -207,23 +207,72 @@ class Band:
         return out
 
 
+def _edge_points(e, vpos, step: float) -> Iterable[tuple[float, float]]:
+    """环提取的内部边 ``_E`` → 视图坐标点流（直线按长度、弧按弧长）。"""
+    x1, y1 = vpos[e.vs]
+    x2, y2 = vpos[e.ve]
+    if e.t == "L":
+        dx, dy = x2 - x1, y2 - y1
+        n = max(1, min(4000, int(math.ceil(math.hypot(dx, dy) / step))))
+        for i in range(n + 1):
+            t = i / n
+            yield (x1 + dx * t, y1 + dy * t)
+        return
+    cx, cy, r = e.cx, e.cy, e.r
+    if r <= 1e-9:
+        return
+    if e.vs == e.sa_v:
+        a0, a1, ccw = e.sa, e.ea, True
+    else:
+        a0, a1, ccw = e.ea, e.sa, False
+    span = ((a1 - a0) % (2 * math.pi)) if ccw else ((a0 - a1) % (2 * math.pi))
+    n = max(2, min(4000, int(math.ceil(r * span / step))))
+    sgn = 1.0 if ccw else -1.0
+    for i in range(n + 1):
+        q = a0 + sgn * span * i / n
+        yield (cx + r * math.cos(q), cy + r * math.sin(q))
+
+
+def _accumulate(cols: dict[int, list[float]],
+                pts: Iterable[tuple[float, float]]) -> None:
+    for x, y in pts:
+        k = int(math.floor(x / BAND_STEP))
+        c = cols.get(k)
+        if c is None:
+            cols[k] = [y, y]
+        else:
+            if y < c[0]:
+                c[0] = y
+            if y > c[1]:
+                c[1] = y
+
+
 def build_band(d: "Drawing", frame: ViewFrame, view) -> Band | None:
-    """把一个视图的可见轮廓环变成剪影包络（提不到环 ⇒ None）。"""
-    res = extract_ring(d, view)
-    if res.ring is None:
-        return None
+    """把一个视图的可见轮廓证据变成剪影包络（无轮廓 ⇒ None）。
+
+    **信号源 = 全部可见轮廓边**（``views.ring._profile_edges`` 的边表，
+    逐边按几何密采样），不是环提取的结果。原实现只采**单条环**，
+    而环遍历（最左转）在 T 型拆分点上会选旁支抄近路 —— YZYX V1
+    实测：x=−9.5（孔端竖线）与 z=48.25（孔腔顶横线）的交点处，
+    环沿"孔腔顶线"西行而丢掉了 145 顶线（缺口 x −46.5..−9.5），
+    该段剪影顶被读成 48.25 而不是 145，base_top 因此塌到 48.25。
+    逐列取全部边的 (min, max) 即投影并集包络 —— 内圈线只会落在
+    外轮廓之内，不改变列极值；缺的边（如被抄近路丢掉的 145 顶线）
+    无论属于哪个候选环都在边表里，包络自然完整。
+
+    环提取仍作兜底：边表为空（纯圆视图等）而环提得到时退回老路径。
+    """
     cols: dict[int, list[float]] = {}
-    for s in res.ring.segs:
-        for x, y in _sample(s, BAND_STEP):
-            k = int(math.floor(x / BAND_STEP))
-            c = cols.get(k)
-            if c is None:
-                cols[k] = [y, y]
-            else:
-                if y < c[0]:
-                    c[0] = y
-                if y > c[1]:
-                    c[1] = y
+    edges, vpos = _profile_edges(d, view)
+    if edges:
+        for e in edges:
+            _accumulate(cols, _edge_points(e, vpos, BAND_STEP))
+    if not cols:
+        res = extract_ring(d, view)
+        if res.ring is None:
+            return None
+        for s in res.ring.segs:
+            _accumulate(cols, _sample(s, BAND_STEP))
     if not cols:
         return None
     rows: list[tuple[float, float, float]] = []
