@@ -34,6 +34,11 @@ class OpenQuestion(StrEnum):
     #: 拿它当完整视图会把尺寸算错且毫无提示（旧管线完全没有这个概念）
     BROKEN_VIEW = "断裂视图（该向尺寸不可用）"
     UNKNOWN_VIEW = "视图未定性"
+    #: 弧不是圆：多段弧的未画部分过半落在视图轮廓之外 ⇒ 判为拱形/型面外缘，
+    #: 不按整圆柱读（见 correspondence._profile_arc）。**非拦路**——它说明
+    #: "这块形状还没读出来"（少建一个特征），不会把已有特征建错；拦路的
+    #: 定义见 pipeline.RebuildResult.blocking
+    UNRECOGNIZED_PROFILE = "轮廓弧未识别为特征"
     OUT_OF_DOMAIN = "超出解释域"             # 自由曲面等（§12）
 
 

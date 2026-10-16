@@ -1141,6 +1141,21 @@ def merge_section_axes(corr: CorrespondenceResult, rep: RecognizeReport,
             _absorb(same[0][1], axis, c, rep)
             continue
         if r_new is None:
+            # 先问轮廓弧：这条轴旁边若立着一条被判为轮廓弧的弧（同轴），
+            # 那"缺半径"是误诊 —— 半径图上有（弧就是它的读数），缺的是**形状
+            # 识别**（拱顶/剖分面半圆孔等，见 ``_profile_arc``）。那桩事已在
+            # 对应层报过 UNRECOGNIZED_PROFILE 疑问，这里不换一个说法再报一遍
+            # （本函数自己的规矩：同一桩事只报一次）。
+            pals = [p for p in corr.profiles
+                    if (dd := axis_distance(p.axis, axis)) is not None
+                    and dd <= AXIS_POS_TOL]
+            if pals:
+                rep.notes.append(
+                    f"{'×'.join(c.views)} 的中心线轴与轮廓弧同轴（"
+                    + "、".join(sorted(f"{p.view} r{p.axis.radius.value:g}"
+                                       for p in pals))
+                    + "）—— 半径图上有、形状未识别，疑问已在轮廓弧一处报过")
+                continue
             rep.questions.add(Question(
                 OpenQuestion.MISSING_DIMENSION,
                 f"{'×'.join(c.views)} 的中心线定出一条 3D 轴"

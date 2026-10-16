@@ -53,6 +53,12 @@ Y = 由俯视图/侧视图补出的第三向。这样"图纸上量到的图元�
 - **POINT 对应只做有界版**：端点两两配对是组合爆炸，此处只对
   "与圆/弧心重合或在包围盒极值上"的特征点做配对（见 `_points`），
   全量版属于阶段 3 求解器的活。
+- **拱形/型面外缘还没读**：弧画到的部分**不足半圈**、且未画到的那部分过半
+  落在视图轮廓之外时，判为**轮廓弧**而非"被遮挡的圆"（`_profile_arc`；
+  YZYX 的塔拱即此），报 `UNRECOGNIZED_PROFILE` 疑问并**少建一个特征** ——
+  比按整圆柱读、多建一根 φ375×345 的错料诚实。画到 ≥ 半圆的弧不在此列
+  （键槽开口、半剖分面上的轴承半孔、半圆槽都是圆上少画一截，圆是真的）。
+  拱这类形状的识别规则是后续工作。
 """
 from __future__ import annotations
 
@@ -65,7 +71,7 @@ from ..evidence.model import Drawing, Evidence, Kind, Role, View, ViewType
 from ..evidence.text_parser import CutSpec, TextKind
 from ..model.claim import Claim, Tier, merge
 from ..model.geom import Axis3, Point3, Vector3
-from ..model.geom2d import Arc2, Circle2, Line2, Point2
+from ..model.geom2d import Arc2, BBox2, Circle2, Line2, Point2
 from ..model.ids import EvidenceRef
 from ..model.questions import OpenQuestion, Question, QuestionList
 
@@ -261,11 +267,27 @@ class Correspondence:
                 f"{self.mapping}   {self.note}")
 
 
+@dataclass(frozen=True)
+class ProfileArc:
+    """被判为**轮廓弧**的弧 —— "圆"被证伪（未画部分在视图轮廓之外，见
+    ``_profile_arc``），但它的圆心与半径仍是真读数，记下来给下游：
+    识别器拿它避免把同轴的中心线轴误诊成"图纸没给半径"（YZYX 塔的轴即此，
+    半径其实标得清清楚楚 —— R187.5 / R95 / Ø96.5… —— 缺的是形状识别）。
+    """
+
+    view: str
+    #: 若这条弧按圆柱读会落在的 3D 轴（圆心 × 投影方向；半径随 Claim 带依据）
+    axis: Axis3
+    handles: tuple[EvidenceRef, ...]
+
+
 @dataclass
 class CorrespondenceResult:
     correspondences: list[Correspondence] = field(default_factory=list)
     frames: dict[str, ViewFrame] = field(default_factory=dict)
     questions: QuestionList = field(default_factory=QuestionList)
+    #: 各视图里判为轮廓弧的弧（不进 ``correspondences`` —— 它们没有 3D 解释）
+    profiles: list[ProfileArc] = field(default_factory=list)
 
     def by_kind(self, kind: CorrKind) -> list[Correspondence]:
         return [c for c in self.correspondences if c.kind == kind]
@@ -1111,32 +1133,101 @@ ARC_COVER_MIN = math.radians(170.0)
 #: 覆盖判定的采样精度（弧度，0.5°）——只判"盖没盖够"，不需要精确
 ARC_COVER_BIN = math.radians(0.5)
 
+#: "轮廓弧 vs 圆边"判定的三个门槛（见 ``_profile_arc``）：未覆盖角域的下限
+#: （缺口不到半圈的不构成"拱"嫌疑）、视图轮廓盒的外扩余量（mm）、未覆盖部分
+#: 落在盒外的比例下限。
+PROFILE_ARC_GAP_MIN = math.radians(180.0)
+PROFILE_ARC_TOL = 0.5
+PROFILE_ARC_OUT_FRAC = 0.5
 
-def _arc_cover(spans: list[tuple[float, float]]) -> float:
-    """多段弧在 [0, 2π) 上的覆盖合计（弧度）。``spans`` 给 (起角, 跨角) 对。"""
+
+def _arc_hits(spans: list[tuple[float, float]]) -> bytearray:
+    """把弧段打到 0.5° 的角位掩码上 —— ``_arc_cover`` / ``_profile_arc`` 的共用底座。
+
+    端点取整（``round``）意味着**覆盖会被算得比实际宽一点**：单段 169.86°
+    实测报 170.5°（YZYX 拱弧正是这样越过了 ``ARC_COVER_MIN``）—— 所以
+    "覆盖够了"不能单独作为"是圆"的依据，还得看没盖到的那部分在哪儿。
+    """
     n = int(round(2 * math.pi / ARC_COVER_BIN))
     hit = bytearray(n)
     for s, w in spans:
         if w >= 2 * math.pi - 1e-9:
-            return 2 * math.pi
+            return bytearray(b"\x01") * n
         i0 = int(round((s % (2 * math.pi)) / ARC_COVER_BIN))
         i1 = int(round(((s % (2 * math.pi)) + w) / ARC_COVER_BIN))
         for i in range(i0, i1 + 1):
             hit[i % n] = 1
-    return sum(hit) * ARC_COVER_BIN
+    return hit
 
 
-def _circles_of(d: Drawing, idx: dict[str, Evidence], v: View
-                ) -> list[tuple[EvidenceRef, Point3, float]]:
-    """视图里的整圆/整圆弧/多段弧拼出的圆边 → (handle, 图纸圆心, 半径)。
+def _arc_cover(spans: list[tuple[float, float]]) -> float:
+    """多段弧在 [0, 2π) 上的覆盖合计（弧度）。``spans`` 给 (起角, 跨角) 对。"""
+    return sum(_arc_hits(spans)) * ARC_COVER_BIN
 
-    HLR 出图的圆常被打成整圆弧（Arc2 张角 2π），故两种都收；此外一条圆边
-    可能被拆成**多段弧**（甚至只画一部分，见 ``ARC_COVER_MIN``）—— 按
-    (圆心, 半径) 归组、角覆盖达标即算一条圆边，各段**逐条进列表**：同心的
-    同半径多条会被 `cylinders_from_circles` 并成一条（依据并列，不误报同心）。
+
+def _profile_arc(cx: float, cy: float, r: float,
+                 spans: list[tuple[float, float]], bbox: BBox2 | None) -> bool:
+    """多段弧拼出的"圆"，是不是**轮廓弧**（拱形/型面外缘）而不是圆边？
+
+    两条判据同时成立才拦（缺一不可）：
+
+    ① **未画到的角域超过半圈**（``PROFILE_ARC_GAP_MIN``）——画到的部分不足
+       半圆时，"其余被遮挡/重合"的整圆假设**无界**（一个半圆拱长得一模一样），
+       不能按圆读；画到 ≥ 半圆则假设有界（至多补半圈），键槽开口（缺口 31.5°）、
+       半孔/半圆槽（画满一整个直径）都不受影响。
+    ② **缺口过半落在视图包围盒之外**。视图包围盒是该向全部可见/隐藏轮廓的
+       包络 —— **盒外按制图法不可能有材料**；圆"没画的那截"整条在盒外，就
+       不是"被遮挡的圆"，是拱。
+
+    实测四例（两条判据的边界都见过了）：
+
+    - YZYX 齿箱上盖 V0/V4：各一条 R187.5 弧，覆盖 169.86°（5.07°..174.93°），
+      圆心落在视图底边（剖分面）上 —— 未画的下半圈整条在盒外（塔本形是
+      z≥0 的半圆柱拱）。缺口 190.1° > 180° ⇒ 拦。它被 ``ARC_COVER_MIN``
+      放行、按整圆读会合成 φ375×345 的实心圆柱：38.1M mm³ ≈ 全模型 38.3M
+      里几乎全部（v0.6.31 实测）。
+    - YZYX 半剖分面上的轴承半孔（r48.25/80/83/84.5/107.5）：覆盖 180.5°、
+      缺口 179.5° ≤ 180° ⇒ **不拦**。画到一整个直径才停在剖分面上，圆假设
+      有界；而按整圆柱当**切除**读恰是正解 —— 缺失的半圈整条在盒体材料之外。
+    - bracket 剖面图抬升长圆左端 r20（8 段弧盖 90°..270°）：缺口 ~180° 但
+      落在板内（判据②不成立）⇒ 不拦，仍是圆边。
+    - 20160112 阶梯轴 V1 φ43 键槽截面（7 段弧盖 328.5°，缺口 31.5° = 键槽
+      开口）、轴测量 V1 r20 半圆槽（2×90°，缺口 179.5°）⇒ 均不拦 —— 圆是
+      真的，开口/半边只是圆上少画的一截。
+    """
+    if bbox is None or r <= 0.0:
+        return False
+    hit = _arc_hits(spans)
+    miss = [i for i, h in enumerate(hit) if not h]
+    if len(miss) * ARC_COVER_BIN <= PROFILE_ARC_GAP_MIN:
+        return False
+    box = bbox.expanded(PROFILE_ARC_TOL)
+    outside = 0
+    for i in miss:
+        a = (i + 0.5) * ARC_COVER_BIN
+        x, y = cx + r * math.cos(a), cy + r * math.sin(a)
+        if not (box.xmin <= x <= box.xmax and box.ymin <= y <= box.ymax):
+            outside += 1
+    return outside >= PROFILE_ARC_OUT_FRAC * len(miss)
+
+
+def _circle_edges_of(d: Drawing, idx: dict[str, Evidence], v: View
+                     ) -> tuple[list[tuple[EvidenceRef, Point3, float]],
+                                list[tuple[EvidenceRef, float]]]:
+    """视图里的圆边 → (圆边, 被判为轮廓弧的弧)。
+
+    圆边：整圆、张角 2π 的弧、按 (圆心, 半径) 归组后角覆盖 ≥ ``ARC_COVER_MIN``
+    的多段弧。各段**逐条进列表**：同心的同半径多条会被
+    `cylinders_from_circles` 并成一条（依据并列，不误报同心）。
+
+    第二项是被 ``_profile_arc`` 拦下的弧（(handle, 半径)）——**不进圆边**，
+    返回给调用方记账（``cylinders_from_circles`` 报"轮廓弧未识别"疑问）。
+    拦它不是保守默认：它作为圆**已证伪**（圆没画完的那截在视图轮廓之外，
+    不可能是被遮挡），详见 ``_profile_arc``。
     """
     out: list[tuple[EvidenceRef, Point3, float]] = []
-    arcs: dict[tuple[int, int, int, int], list[tuple[EvidenceRef, Arc2]]] = {}
+    rejected: list[tuple[EvidenceRef, float]] = []
+    arcs: dict[tuple[int, int, int], list[tuple[EvidenceRef, Arc2]]] = {}
     for h in v.evidence:
         e = idx.get(h)
         if e is None or e.kind != Kind.EDGE:
@@ -1154,13 +1245,27 @@ def _circles_of(d: Drawing, idx: dict[str, Evidence], v: View
                 # 跨度不进 key：同一条圆边的各段半径相同 ⇒ 按 (圆心, 半径) 分组
                 arcs.setdefault(key, []).append((e.handle, g))
     for items in arcs.values():
-        cover = _arc_cover([((a.start_angle), (a.end_angle - a.start_angle)
-                             % (2 * math.pi)) for _, a in items])
-        if cover >= ARC_COVER_MIN:
-            c = items[0][1].center
-            for handle, _ in items:
-                out.append((handle, Point3(c.x, c.y, 0.0), items[0][1].radius))
-    return out
+        spans = [(a.start_angle, (a.end_angle - a.start_angle) % (2 * math.pi))
+                 for _, a in items]
+        if _arc_cover(spans) < ARC_COVER_MIN:
+            continue
+        c, r = items[0][1].center, items[0][1].radius
+        if _profile_arc(c.x, c.y, r, spans, v.bbox):
+            rejected.extend((handle, r) for handle, _ in items)
+            continue
+        for handle, _ in items:
+            out.append((handle, Point3(c.x, c.y, 0.0), r))
+    return out, rejected
+
+
+def _circles_of(d: Drawing, idx: dict[str, Evidence], v: View
+                ) -> list[tuple[EvidenceRef, Point3, float]]:
+    """视图里的圆边（不含轮廓弧）→ (handle, 图纸圆心, 半径)。
+
+    只要圆边各调用方用这个；要一并拿"被拦下的轮廓弧"（记账用）走
+    ``_circle_edges_of``，两者同源。
+    """
+    return _circle_edges_of(d, idx, v)[0]
 
 
 @dataclass(frozen=True)
@@ -1319,8 +1424,11 @@ def _band_totals(idx: dict[str, Evidence], v: View, along: str,
 
 
 def cylinders_from_circles(d: Drawing, frames: dict[str, ViewFrame],
-                           qs: QuestionList) -> list[Correspondence]:
+                           qs: QuestionList
+                           ) -> tuple[list[Correspondence], list[ProfileArc]]:
     """圆 ⇒ 圆柱轴；再拿正交视图里的轮廓对补上长度与"孔还是凸台"。
+
+    返回 (圆柱对应, 被判为轮廓弧的弧) —— 后者没有 3D 解释，只记账。
 
     **同心圆不合并**：同一个圆心上的多个圆是**多条圆边**，可能读成
     沉孔/倒角/台阶（同一根轴上的两个直径），也可能读成"盘 + 中心孔"、
@@ -1331,13 +1439,35 @@ def cylinders_from_circles(d: Drawing, frames: dict[str, ViewFrame],
     体积从 85,652 涨到 115,811（+35%）。
     """
     out: list[Correspondence] = []
+    prof: list[ProfileArc] = []
     idx = _index(d)
     for v in d.views:
         if v.id not in frames or v.bbox is None:
             continue
         f = frames[v.id]
+        edges, profile = _circle_edges_of(d, idx, v)
+        if profile:
+            rs = "、".join(f"r{r:g}" for r in sorted({r for _, r in profile}))
+            qs.add(Question(
+                OpenQuestion.UNRECOGNIZED_PROFILE,
+                f"{v.id} 有 {len(profile)} 条弧（{rs}）未画到的部分过半落在"
+                "本视图轮廓之外 —— 判为**轮廓弧**（半圆拱/型面外缘，如剖分面上的"
+                "半圆孔、罩壳的拱顶），不按整圆柱读（视图轮廓之外不可能有材料，"
+                "被遮挡的圆不会遮到外面）。这类轮廓还没有识别规则，"
+                "对应形状尚未读出",
+                view=v.id, evidence=tuple(h for h, _ in profile)))
+        dirs = {"x": Vector3(1, 0, 0), "y": Vector3(0, 1, 0),
+                "z": Vector3(0, 0, 1)}
+        for handle, r in profile:
+            c3 = f.to_model(idx[handle].geom.center.x,   # type: ignore[union-attr]
+                            idx[handle].geom.center.y)   # type: ignore[union-attr]
+            prof.append(ProfileArc(
+                v.id, Axis3(c3, dirs[f.p_axis],
+                            Claim(r, f"profile_arc:{v.id}", Tier.PROJECTION,
+                                  evidence=(handle,))),
+                (handle,)))
         merged: dict[tuple[int, int], list[tuple[EvidenceRef, Point3, float]]] = {}
-        for handle, center, r in _circles_of(d, idx, v):
+        for handle, center, r in edges:
             key = (round(center.x / MATCH_TOL), round(center.y / MATCH_TOL))
             merged.setdefault(key, []).append((handle, center, r))
         for group in merged.values():
@@ -1364,13 +1494,11 @@ def cylinders_from_circles(d: Drawing, frames: dict[str, ViewFrame],
                     candidates=("step", "counterbore", "independent"),
                 ))
             origin = f.to_model(group[0][1].x, group[0][1].y)
-            dirs = {"x": Vector3(1, 0, 0), "y": Vector3(0, 1, 0),
-                    "z": Vector3(0, 0, 1)}
             for same in uniq:
                 out.append(_circle_to_cylinder(
                     d, idx, v, f, frames, qs, tuple(h for h, _, _ in same),
                     same[0][2], origin, dirs[f.p_axis], refs0))
-    return out
+    return out, prof
 
 
 def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
@@ -1649,7 +1777,9 @@ def build_correspondence(d: Drawing, qs: QuestionList | None = None,
 
     res.correspondences.extend(axes_from_sections(d, frames, questions))
     res.correspondences.extend(axes_from_centerlines(d, frames, questions))
-    res.correspondences.extend(cylinders_from_circles(d, frames, questions))
+    cyls, profiles = cylinders_from_circles(d, frames, questions)
+    res.correspondences.extend(cyls)
+    res.profiles.extend(profiles)
     res.correspondences.extend(points_from_vertices(d, frames, questions))
 
     if not res.axes():
@@ -1680,5 +1810,16 @@ def describe(res: CorrespondenceResult) -> str:
             lines.append(f"  {c}")
         if len(items) > 24:
             lines.append(f"  … 另有 {len(items) - 24} 条")
+        lines.append("")
+    if res.profiles:
+        by_view: dict[str, list[str]] = {}
+        for p in res.profiles:
+            by_view.setdefault(p.view, []).append(
+                f"r{p.axis.radius.value:g}@"
+                f"({p.axis.origin.x:.1f},{p.axis.origin.y:.1f},"
+                f"{p.axis.origin.z:.1f})")
+        lines.append(f"轮廓弧（未识别为特征，不进圆柱通道）（{len(res.profiles)} 条）")
+        for v, rs in by_view.items():
+            lines.append(f"  {v}: {'、'.join(rs)}")
         lines.append("")
     return "\n".join(lines)

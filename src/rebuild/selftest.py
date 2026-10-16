@@ -785,6 +785,36 @@ def test_correspondence() -> None:
           abs(_merge_total([(0.0, 1.0), (1.2, 2.0)]) - 1.8) < 1e-9,
           str(_merge_total([(0.0, 1.0), (1.2, 2.0)])))
 
+    # F5 轮廓弧判定（拱 vs 圆边，2026-10-16 定稿）——两个门槛各见一次边界：
+    #    ①缺口 > 半圈（画到的弧不足半圆 ⇒ "其余被遮挡"的整圆假设无界，
+    #    半圆拱长得一模一样）；②缺口过半落在视图轮廓盒外（盒外不可能有材料）。
+    #    四例数值全部取自实测坐标，来源图纸均 gitignore，用同形合成复现。
+    import math
+    from src.rebuild.model.geom2d import BBox2
+    from src.rebuild.views.correspondence import _arc_cover, _profile_arc
+    # 端点取整把覆盖算宽：单段 169.86°（YZYX 拱弧实测跨度 5.07°..174.93°）
+    # 报 170.5° —— 正是它越过 ARC_COVER_MIN=170° 的机制，故"覆盖够"不能
+    # 单独作"是圆"的依据。
+    check("弧覆盖 0.5° 分箱：单段 169.86° 报 170.5°",
+          abs(_arc_cover([(math.radians(5.07), math.radians(169.86))])
+              - math.radians(170.5)) < 1e-9,
+          f"{math.degrees(_arc_cover([(math.radians(5.07), math.radians(169.86))])):.1f}°")
+    _yz_box = BBox2(3265.44, 1541.25, 3660.44, 1728.75)
+    check("轮廓弧①：YZYX 塔拱（r187.5@剖分面，缺口 189.5°>180 且 95% 在盒外）→ 拦",
+          _profile_arc(3462.94, 1541.25, 187.5,
+                       [(math.radians(5.07), math.radians(169.86))], _yz_box))
+    check("轮廓弧②：半圆画满一整个直径（缺口 179.5°≤180，YZYX 半孔/轴测量半圆槽形）→ 不拦",
+          not _profile_arc(42.0, 32.0, 20.0,
+                           [(math.radians(90.0), math.radians(90.0)),
+                            (math.radians(180.0), math.radians(90.0))],
+                           BBox2(2.0, 2.0, 42.0, 62.0)))
+    check("轮廓弧③：键槽开口（20160112 φ43 截面形，缺口 32.0°≤180）→ 不拦",
+          not _profile_arc(0.25, -84.77, 21.5, [(0.0, math.radians(327.6))],
+                           BBox2(-21.25, -106.27, 20.90, -63.27)))
+    check("轮廓弧④：缺口 > 半圈但落在轮廓盒内（bracket 抬升长圆 r20 形）→ 不拦",
+          not _profile_arc(50.0, 50.0, 20.0, [(0.0, math.radians(170.0))],
+                           BBox2(0.0, 0.0, 100.0, 100.0)))
+
 
 # ============ G. 约定层（阶段 2） ============
 
