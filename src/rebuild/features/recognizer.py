@@ -1540,6 +1540,15 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
             rep.notes.append(
                 f"高度分解：{len(plan.raises)} 块抬升区、{len(plan.cuts)} 块"
                 f"切除区自 #{first} 号续编（这些圆已由分区表达，不再重复建圆柱）")
+    # 绕坐标轴的回转族（YZYX 塔/盘/止口/侧裙）：端视图里的**短弧簇**（同圆心
+    # ≥3 条互异半径、画不满的轮廓弧）定出回转轴，子午视图的轴向线跨视图取交
+    # 得母线。`detect_revolve` 的入口是圆柱提示（圆边 ≥ 3），短弧全被它当
+    # "不是圆"丢掉了——这里正是那批弧的出口。不成立时零命中。
+    from .axis_revolve import detect_axis_revolve
+    for f in detect_axis_revolve(d, corr, rep):
+        f.id = FeatureId(next_id)
+        part.add(f)
+        next_id += 1
     if rep.zones is not None:
         # 孔口定位（§C6 第三段）：标注给了深度、轮廓对却没读到的孔组，用
         # **同心材料分区的顶面**定孔口（4~∅10-7H 深25 ⇒ z[120,145]）。

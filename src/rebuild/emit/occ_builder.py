@@ -293,6 +293,75 @@ def _dedupe(pts: list[Point3], tol: float = 1e-9) -> list[Point3]:
     return out
 
 
+#: 母线「严格共圆」判据（mm）：≥4 个连续点、到外心距离与半径的偏差都 ≤ 此值。
+#: 1e-6 意味着"这些点就是同一圆弧的采样"；图纸读出的实测点达不到这个精度，
+#: 不会把折线误合成弧。
+ARC_FIT_TOL = 1e-6
+
+
+def _circum2(a: tuple[float, float], b: tuple[float, float],
+             c: tuple[float, float]) -> tuple[float, float] | None:
+    """三点外心（2D）；共线/退化返回 None。"""
+    d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1])
+               + c[0] * (a[1] - b[1]))
+    if abs(d) < 1e-12:
+        return None
+    sa = a[0] * a[0] + a[1] * a[1]
+    sb = b[0] * b[0] + b[1] * b[1]
+    sc = c[0] * c[0] + c[1] * c[1]
+    return ((sa * (b[1] - c[1]) + sb * (c[1] - a[1]) + sc * (a[1] - b[1])) / d,
+            (sa * (c[0] - b[0]) + sb * (a[0] - c[0]) + sc * (b[0] - a[0])) / d)
+
+
+def _arc_runs2(pr: list[tuple[float, float]], tol: float = ARC_FIT_TOL,
+               max_step: float = math.radians(60.0)
+               ) -> list[tuple[str, int, int]]:
+    """母线 (t, r) 点列切成 [(kind, i0, j0)]，kind="arc" 的段严格共圆。
+
+    只在「≥4 个连续点全在同一圆上」时出 arc —— 3 点定圆永远成立、没有证据
+    价值；4 点 + ``tol`` 才说明是**圆弧的采样**而非折线。用途：母线里的圆角
+    采样段若按折线发射，每个采样点会留下一圈环缝棱线（YZYX 塔 R15 转角在
+    俯视图实测 306 段假棱，全是这些缝的投影）。
+
+    再加两条防**矩形四角共圆陷阱**的判据（Thales：任何矩形四角共圆——"上→
+    右→下"的直角路径会被三点定圆读成绕对角线的大弧，PF60K 基体实测 +360%）：
+    ① 每条弦的**圆弧包角 ≤ ``max_step``**（真弧采样步距小；矩形那条 174° 的
+    长边当场被拒）；② 脚步**同向推进**（真弧采样沿一个方向绕）。
+    """
+    n = len(pr)
+    runs: list[tuple[str, int, int]] = []
+    i = 0
+    while i < n - 1:
+        if i + 3 < n:
+            c = _circum2(pr[i], pr[i + 1], pr[i + 2])
+            if c is not None:
+                cx, cy = c
+                r0 = math.hypot(pr[i][0] - cx, pr[i][1] - cy)
+                j = i + 1
+                a_prev = math.atan2(pr[i][1] - cy, pr[i][0] - cx)
+                sgn = 0
+                while j < n and abs(
+                        math.hypot(pr[j][0] - cx, pr[j][1] - cy) - r0) <= tol:
+                    a = math.atan2(pr[j][1] - cy, pr[j][0] - cx)
+                    dth = (a - a_prev + math.pi) % (2 * math.pi) - math.pi
+                    if abs(dth) > max_step:
+                        break
+                    if sgn == 0:
+                        sgn = 1 if dth > 0 else -1
+                    elif (dth > 0) != (sgn > 0):
+                        break
+                    a_prev = a
+                    j += 1
+                j -= 1
+                if j - i >= 3:
+                    runs.append(("arc", i, j))
+                    i = j
+                    continue
+        runs.append(("line", i, i + 1))
+        i += 1
+    return runs
+
+
 def _polygon_face(pts: list[Point3], f: Feature, what: str):
     """由一串 IR 点造闭合平面 face（点必须共面，顺序即环序）。"""
     pts = _dedupe(pts)
@@ -765,6 +834,10 @@ def _build_revolve(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
     实测 `MakeRevol` 吃"闭合环含轴段"毫无问题，不需要偷偷离轴 ε
     （旧管线 `_tor9` 的 53.7% 空心体正是"把边画在旋转轴上"另加了一套错误的
     保护体补丁造成的，那是补丁的错，不是核的错）。
+
+    母线里的**圆弧采样段**（连续 ≥4 点严格共圆，见 ``_arc_runs2``）改画真
+    圆弧边：折线会留下逐点环缝（每圈一条棱），在端视/俯视里投影成图纸没有
+    的横线堆。检测不到圆弧的母线走原折线路径，逐位不变。
     """
     o, d = _axis_of(f)
     ang = float(_param(f, "angle_deg"))
@@ -779,8 +852,42 @@ def _build_revolve(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
     # 回转体是绕轴的，径向取哪条都一样，但取 b1 与 `profile` 的 (a,b) 约定同源。
     pts = [_at(o, b1, b2, d, float(r), 0.0, float(t)) for t, r in profile]
     # 闭合成环：末点 → 轴上垂足 → 沿轴 → 首点的轴上垂足 → 首点（端点 r=0 时自动重合）
-    face = _polygon_face(pts + [_at(o, b1, b2, d, 0.0, 0.0, (p - o).dot(d))
-                                for p in (pts[-1], pts[0])], f, "回转母线")
+    feet = [_at(o, b1, b2, d, 0.0, 0.0, (p - o).dot(d)) for p in (pts[-1], pts[0])]
+    runs = _arc_runs2([(float(t), float(r)) for t, r in profile])
+    if any(kind == "arc" for kind, _, _ in runs):
+        # 母线含**圆弧采样段**（严格共圆 ≥4 点）：改画真圆弧边。折线发射会把
+        # 每个采样点变成一圈环缝棱线——YZYX 塔 R15 转角折线版俯视图 306 段
+        # 假棱、全视图多 387（图纸没有这些缝）；真弧后塔=柱+环面+端面，干净。
+        wire = BRepBuilderAPI_MakeWire()
+
+        def _add(e: Any) -> None:
+            wire.Add(e)
+            if not wire.IsDone():
+                raise OccBuildError(
+                    f"特征 #{f.id}（revolve）回转母线连线失败"
+                    f"（第 {wire.Error()} 号错误：端点不接/重复）")
+        for kind, i0, j0 in runs:
+            if kind == "line":
+                for k in range(i0, j0):
+                    _add(BRepBuilderAPI_MakeEdge(_pnt(pts[k]),
+                                                 _pnt(pts[k + 1])).Edge())
+            else:
+                g = GC_MakeArcOfCircle(_pnt(pts[i0]), _pnt(pts[(i0 + j0) // 2]),
+                                       _pnt(pts[j0]))
+                if not g.IsDone():
+                    raise OccBuildError(
+                        f"特征 #{f.id}（revolve）母线第 {i0}..{j0} 点圆弧拟合失败")
+                _add(BRepBuilderAPI_MakeEdge(g.Value()).Edge())
+        for a, b in ((pts[-1], feet[0]), (feet[0], feet[1]), (feet[1], pts[0])):
+            if a.distance_to(b) > 1e-9:
+                _add(BRepBuilderAPI_MakeEdge(_pnt(a), _pnt(b)).Edge())
+        mkf = BRepBuilderAPI_MakeFace(wire.Wire())
+        if not mkf.IsDone():
+            raise OccBuildError(
+                f"特征 #{f.id}（revolve）回转母线（含圆弧）共面性/自交导致建面失败")
+        face = mkf.Face()
+    else:
+        face = _polygon_face(pts + feet, f, "回转母线")
     tool = _built(BRepPrimAPI_MakeRevol(
         face, gp_Ax1(_pnt(o), gp_Dir(d.x, d.y, d.z)), library.radians(ang)),
         f, f"回转（{len(profile)} 点母线）")
