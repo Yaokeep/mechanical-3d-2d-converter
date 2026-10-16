@@ -2,9 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-<!-- 最后同步：2026-10-12 @ v0.6.25（PF60K 残余追平收口发版；自 v0.6.24 起累计：
-     PF60K 两表转绿（OCC 261,943.9 +0.0034% / SW 261,776.7）、SW 发射器三修
-     （推理捕捉/环带剥缝/整圆原生实体），簿记见"版本号同步"节） -->
+<!-- 最后同步：2026-10-16 事实复核（正文已含 v0.6.26~v0.6.31 内容；tag 仍 v0.6.25，
+     簿记见"版本号同步"节）。本轮复核修正：ruff 基线 150→155（新增 F822×1）、
+     selftest 421→431、根目录 `_*.py` 计数 418→444、sw_constants.py 行数 45→55、
+     代码内版本字符串路径补 `src/` 前缀；其余声明（环境表/PyQt6 缺失、51 个 .bas、
+     tests/ 空、脚本行数、gitignore 行号）逐项实测无误 -->
 
 ## 项目概述
 
@@ -19,8 +21,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python main.py
 
 # 代码质量（ruff 只装在 PATH 默认 python 里，两个记录环境都没有）
-ruff check src/            # 已知基线 150 告警（2026-10-09 复测）：F401×75 / F541×46 / F821×14
-                           # / E741×9 / F841×5 / E402×1
+ruff check src/            # 已知基线 155 告警（2026-10-16 复测）：F401×77 / F541×46 / F821×15
+                           # / E741×9 / F841×6 / E402×1 / F822×1
 ruff format src/           # 无 pyproject.toml，全部走 ruff 默认规则
 
 # 测试：tests/ 仅 __init__.py，且三个环境均未装 pytest。
@@ -105,8 +107,9 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
                                                # 用户目视标记缺陷的入口（v0.6.18 三缺陷即由此而来）。
                                                # 脚本内路径写死 bracket：换重建结果改 main() 里 read_step 的 _3d.step 路径
 # 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性脚本一律用 `_` 前缀，
-# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃（根目录现存 418 个，
-# 2026-10-12 计数，分十类：_probe 几何探针 / _sw SW COM API 探测 / _diag 根因诊断 /
+# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃（根目录现存 444 个
+# `_*.py` + 19 个 `_*.log`，2026-10-16 计数，分十类：_probe 几何探针（含
+# _probe_yz_* 齿箱上盖 / _probe_sw_e* SW 发射器）/ _sw SW COM API 探测 / _diag 根因诊断 /
 # _wx 样本真值 / _d79 D79307 探针 / _yz 齿箱上盖 / _dump+_draw 截面叠加工具链 /
 # _csg+_bak 版本备份 / _z7+_z8+_z9 阶段 7 高度分解/圆角/侧通道调试 / 杂项）。
 # `_yz_*.py` YZYX95.4-20 齿箱上盖（φ220 大件，2026-10-02~06 五轮 70 个，v15a 体积
@@ -370,7 +373,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 ## 项目当前状态
 
 版本 v0.6.25（git tag 为准；tag 落后 HEAD 见"版本号同步"节）。
-代码内三处版本字符串（`app.py:15` / `main_window.py:28` / `main_window.py:535`）、
+代码内三处版本字符串（`src/app.py:15` / `src/gui/main_window.py:28` / 同文件 `:535`）、
 README 与两个转换器脚本横幅已于 2026-10-12 统一 bump 至 v0.6.25。
 **逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.25）——
 本节只留仍在影响决策的部分。
@@ -584,7 +587,7 @@ step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 421 项自检（2026-10-15 孔标注绑定后实测），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 431 项自检（2026-10-15 半剖/孔口推断后实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
@@ -654,7 +657,7 @@ ACCEPT，其余 5 个单视图零标注、第三向尺寸不在图上 ⇒ NEEDS_
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `sw_constants.py` | 45 | SW 2025 API 枚举常量（经验证的晚期绑定值），来源：`CAD/SW2025_API_REFERENCE.md` |
+| `sw_constants.py` | 55 | SW 2025 API 枚举常量（经验证的晚期绑定值），来源：`CAD/SW2025_API_REFERENCE.md` |
 | `sw_driver.py` | 912 | COM 驱动封装 — 连接/断开/新建零件/草图/特征/倒角/圆角/键槽/保存 |
 | `sw_shaft_builder.py` | 1063 | 阶梯轴参数化建模 — 旋转基体 → VBScript（倒角+圆角）→ Python COM 键槽 |
 
@@ -730,8 +733,8 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
 - **版本号同步**（发版时全部要改，当前均为 `0.6.25`，已核对一致）:
-  `app.py:15` `APP_VERSION` / `main_window.py:28` `setWindowTitle` /
-  `main_window.py:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
+  `src/app.py:15` `APP_VERSION` / `src/gui/main_window.py:28` `setWindowTitle` /
+  同文件 `:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
   + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
   `dxf_to_sw_features.py` 的 docstring 与结尾 print）。
   惯例：内容入正文即可按 `v0.6.x:` 前缀提交，tag 簿记待下次发版收口；发版 =
