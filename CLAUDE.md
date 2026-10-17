@@ -333,7 +333,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 99.5%+ 时局部可见缺陷仍零命中（bracket 三缺陷、YZYX 五处标记全靠目视）——
 历史缺陷已转成自动断言，**每次修复的例行检查序列**：
 
-1. `python -m src.rebuild.selftest` — 421 项
+1. `python -m src.rebuild.selftest` — 439 项
 2. `PYTHONIOENCODING=utf-8 $PY run_rebuild_acceptance.py` — 9 绿 + 体积/bbox
    阈值判红（0.5%/1mm，仅 expect=="ok"）+ bracket 缺陷盒·点断言（PROBES 表：
    三缺陷盒 + 凸台右弧两盒 + 3 点分类；gold/shift 2026-10-11 定标实测，
@@ -566,9 +566,46 @@ selftest **421 → 431**（G14 夹具 4 + H10 推断 6；破坏性证明两条�
 缺451→343/多42→2，TR 缺165→199/多57→116（TR = 从 −X 看的复合投影，缺外壳
 ⇒ 内部棱线暴露成"多"、壳自身的线成"缺"，读出塔壳后自会回收）；特征树
 24→23（−1 = 那根 φ375 假圆柱）、拦路仍 0、9 靶子验收表逐位不变、selftest
-**431 → 436**（F5 四边界例）。**下一堵墙**：拦路已零、假料已清，缺口**全是
-未读出的特征**（甲板/塔壁/平台——探针 10 个 FAIL 全落在这三处）与非拦路疑问
-（V1 剖切面、塔顶三孔族、#7 的 depth 48.25 疑误）。
+**431 → 436**（F5 四边界例）。**v0.6.32 时的下一堵墙**（甲板/塔壁/平台——探针 10 个 FAIL 全落这三处）
+由后续三刀依次消化：**§C6 第四刀 侧凹槽族六件套（v0.6.33）**新模块
+`features/side_recess.py`（俯视「隐藏壁面线+可见唇线+带内端面线」三联 +
+剖面槽底/斜肩/平台/壁根圆角/端块外柱面读数 ⇒ 甲板抬升/深腔/浅腔/唇外盒切/
+壁根月牙/端块裙；三处根因：`_crescent` 轮廓错把「槽底边+壁面边」写成一条
+斜边围出弦-弧透镜、浅腔未登记进 `cuts[sign]` 致月牙 +OVER 过冲段被削、
+端块裙按半径取最大选错——R187.5 顶拱与 R95 裙弧同心且都 visible，补端点
+判据；`height_zones.build_band` 信号源改「全部可见轮廓边」逐列包络，环
+遍历在 T 型拆分点抄近路曾丢 145 顶线）——**探针 9/27 → 27/27**、HLR TR
+多 59→55/缺 199→88。**§C6 第五刀 轴回转族 + 母线真弧（v0.6.34）**新模块
+`features/axis_revolve.py`——端视图短弧簇（同圆心 ≥3 条互异半径、画不满
+轮廓弧）定回转轴（YZYX 给出 r95 侧裙/r110 止口/r145 盘/r187.5 塔四条母线；
+子午视图轴向线跨视图 span 取交得真实跨度，R15 端部圆角弧进母线）；
+`detect_revolve` 的圆边入口把短弧当「不是圆」丢掉——这里正是那批弧的出口
+（不成立零命中，bracket/PF60K 不变）。发射侧 `emit/occ_builder.py` 共用件：
+母线严格共圆段（≥4 连续点、每弦包角 ≤60°、同向推进）改画
+`GC_MakeArcOfCircle` 真弧 + MakeWire 手工闭环——折线采样在每段转角留环缝
+棱线、投影成图纸没有的横线堆（BL 多 387→104）；矩形四角共圆（Thales）
+防误判。YZYX 缺 TL 200→151 / BL 293→278 / TR 88→48。**§C6 第六刀 剖面
+边界补扫 + 非剖面支持门 + 塔腔（v0.6.35）**——`axis_revolve.axis_bore_scan`
+（第 5 节）：短弧表覆盖不到的半径（Ø160 腔/筒/凹填角只在剖面视图里以
+「轴向线 × HATCH 材料边界」存在）由 ±1.5mm 材料双探针读出（内侧材料 ⇒
+REVOLVE 母线、外侧材料 ⇒ HOLE），必须最后跑（`used` 排除集要看到全树：
+塔腔冠 r177.5 在 POCKET 里）——YZYX 6 特征进树；**非剖面视图支持门**
+（`_non_section_support`，`BORE_SUPPORT_FRAC=0.5`）：add 段须被 ≥1 个非剖面
+子午帧的 visible span 覆盖 ≥50% 才信「绕轴回转」——剖面里一条水平 HATCH
+边界线可以同时是后方可见轮廓/平顶实体顶面轮廓的投影（材料双探针无法
+区分）。三条过发实锤拒掉：r100 [2478.3,2484.3]、r145 [2604.3,2624.3]、
+r140 [2629.3,2645.3]（v15a 截面网格实锤无实心），r145 盘 [2484.3,2504.3]
+（V1+V3 双视图支持）保留——同口径复评多 −115（BL 208→118 / TL 49→36 /
+TR 75→63）换缺 +5（TL 54→58）；`features/tower_cavity.py` 塔腔（YZYX 式
+「冠—拱壳」POCKET：剖面帧里冠线两端各接同心弧对——小弧冠角/大弧塔端部
+圆角、弧顶=塔顶母线，端点种子链式追踪 + HATCH 材料侧仲裁直到结合面，
+挤出半宽 W=√(R²−h²) 由冠面与塔柱面相贯线推论）——1 特征进树（半宽 60.42
+=√(187.5²−177.5²)）；`features/material.py` = HATCH 材料判据工具箱中立化
+（tower_cavity 与 axis_bore_scan 共用）。selftest 436 → 439。
+**当前下一堵墙**：BL 缺 278（西/东端块 z>80 上部 + 塔顶高 140 的 r~70 柱
+等未读出特征）+ TL 缺 58 + TR 缺 48；多 BL 118（= r107.5 凹帽区 12 段 +
+旧树历史债 104）/ TR 63 仍超基线。非拦路疑问（V1 剖切面、塔顶三孔族、
+#7 的 depth 48.25 疑误）不变。
 ✅ 无基准三件套（`yz_accept.py`：27
 材料点 + 五视图 HLR 评分）建在 **v15a 零件系**上（探针点、`yz_hlr.SPLIT_X=−96.5`
 都是零件系常量），新框架模型在**图纸坐标系**——2026-10-13 **零件系变换已落地**
@@ -593,7 +630,7 @@ linetype 断裂/虚线/**细实线**、section 剖切种类/材料（v0.6.31 起
 （「c 向」标题 + 剖面线覆盖比 <0.9 ⇒ local）、细实线=被盖轮廓（Role.THIN，
 环提取只认 VISIBLE 自动排除）、DIMENSION「数值↔几何锚点」配对（tier=ANNOTATED），
 实测 YZYX C—C 定性 section/scope=local、52 条尺寸 45 锚上、20/3/120 逐位吻合）、
-`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）**）、`verify/`（compare/coverage/
+`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **material** HATCH 材料判据工具箱）、`verify/`（compare/coverage/
 gate/step_probe/box_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
 step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
@@ -601,7 +638,7 @@ step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 431 项自检（2026-10-15 半剖/孔口推断后实测），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 439 项自检（2026-10-17 剖面补扫/塔腔后实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
