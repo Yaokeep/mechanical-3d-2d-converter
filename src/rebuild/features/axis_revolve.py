@@ -21,8 +21,10 @@
 1. **端视短弧簇**：在 ``p_axis == 轴名`` 的视图里把 visible 弧按（圆心, 半径）
    归组、组内算角覆盖（与 `_circle_edges_of` 同一套 ``_arc_cover``/`_profile_arc``）；
    "短弧组" = 覆盖 < ``ARC_COVER_MIN`` 或被判轮廓弧。短弧组按圆心 ±``CENTER_TOL``
-   再聚簇，簇内互异半径 ≥ ``MIN_RADII`` ⇒ 候选轴（轴心 = 圆心过 u/v_to_model
-   映射，轴向分量 0——母线 t 因此可用**绝对**图纸坐标，与 `_axial_lines` 同口径）。
+   再聚簇，簇内互异半径 ≥ ``MIN_RADII`` ⇒ 候选轴（轴心 = 簇内最大半径弧的
+   **精确**圆心过 u/v_to_model 映射，轴向分量 0——母线 t 因此可用**绝对**图纸
+   坐标，与 `_axial_lines` 同口径）。组键的 0.1mm 舍入只用于归组；2026-10-17 修
+   过一处把它漏进轴心的 bug（YZYX 塔被整体读偏 (−0.037, −0.049)）。
 2. **母线扫描**：对候选轴，在子午视图（轴 ∈ {u_axis, v_axis} 且 p_axis ≠ 轴）
    复用 `revolve._axial_lines` 收 ∥轴线段，按 |r − 半径表| ≤ ``RADIUS_TOL``
    匹配、同视图同半径合并（gap ≤ ``SEG_GAP``）。**只收 visible 线**——
@@ -57,10 +59,11 @@ from ..evidence.model import Kind, Role
 from ..model.claim import Claim, Tier
 from ..model.feature_tree import Feature, FeatureType
 from ..model.geom import Axis3, Point3, Vector3
-from ..model.geom2d import Arc2, Circle2
+from ..model.geom2d import Arc2, Circle2, Point2
 from ..model.ids import FeatureId
 from ..views.correspondence import ARC_COVER_MIN, _arc_cover, _profile_arc
 from .library import mk_claim
+from .material import material_map as _material_map
 from .recognizer import AXIS_POS_TOL
 from .revolve import AXIS_R_TOL, RADIUS_TOL, SEG_GAP, _axial_lines, _merge_spans
 
@@ -163,20 +166,29 @@ def _axis_candidates(d: Drawing,
         # 按圆心聚簇（圆心坐标 ±CENTER_TOL）
         clusters: list[dict] = []
         for (cx, cy, r), items in sorted(groups.items()):
+            # 组键是**舍入值**（只用来归组）；轴心必须取弧自身的精确圆心 ——
+            # 键的 0.1 舍入曾漏进轴心（YZYX 塔轴读成 3462.90/1541.20，图纸
+            # 真值 3462.9371/1541.2485，整根塔偏 (−0.0371, −0.0485)，腔冠
+            # 面随之穿出塔面 0.14mm）。取簇内**最大半径弧**的圆心为读数。
+            gc = items[0][1].center
             for cl in clusters:
                 if (abs(cx - cl["c"][0]) <= CENTER_TOL
                         and abs(cy - cl["c"][1]) <= CENTER_TOL):
                     cl["radii"].add(r)
                     cl["views"].add(vid)
+                    if r > cl["rmax"]:
+                        cl["rmax"] = r
+                        cl["pc"] = gc
                     break
             else:
-                clusters.append({"c": (cx, cy), "radii": {r}, "views": {vid}})
+                clusters.append({"c": (cx, cy), "radii": {r}, "views": {vid},
+                                 "rmax": r, "pc": gc})
         for cl in clusters:
             if len(cl["radii"]) < MIN_RADII:
                 continue
-            cx, cy = cl["c"]
-            coords = {fr.u_axis: fr.u_to_model(cx),
-                      fr.v_axis: fr.v_to_model(cy), fr.p_axis: 0.0}
+            gc = cl["pc"]
+            coords = {fr.u_axis: fr.u_to_model(gc.x),
+                      fr.v_axis: fr.v_to_model(gc.y), fr.p_axis: 0.0}
             cands.append(_AxisCand(
                 name, Point3(coords["x"], coords["y"], coords["z"]),
                 tuple(sorted(cl["radii"])), tuple(sorted(cl["views"]))))
@@ -259,7 +271,13 @@ def _end_cap(d: Drawing, mframes: list[ViewFrame], dir_name: str,
         c_ax = {"x": centre.x, "y": centre.y, "z": centre.z}[rad_axis]
         for h in view.evidence:
             e = d.by_handle(h)
-            if e is None or e.kind != Kind.EDGE or e.role.value != Role.VISIBLE:
+            if e is None or e.kind != Kind.EDGE:
+                continue
+            # 角色放宽到 VISIBLE ∪ AXIS：YZYX 端块的凹填角弧被绘图误设成
+            # 粗实线层 + CENTER2 线型（role=axis），几何上却是真轮廓——
+            # 三层校验（圆心轴向/径向/端点逐点吻合）足够严，伪弧（中心线弧）
+            # 过不了；只认 VISIBLE 会让这类凹帽整条丢失。
+            if e.role.value not in (Role.VISIBLE, Role.AXIS):
                 continue
             g = e.geom
             if not isinstance(g, Arc2):
@@ -276,7 +294,11 @@ def _end_cap(d: Drawing, mframes: list[ViewFrame], dir_name: str,
             if abs(ax_c - x_end) > FILLET_CX_TOL:
                 continue
             r_meas = abs(rad_c - c_ax)
-            if abs(r_meas + R - rn) > FILLET_RTOL:
+            if abs(r_meas + R - rn) <= FILLET_RTOL:
+                c_r = rn - R            # 凸：圆心在半径低侧（原行为）
+            elif abs(r_meas - R - rn) <= FILLET_RTOL:
+                c_r = rn + R            # 凹：圆心在半径高侧（YZYX 端块凹填角）
+            else:
                 continue
             # 两端点 (轴向, 到轴垂距)
             ok = False
@@ -293,29 +315,34 @@ def _end_cap(d: Drawing, mframes: list[ViewFrame], dir_name: str,
                         and abs(dd_rad - rn) <= FILLET_RTOL):
                     ok = True
                 elif (abs(dd_ax - far) <= FILLET_RTOL
-                      and abs(dd_rad - (rn - R)) <= FILLET_RTOL):
+                      and abs(dd_rad - c_r) <= FILLET_RTOL):
                     ok = True
             if not ok:
                 continue
-            # 母线外延点：**西端**从 (远端, rn−R) 沿圆弧到 (端点, rn)；
-            # **东端**从 (端点, rn) 到 (远端, rn−R)——两端都按"母线行进方向"
-            # 排（西段在前、东段在后），首末点与采样式独立覆写为精确值。
+            # 母线外延点（两型同式，圆心半径位在 c_r）：**西端**从 (远端, c_r)
+            # 沿圆弧到 (端点, rn)；**东端**从 (端点, rn) 到 (远端, c_r)——
+            # 两端都按"母线行进方向"排（西段在前、东段在后），首末点覆写为
+            # 精确值。凸（c_r=rn−R）是原行为；凹（c_r=rn+R）由 YZYX 端块的
+            # R15 凹填角引入：弧从外侧高处降到筒壁。
             far = ax_c - R if west else ax_c + R
             pts: list[tuple[float, float]] = []
             for i in range(FILLET_SEGS + 1):
                 t = i / FILLET_SEGS
                 if west:
-                    th = math.pi - t * (math.pi / 2.0)      # 180° → 90°
+                    th = math.pi - t * (math.pi / 2.0)        # 凸：180° → 90°
+                    if c_r > rn:
+                        th = math.pi + t * (math.pi / 2.0)    # 凹：180° → 270°
                 else:
-                    th = math.pi / 2.0 - t * (math.pi / 2.0)  # 90° → 0°
-                pts.append((ax_c + R * math.cos(th),
-                            (rn - R) + R * math.sin(th)))
+                    th = math.pi / 2.0 - t * (math.pi / 2.0)  # 凸：90° → 0°
+                    if c_r > rn:
+                        th = 1.5 * math.pi + t * (math.pi / 2.0)  # 凹：270° → 360°
+                pts.append((ax_c + R * math.cos(th), c_r + R * math.sin(th)))
             if west:
-                pts[0] = (far, rn - R)
+                pts[0] = (far, c_r)
                 pts[-1] = (x_end, rn)
             else:
                 pts[0] = (x_end, rn)
-                pts[-1] = (far, rn - R)
+                pts[-1] = (far, c_r)
             return _Cap(R, pts, h)
     return None
 
@@ -427,3 +454,403 @@ def detect_axis_revolve(d: Drawing, corr: CorrespondenceResult,
                     f"轴回转：r{rn:g} 段 [{x0:.2f},{x1:.2f}]（{x1 - x0:.2f}mm，"
                     f"{len(pts)} 点母线{cap_note}）")
     return out
+
+
+# ---------------------------------------------------------------------------
+# 5) 剖面边界补扫：子午段 × HATCH 材料双探针 ⇒ 表外半径的 REVOLVE / HOLE
+# ---------------------------------------------------------------------------
+
+#: 材料双探针的径向偏移（mm）——大于出图线宽/HATCH 边界的抖动，小于 YZYX
+#: 最薄壁（端块筒壁 ~12.5、盘区壁 ~24）。
+BORE_PROBE = 1.5
+#: 同几何段合并容差：半径 / 端点（mm）。
+BORE_MERGE_R = 0.05
+BORE_MERGE_X = 0.1
+
+
+def _used_handles(part) -> set[str]:
+    """全树已消费的原图元 handle 本体（evidence ∪ 参数/轴 Claim 的证据）。
+
+    实测口径（YZYX 2026-10-17）：证据里存的都是**裸 handle**（``7C4``/``7CF``），
+    无 ``#序号`` 形态——对两侧都做 ``split("#")[0]`` 因此安全；HATCH 边界
+    （``7BD#32`` 这类）从未进过任何特征的证据，不会误伤整圈边界。
+    """
+    used: set[str] = set()
+    for f in part.features:
+        for h in f.evidence or ():
+            used.add(str(h).split("#")[0])
+        claims = list(f.params.values())
+        if f.axis is not None:
+            claims.append(f.axis)
+        for c in claims:
+            for h in (getattr(c, "evidence", None) or ()):
+                used.add(str(h).split("#")[0])
+    return used
+
+
+@dataclass(frozen=True)
+class _BoreSeg:
+    """子午段（同几何合并后）：半径 + 端点 + 中点径向坐标 + 句柄。
+
+    ``x0/x1`` 与 ``ax_probe`` 都是**沿轴绝对坐标**（t 口径，与发射器共用——
+    候选轴的轴向分量恒 0，t 与图元分量值逐位相等）；``rad`` 是段中点的
+    径向分量值（带符号，判段在轴的哪侧）。
+    """
+
+    r: float
+    x0: float
+    x1: float
+    ax_probe: float
+    rad: float
+    handles: tuple[str, ...]
+
+
+def _meridian_segments(d: Drawing, fr: ViewFrame, dir_name: str,
+                       centre: Point3) -> list[_BoreSeg]:
+    """子午视图的 ∥轴段 → 合并表（**不滤角色**；同几何归并）。
+
+    不滤角色的理由与 `_end_cap` 同：YZYX 端块的筒壁与凹填角弧被绘图误设成
+    粗实线层 + CENTER2（role=axis），几何上却是真轮廓——过滤交给材料探针
+    （两侧同态的标注/中心线段自然出局）。归并只并"同一条线的两次画法"
+    （r 与两端点都在容差内），**不做相交合并**——那会把一条全长可见线
+    搭进 HATCH 边界的子段，吞掉段自身的证据。
+    """
+    comp = {"x": lambda p: p.x, "y": lambda p: p.y, "z": lambda p: p.z}
+    gu, gv = comp[fr.u_axis], comp[fr.v_axis]
+    u_is_ax = fr.u_axis == dir_name
+    groups: list[dict] = []
+    for ln in _axial_lines(d, fr, dir_name, centre):
+        if ln.r < AXIS_R_TOL:
+            continue
+        lo, hi = min(ln.t0, ln.t1), max(ln.t0, ln.t1)
+        for g in groups:
+            if (abs(g["r"] - ln.r) <= BORE_MERGE_R
+                    and abs(g["x0"] - lo) <= BORE_MERGE_X
+                    and abs(g["x1"] - hi) <= BORE_MERGE_X):
+                g["handles"].append(ln.handle)
+                break
+        else:
+            if u_is_ax:
+                ax_probe = 0.5 * (gu(ln.p0) + gu(ln.p1))
+                rad = 0.5 * (gv(ln.p0) + gv(ln.p1))
+            else:
+                ax_probe = 0.5 * (gv(ln.p0) + gv(ln.p1))
+                rad = 0.5 * (gu(ln.p0) + gu(ln.p1))
+            # r 取到图纸精度（4 位）：垂距的浮点尾（48.24999999999909）会让
+            # apply_prior 的标准值精化把旧值挂进 alternatives ⇒ is_settled
+            # 假 ⇒ "特征歧义未消解"拦路（实测 #44）。三个同型孔里只有尾差
+            # 最脏的那个被报，正是这个机理。
+            groups.append({"r": round(ln.r, 4), "x0": lo, "x1": hi,
+                           "ax_probe": ax_probe, "rad": rad,
+                           "handles": [ln.handle]})
+    return [_BoreSeg(g["r"], g["x0"], g["x1"], g["ax_probe"], g["rad"],
+                     tuple(dict.fromkeys(g["handles"]))) for g in groups]
+
+
+def _rad_point(fr: ViewFrame, dir_name: str, ax_val: float,
+               rad_val: float) -> Point2:
+    """(沿轴坐标, 径向坐标) → material_map 口径的 Point2（u 分量在前）。"""
+    if fr.u_axis == dir_name:
+        return Point2(ax_val, rad_val)
+    return Point2(rad_val, ax_val)
+
+
+def _material_flip(mat, fr: ViewFrame, dir_name: str, seg: _BoreSeg,
+                   c_rad: float) -> str | None:
+    """段两侧 ±BORE_PROBE 的材料翻转：内侧材料 ⇒ "add"、外侧材料 ⇒ "cut"。
+
+    内侧 = 朝轴心（小 r）侧。两侧同态（都空 = 腔区标注残留；都实 =
+    HATCH 覆盖外的内部段）返回 None——不是边界，调用方跳过。
+    """
+    sgn = 1.0 if seg.rad >= c_rad else -1.0
+    in_mat = mat(_rad_point(fr, dir_name, seg.ax_probe, seg.rad - sgn * BORE_PROBE))
+    out_mat = mat(_rad_point(fr, dir_name, seg.ax_probe, seg.rad + sgn * BORE_PROBE))
+    if in_mat and not out_mat:
+        return "add"
+    if out_mat and not in_mat:
+        return "cut"
+    return None
+
+
+def _dedup_rows(rows: list[tuple]) -> list[tuple]:
+    """跨帧同几何合并（同一候选轴内：半径/端点容差内取首帧为代表）。"""
+    out: list[tuple] = []
+    for row in rows:
+        for o in out:
+            if (o[0] is row[0]
+                    and abs(o[2].r - row[2].r) <= BORE_MERGE_R
+                    and abs(o[2].x0 - row[2].x0) <= BORE_MERGE_X
+                    and abs(o[2].x1 - row[2].x1) <= BORE_MERGE_X):
+                break
+        else:
+            out.append(row)
+    return out
+
+
+def _revolve_covers(part, rn: float) -> list[tuple[float, float]]:
+    """全树 REVOLVE 母线里 r≈rn 的**水平段**区间（该半径已被表过的实际覆盖）。
+
+    对"半径段是否已被旧路表达"只认**已发射的几何**——旧路 visible span 是
+    "这条线画到哪"（7C4 全长 [−166.5,−0.5]），拿它当覆盖会把从未建过的区段
+    （r145 [−46.5,−26.5]）也圈进去；#12 的实际母线只在 [−166.5,−146.5]。
+    每段现算（不缓存）——本次发射的新母线也进覆盖表，顺带防同半径重复。
+    """
+    out: list[tuple[float, float]] = []
+    for f in part.features:
+        if f.type.value != FeatureType.REVOLVE.value:
+            continue
+        c = f.params.get("radius_profile")
+        if c is None:
+            continue
+        prof = c.value
+        for (t0, r0), (t1, r1) in zip(prof, prof[1:]):
+            if abs(r0 - rn) <= RADIUS_TOL and abs(r1 - rn) <= RADIUS_TOL:
+                out.append((min(t0, t1), max(t0, t1)))
+    return out
+
+
+def _overlaps_emitted(emitted: list[tuple[float, float, float]],
+                      r: float, x0: float, x1: float) -> bool:
+    for r0, a0, a1 in emitted:
+        if abs(r0 - r) > BORE_MERGE_R:
+            continue
+        ov = min(a1, x1) - max(a0, x0)
+        if ov > 0.5 * min(a1 - a0, x1 - x0) - 1e-9:
+            return True
+    return False
+
+
+BORE_SUPPORT_FRAC = 0.5
+
+
+def _non_section_support(d: Drawing, corr: CorrespondenceResult,
+                         mats: dict, cand, dir_name: str, seg: _BoreSeg,
+                         cache: dict) -> bool:
+    """add 段的"非剖面视图"可见线支持：≥1 个非剖面子午帧的 visible span
+    覆盖段长 50% 以上，才信"该段绕轴回转成实体"。
+
+    剖面视图里的一条"水平 HATCH 边界线"可以同时是**后方可见轮廓**（窗口区
+    对面的筒壁）或**平顶实体的顶面轮廓**在切面上的投影——与本视图的
+    "回转母线"同图同形。YZYX 实锤（v15a 截面网格）：r145 [2604.3,2624.3]
+    与 r140 [2629.3,2645.3] 两段在单剖面视图里材料探针全过，但真值该处
+    只有半径 ≈70 的塔帽，发的 r145/r140 实心回转是过发（俯视"多"58 段）。
+    真回转段的半径在正交视图（俯视 V3 等，无 HATCH）里也留有可见轮廓线：
+    r145 盘 [2484.3,2504.3] 在 V1+V3 都有，r107.5 筒在 V3 有。
+    """
+    for vid in sorted(corr.frames):
+        fr = corr.frames[vid]
+        if fr.p_axis == dir_name or dir_name not in (fr.u_axis, fr.v_axis):
+            continue
+        if (dir_name, vid) in mats:
+            continue                        # 剖面视图（有 HATCH）不算数
+        ck = (vid, round(seg.r, 2))
+        if ck not in cache:
+            segs2, _ = _span_scan(d, fr, dir_name, cand.centre, seg.r)
+            cache[ck] = segs2
+        ov = sum(max(0.0, min(b1, seg.x1) - max(b0, seg.x0))
+                 for b0, b1 in cache[ck])
+        if ov >= BORE_SUPPORT_FRAC * (seg.x1 - seg.x0):
+            return True
+    return False
+
+
+def axis_bore_scan(d: Drawing, corr: CorrespondenceResult, part,
+                   rep: RecognizeReport) -> int:
+    """剖面边界补扫：子午段 × HATCH 材料双探针 ⇒ 表外半径的 REVOLVE / HOLE。
+
+    ``detect_axis_revolve`` 的半径表来自**端视短弧簇**——右端块的 Ø160 腔 /
+    筒 / 凹填角在端视图里是画满（或半剖省笔）的圆，进不了短弧表；它们只在
+    剖面视图（V1）以「轴向线 × HATCH 材料边界」存在。本函数不再依赖端视弧：
+
+    1. 对每个候选轴的全部子午帧枚举 ∥轴段（不滤角色，见 `_meridian_segments`），
+       跨帧同几何合并；
+    2. 排除三道：段句柄已被任意既有特征消费（塔腔冠 r177.5 在 POCKET 里）；
+       半径落表且段在旧路 `_span_scan` 证据里、或落在旧路 span 区间内
+       （r145 的 HATCH 边界子段 = 已被 #12 表达的同一段）；
+    3. 材料双探针定极性：内侧材料 ⇒ **add**（段是外轮廓 ⇒ REVOLVE 母线，
+       端部复用 `_end_cap` 的凹凸帽；再经**非剖面视图支持门**——剖面
+       HATCH 边界水平线可能只是"后方可见轮廓/平顶实体顶面"的投影，须
+       正交视图的可见线佐证，见 `_non_section_support`）；外侧材料 ⇒
+       **cut**（段是内壁 ⇒ HOLE，孔口取"沿轴向外 2mm 处轴心为空"的那端，
+       depth = span，through 按 CONVENTION=False 钉死——图上有孔底轮廓线，
+       不许 `derive_through` 拿基体厚度把它改判成通孔）。
+    """
+    cands = _axis_candidates(d, corr)
+    if not cands:
+        return 0
+    _VEC = {"x": Vector3(1.0, 0.0, 0.0), "y": Vector3(0.0, 1.0, 0.0),
+            "z": Vector3(0.0, 0.0, 1.0)}
+    used = _used_handles(part)
+    rows: list[tuple] = []
+    mats: dict[tuple, tuple] = {}
+    mfr_by_dir: dict[str, list[ViewFrame]] = {}
+    for cand in cands:
+        dir_name = cand.dir_name
+        mframes = [corr.frames[v] for v in sorted(corr.frames)
+                   if corr.frames[v].p_axis != dir_name
+                   and dir_name in (corr.frames[v].u_axis,
+                                    corr.frames[v].v_axis)]
+        mfr_by_dir[dir_name] = mframes
+        for fr in mframes:
+            view = next((v for v in d.views if v.id == fr.view_id), None)
+            if view is None:
+                continue
+            mat = _material_map(d, fr, view.bbox)
+            if not getattr(mat, "has_hatch", False):
+                continue                    # 无剖面线的视图不打材料
+            c_rad = {"x": cand.centre.x, "y": cand.centre.y,
+                     "z": cand.centre.z}[fr.v_axis if fr.u_axis == dir_name
+                                         else fr.u_axis]
+            mats[(dir_name, fr.view_id)] = (mat, c_rad)
+            for seg in _meridian_segments(d, fr, dir_name, cand.centre):
+                rows.append((cand, fr, seg))
+    if not rows:
+        return 0
+    rows = _dedup_rows(rows)
+    emitted: list[tuple[float, float, float]] = []
+    old_ev: dict[tuple, set] = {}
+    sup_cache: dict[tuple, list] = {}
+    n_out = 0
+    for cand, fr, seg in rows:
+        dir_name = cand.dir_name
+        if seg.x1 - seg.x0 < MIN_SEG:
+            continue
+        if _overlaps_emitted(emitted, seg.r, seg.x0, seg.x1):
+            continue
+        mat, c_rad = mats[(dir_name, fr.view_id)]
+        body = {h.split("#")[0] for h in seg.handles}
+        if body & used:
+            rep.notes.append(
+                f"剖面补扫：r{seg.r:g} [{seg.x0:.2f},{seg.x1:.2f}] 已被既有特征"
+                f"用作证据 ⇒ 跳过")
+            continue
+        rn_tab = next((t for t in cand.radii
+                       if abs(t - seg.r) <= RADIUS_TOL), None)
+        if rn_tab is not None:
+            ck = (dir_name, fr.view_id, rn_tab)
+            if ck not in old_ev:
+                _, ev_old = _span_scan(d, fr, dir_name, cand.centre, rn_tab)
+                old_ev[ck] = {str(h).split("#")[0] for h in ev_old}
+            if body & old_ev[ck]:
+                rep.notes.append(
+                    f"剖面补扫：r{seg.r:g} [{seg.x0:.2f},{seg.x1:.2f}] 旧路可见段"
+                    f"已表达 ⇒ 跳过")
+                continue
+            if any(b0 - BORE_MERGE_X <= seg.x0 and seg.x1 <= b1 + BORE_MERGE_X
+                   for b0, b1 in _revolve_covers(part, rn_tab)):
+                rep.notes.append(
+                    f"剖面补扫：r{seg.r:g} [{seg.x0:.2f},{seg.x1:.2f}] 已被 "
+                    f"r{rn_tab:g} 回转母线覆盖 ⇒ 跳过")
+                continue
+        pol = _material_flip(mat, fr, dir_name, seg, c_rad)
+        if pol is None:
+            continue
+        ev_t = tuple(seg.handles)
+        if pol == "add":
+            if not _non_section_support(d, corr, mats, cand, dir_name, seg,
+                                        sup_cache):
+                rep.notes.append(
+                    f"剖面补扫：r{seg.r:g} [{seg.x0:.2f},{seg.x1:.2f}] 无非剖面"
+                    f"视图可见线支持 ⇒ 拒发（HATCH 边界可能只是后方可见轮廓/"
+                    f"顶面轮廓的投影）")
+                continue
+            mframes = mfr_by_dir[dir_name]
+            west = _end_cap(d, mframes, dir_name, cand.centre,
+                            seg.x0, seg.r, True)
+            east = _end_cap(d, mframes, dir_name, cand.centre,
+                            seg.x1, seg.r, False)
+            pts: list[tuple[float, float]] = \
+                list(west.pts) if west else [(seg.x0, seg.r)]
+            if east:
+                pts.extend(east.pts)
+            else:
+                pts.append((seg.x1, seg.r))
+            ev_t = tuple(dict.fromkeys(
+                seg.handles
+                + ((west.handle,) if west else ())
+                + ((east.handle,) if east else ())))
+            f = Feature(
+                id=FeatureId(-1),
+                type=Claim(FeatureType.REVOLVE,
+                           "axis_bore:section_material_side",
+                           Tier.PROJECTION, ev_t),
+                params={
+                    "dir": mk_claim(dir_name, "axis_bore:section_material_side",
+                                    Tier.PROJECTION, ev_t),
+                    "angle_deg": mk_claim(
+                        180.0, "axis_bore:half_toward_material",
+                        Tier.CONVENTION, ev_t),
+                    "radius_profile": mk_claim(
+                        pts, "axis_bore:material_side_flip",
+                        Tier.PROJECTION, ev_t),
+                    "origin": mk_claim(cand.centre,
+                                       "axis_bore:short_arc_cluster",
+                                       Tier.PROJECTION, ev_t),
+                },
+                axis=Claim(Axis3(cand.centre, _VEC[dir_name]),
+                           "axis_bore:short_arc_cluster",
+                           Tier.PROJECTION, ev_t),
+                placement=Claim(cand.centre, "axis_bore:short_arc_cluster",
+                                Tier.PROJECTION, ev_t),
+                source_view=fr.view_id,
+                evidence=list(ev_t),
+            )
+            f.id = part.next_id()
+            part.add(f)
+            emitted.append((seg.r, seg.x0, seg.x1))
+            n_out += 1
+            cap_note = ""
+            if west or east:
+                cap_note = (f"，端部圆角 R"
+                            f"{west.radius if west else east.radius:g}")
+            rep.notes.append(
+                f"剖面补扫：r{seg.r:g} [{seg.x0:.2f},{seg.x1:.2f}] 外侧空 ⇒ "
+                f"REVOLVE 母线（{len(pts)} 点{cap_note}）")
+            continue
+        # cut：段是内壁 ⇒ 钻 HOLE。孔口 = 沿轴向外 2mm 处轴心为空的那端
+        # （端面外/已切穿的腔都是空；孔底一侧轴心上是材料）。
+        west_open = not mat(_rad_point(fr, dir_name, seg.x0 - 2.0, c_rad))
+        east_open = not mat(_rad_point(fr, dir_name, seg.x1 + 2.0, c_rad))
+        d_neg = east_open and not west_open
+        mouth = seg.x1 if d_neg else seg.x0
+        c_ax = {"x": cand.centre.x, "y": cand.centre.y,
+                "z": cand.centre.z}[dir_name]
+        t0 = (mouth - c_ax) * (-1.0 if d_neg else 1.0)
+        v0 = _VEC[dir_name]
+        vec = Vector3(-v0.x, -v0.y, -v0.z) if d_neg else v0
+        f = Feature(
+            id=FeatureId(-1),
+            type=Claim(FeatureType.HOLE,
+                       "axis_bore:section_material_side",
+                       Tier.PROJECTION, ev_t),
+            params={
+                "radius": mk_claim(seg.r, "axis_bore:material_side_flip",
+                                   Tier.PROJECTION, ev_t),
+                "through": mk_claim(
+                    False, "axis_bore:section_profile_has_bottom",
+                    Tier.CONVENTION, ev_t),
+                "depth": mk_claim(seg.x1 - seg.x0, "axis_bore:section_span",
+                                  Tier.PROJECTION, ev_t),
+                "axial_at": mk_claim(t0, "axis_bore:material_side_flip",
+                                     Tier.PROJECTION, ev_t),
+                "dir": mk_claim(dir_name, "axis_bore:section_material_side",
+                                Tier.PROJECTION, ev_t),
+                "origin": mk_claim(cand.centre, "axis_bore:short_arc_cluster",
+                                   Tier.PROJECTION, ev_t),
+            },
+            axis=Claim(Axis3(cand.centre, vec), "axis_bore:short_arc_cluster",
+                       Tier.PROJECTION, ev_t),
+            placement=Claim(cand.centre, "axis_bore:short_arc_cluster",
+                            Tier.PROJECTION, ev_t),
+            source_view=fr.view_id,
+            evidence=list(ev_t),
+        )
+        f.id = part.next_id()
+        part.add(f)
+        emitted.append((seg.r, seg.x0, seg.x1))
+        n_out += 1
+        rep.notes.append(
+            f"剖面补扫：r{seg.r:g} [{seg.x0:.2f},{seg.x1:.2f}] 内侧空 ⇒ "
+            f"HOLE Ø{2.0 * seg.r:g} 深 {seg.x1 - seg.x0:.2f}"
+            f"（孔口在{'东' if d_neg else '西'}端）")
+    return n_out

@@ -1576,6 +1576,16 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
                                no_feature=no_feature,
                                draws_hidden=draws_hidden, bindings=binds):
         part.add(f)
+    # 塔腔（YZYX 式）：搭在圆柱塔上的「冠—拱壳」腔——剖面帧里冠线两端各接
+    # 「同心弧对」（小弧 = 冠角、大弧 = 塔端部外形圆角、弧顶 = 塔顶母线，
+    # 两弧同心是因为腔冠与塔顶壳等厚），自小弧自由端起链式追踪端点/切向
+    # 连续的轮廓直到结合面，沿塔横向挤出 |y| ≤ W（W 由冠面与塔柱面在相贯
+    # 线上相切推论）。依赖特征树里已有回转塔（axis_revolve 所建）。读不齐
+    # 只记账、不建（见该模块 docstring）。
+    from .tower_cavity import tower_cavity
+    k = tower_cavity(d, corr, part, rep)
+    if k:
+        rep.notes.append(f"塔腔：{k} 个特征进树")
     if rep.zones is not None:
         n = side_axis_spans(d, corr, part, rep.zones.dir_name, rep)
         if n:
@@ -1594,6 +1604,14 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
         k = side_recess(d, corr, part, rep)
         if k:
             rep.notes.append(f"侧凹槽族：{k} 个特征进树")
+    # 剖面边界补扫（YZYX 右端块式）：短弧表覆盖不到的半径（Ø160 腔 / 筒 /
+    # 凹填角只在剖面视图里以「轴向线 × HATCH 材料边界」存在）由材料双探针
+    # 读出——内侧材料 ⇒ REVOLVE 母线、外侧材料 ⇒ HOLE。必须最后跑：`used`
+    # 排除集要看到全树（塔腔冠 r177.5 在 POCKET 里、r80/r105 的腔壁同理）。
+    from .axis_revolve import axis_bore_scan
+    m = axis_bore_scan(d, corr, part, rep)
+    if m:
+        rep.notes.append(f"剖面补扫：{m} 个特征进树")
     merge_section_axes(corr, rep, part)
     if rep.zones is not None or no_feature or binds.by_handle:
         # 分区/轮廓证据把圆的角色定死之后，把 corr 层的歧义疑问**裁决**掉

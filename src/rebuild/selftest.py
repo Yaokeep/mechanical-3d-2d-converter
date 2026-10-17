@@ -1757,6 +1757,43 @@ def test_features() -> None:
     check("分区厚度不够（顶面−深 < 分区底）⇒ 不是孔口面、不推",
           n13 == 0 and bd13.by_handle["k1"].span is None)
 
+    # ---- H11 剖面补扫的跨视图支持门（非剖面视图的可见线佐证） ----
+    # 缺口：剖面里"HATCH 边界水平线"可以只是后方可见轮廓（窗口区对面的筒壁）
+    # 或平顶实体的顶面轮廓在切面上的投影——单剖面视图表达不足以断言"该段
+    # 回转成实体"。YZYX 实锤（v15a 截面网格）：r145 [2604.3,2624.3]（塔帽
+    # 顶）与 r140 [2629.3,2645.3] 在材料双探针里全过但为过发；俯视 V3 的
+    # r145 可见 span 只覆盖盘 [2484.3,2504.3]。判据：add 段须被 ≥1 个非剖面
+    # （无 HATCH，即不在 mats 里）子午帧的 visible span 覆盖 ≥50% 段长。
+    import src.rebuild.features.axis_revolve as _ar
+
+    fr_sec = SimpleNamespace(view_id="V1", u_axis="x", v_axis="z", p_axis="y")
+    fr_top = SimpleNamespace(view_id="V3", u_axis="x", v_axis="y", p_axis="z")
+    corr11 = SimpleNamespace(frames={"V1": fr_sec, "V3": fr_top})
+    mats11 = {("x", "V1"): (None, 0.0)}           # V1 是剖面（有 HATCH）
+    cand11 = SimpleNamespace(centre=_P3(0.0, 0.0, 0.0))
+    seg_tower = _ar._BoreSeg(r=145.0, x0=2604.3, x1=2624.3, ax_probe=2614.3,
+                             rad=145.0, handles=("h1",))
+    seg_disc = _ar._BoreSeg(r=145.0, x0=2484.3, x1=2504.3, ax_probe=2494.3,
+                            rad=145.0, handles=("h2",))
+    table11 = {"V3": [(2484.3, 2504.3)]}          # 俯视只有盘的可见线
+    _orig_ss = _ar._span_scan
+    _ar._span_scan = lambda d, fr, dn, c, rn: (table11.get(fr.view_id, []), [])
+    try:
+        ok_tower = _ar._non_section_support(
+            None, corr11, mats11, cand11, "x", seg_tower, {})
+        ok_disc = _ar._non_section_support(
+            None, corr11, mats11, cand11, "x", seg_disc, {})
+        table11["V3"] = []
+        ok_none = _ar._non_section_support(
+            None, corr11, mats11, cand11, "x", seg_disc, {})
+    finally:
+        _ar._span_scan = _orig_ss
+    check("非剖帧 span 不覆盖该段 ⇒ 拒（塔帽顶 r145 [2604.3,2624.3] 形态）",
+          ok_tower is False)
+    check("非剖帧 span 全覆盖 ⇒ 过（盘 r145 [2484.3,2504.3] 形态）",
+          ok_disc is True)
+    check("剖面帧（在 mats 里）不算支持票——空非剖 ⇒ 拒", ok_none is False)
+
 
 # ---- 阶段 4：汇流（理解层；发射层要 OCC/SW，见 emit 自己的 --demo） ----
 
