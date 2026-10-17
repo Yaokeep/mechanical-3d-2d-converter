@@ -683,6 +683,26 @@ bbox +20 仍是 P1-B 的视图选择。回归：OCC 表 9 绿逐位不变、YZYX
 8,544,416.1 逐位持平、selftest 439→448（H12 八条）。**下一堵墙 = P1-B**
 （基体轮廓视图选择 + 环鲁棒性）→ P1-C（gate 扩展，消灭静默错误）→ P1-D
 （发射器 B-rep）。
+**v0.6.40 P1-B 基体轮廓视图选择 + 环鲁棒性**（两把刀）：①`recognizer._choose_extrude_dir`
+—— 沿最薄方向拉伸的默认读法加一条例外：最薄方向的正视轮廓视图的环**非矩形度**
+（1 − 环面积/环 bbox 面积，`_ring_fill`）≤0.005（纯矩形 = 零形状信息）且另有视图
+≥0.10 时，改取非矩形度最大的视图作轮廓、method=`projection:informative_view` 并留
+note（轴测量 x40/y44/z60 的 V2 环 2640=44×60 恰铺满 bbox ⇒ 原来拉出 105,600 的
+包围盒棱柱；切到 V0 的 L 形环 864 沿 z 拉 60 = 51,840，bbox +20/+116 → 0）。
+最薄视图**没有环**时不换视图（那是没读出来，维持包围盒回退 + 拦路 —— §3 原则二）。
+②`views/ring._glue` 第三遍顶点胶合兜底（旧管线 `merge_close_vertices` 0.5mm +
+`merge_dangling_vertices` 1.5mm 原样移植）：**只在 raw/welded 两遍都没过覆盖率门
+时跑**，已成功视图逐位不变；边数/边序保持（退化自环留给 `_one_pass` 跳过）⇒
+`micro_len` 的 eid 下标仍有效。救的是长边端点间 0.01mm 级微缝落在 SNAP 网格两侧
+（D79307 V1 raw/welded 全 None、V0 raw 356.8 覆盖率不足 → glued 270.50 / 685.80）。
+**实测**（盲测 7 用例）：D79307 blocked→**pass 5,275.6（+20.71%）**、拦路 4→0；
+轴测量 +158.07%→**+31.22%**、轴测量-剖面 +27.60%→**−28.31%**；IMU ±不变、spoon
+仍 blocked（最薄的 V1 覆盖 0.27×0.50，胶合救不了 —— 环确实不完整）。轴测量残余
+bbox +20 = **r20 半圆槽被读成 boss**（特征 #1 boss r20、轴沿 y、轴向起点 116，
+自基体右缘伸出）—— 特征角色问题，留 P1-C（gate 拦"发射 bbox 超出图纸视图跨度"）。
+回归：OCC 表 9 绿逐位不变、YZYX 8,544,416.1 逐位持平、selftest 448→**461**
+（H13 六条视图选择 + J7 七条胶合，含"raw 成功时 `_glue` 不跑"的破坏性证明）。
+**下一堵墙 = P1-C**（gate 扩展）→ P1-D（发射器 B-rep）。
 ✅ 无基准三件套（`yz_accept.py`：27
 材料点 + 五视图 HLR 评分）建在 **v15a 零件系**上（探针点、`yz_hlr.SPLIT_X=−96.5`
 都是零件系常量），新框架模型在**图纸坐标系**——2026-10-13 **零件系变换已落地**
@@ -698,7 +718,8 @@ TR 179**；横向 ±172.5/±197.5/顶 187.5 已逐位对，缺的全在特征识
 `evidence/`（dxf_reader/model + text_parser）、
 `views/`（view_detector + view_typer + correspondence 跨视图对应〔v0.6.32 起
 含**拱弧 vs 圆边**双判据 `_profile_arc`：缺口 > 半圈 且 缺口过半在轮廓盒外〕 +
-**ring 轮廓环仪器**）、
+**ring 轮廓环仪器**（v0.6.40 起含第三遍**顶点胶合兜底** `_glue`：只在 raw/welded
+都失败时跑））、
 `conventions/`（**11 条规则**，2026-10-11 起：centerline 对称/阵列、
 linetype 断裂/虚线/**细实线**、section 剖切种类/材料（v0.6.31 起含**无标题
 半剖/全剖几何推断** `_infer_untitled`）、simplification 螺纹/圆角、
@@ -707,7 +728,7 @@ linetype 断裂/虚线/**细实线**、section 剖切种类/材料（v0.6.31 起
 （「c 向」标题 + 剖面线覆盖比 <0.9 ⇒ local）、细实线=被盖轮廓（Role.THIN，
 环提取只认 VISIBLE 自动排除）、DIMENSION「数值↔几何锚点」配对（tier=ANNOTATED），
 实测 YZYX C—C 定性 section/scope=local、52 条尺寸 45 锚上、20/3/120 逐位吻合）、
-`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **material** HATCH 材料判据工具箱 + **`recognizer.bind_axial_positions` 轴向起点收口**（v0.6.39 P1-A：span→axial_at / 通孔按基体材料端 / 盲孔无依据拦路 / 回转体轴向平移））、`verify/`（compare/coverage/
+`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **material** HATCH 材料判据工具箱 + **`recognizer.bind_axial_positions` 轴向起点收口**（v0.6.39 P1-A：span→axial_at / 通孔按基体材料端 / 盲孔无依据拦路 / 回转体轴向平移）+ **`_choose_extrude_dir` 基体拉伸视图选择**（v0.6.40 P1-B：最薄视图的环是纯矩形时改取非矩形度最大的视图））、`verify/`（compare/coverage/
 gate/step_probe/box_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
 step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
@@ -715,7 +736,7 @@ step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 448 项自检（2026-10-17 P1-A 轴向绑定后实测），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 461 项自检（2026-10-17 P1-B 视图选择/胶合后实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
@@ -932,6 +953,10 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   **9 绿逐位不变**、YZYX 8,544,416.1 逐位持平、selftest **448 项**，CHANGELOG
   配 v0.6.38/v0.6.39 两节。至此 tag 落后 HEAD **20 个提交**、版本字面量仍
   0.6.25，待下次发版一并 bump）
+  （2026-10-17 续：v0.6.40（P1-B 基体轮廓视图选择 `_choose_extrude_dir` + 顶点
+  胶合 `ring._glue`）同样按 `v0.6.x:` 前缀提交。至此 tag 落后 HEAD **21 个提交**、
+  版本字面量仍 0.6.25。本文件已含 v0.6.40 正文，CHANGELOG / GENERALIZATION 各配
+  一节；selftest **461 项**、OCC 验收表 9 绿逐位不变、YZYX 8,544,416.1 逐位持平）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。

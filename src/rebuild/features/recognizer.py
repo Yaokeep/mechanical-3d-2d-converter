@@ -71,6 +71,15 @@ _PLANE_AXES: dict[str, tuple[str, str]] = {
 #: 全是 1.00×1.00，空隙干净，0.98 只是留出浮点与出图抖动。
 RING_SPAN_MIN = 0.98
 
+#: 轮廓视图选择（P1-B）：最薄方向的轮廓视图若恰好是**包围盒矩形**
+#: （环面积 / 环 bbox 面积 的缺口 ≤ 0.5%），它没有携带任何形状信息——
+#: "看不见的正是拉伸方向"这条启发式在该件上失效（实测「轴测量」：
+#: x 跨度 40 最薄，但左视图 V2 的环 2640.00 = 44×60 恰好是包围盒，
+#: 沿 x 拉伸得到纯包围盒棱柱，bbox 比金值大 +20/+116）。切换要求
+#: 候选视图的非矩形度 ≥ 10%（有值得相信的形状），否则维持原判。
+PROFILE_RECT_EPS = 0.005
+PROFILE_SWITCH_MIN = 0.10
+
 
 def _dirs_parallel(a: Vector3, b: Vector3) -> bool:
     return max(abs(a.x - b.x), abs(a.y - b.y), abs(a.z - b.z)) < AXIS_DIR_TOL
@@ -552,6 +561,72 @@ def _single_face_base(d, corr: CorrespondenceResult, frames,
     return f
 
 
+def _ring_fill(d, frame: ViewFrame) -> float | None:
+    """视图轮廓环的**非矩形度**：1 − 环面积 / 环 bbox 面积。
+
+    0 = 环恰好铺满包围盒（矩形视图，没有任何形状信息）；越大越有形状。
+    环不可用（``extract_ring`` 无结果）返回 None —— "没有环"与
+    "环是矩形"是两种不同的缺口，调用方分开处置。
+    """
+    view = next((v for v in d.views if v.id == frame.view_id), None)
+    if view is None:
+        return None
+    res = extract_ring(d, view)
+    if res.ring is None:
+        return None
+    bb = res.ring.bbox
+    abb = bb.width * bb.height
+    if abb <= 0.0:
+        return None
+    return 1.0 - res.ring.area / abb
+
+
+def _choose_extrude_dir(d, frames, ext: dict[str, float],
+                        rep: RecognizeReport) -> tuple[str, str, str | None]:
+    """选拉伸方向 + 轮廓视图 → ``(方向, 依据 method, 指定视图 id 或 None)``。
+
+    默认沿用"沿最薄方向拉伸"（板类零件的自然读法）。例外（P1-B）：
+    最薄方向的正视轮廓视图**恰好是一个矩形** —— 那说明该方向的视图只
+    读到包围盒、没有任何形状信息，沿它拉伸的"基体"就是一个包围盒棱柱。
+    此时改取**非矩形度最大**的另一个视图作拉伸轮廓（至少 10% 有形状），
+    并记一条 note 说明换了视图。
+
+    只处理"环存在但是矩形"的情形；最薄视图**没有环**时维持原行为
+    （包围盒回退 + 拦路待确认）——那是"没读出来"，不该拿另一个视图的
+    形状去猜（§3 原则二：歧义不提前消解）。
+
+    实测对照（P1-B 立项数据）：轴测量 最薄 x=40 的 V2 非矩形度 0.000
+    ⇒ 切到 V0（0.509，p=z）沿 z 拉伸 60，bbox 与金值逐位一致；bracket
+    最薄 z=44 的 V0 非矩形度 0.232 ⇒ 不切；YZYX 最薄 z≈187.5 的 V3
+    非矩形度 0.026 ⇒ 不切；IMU 最薄 y=20 的 V1 非矩形度 0.003 但其余
+    视图全是矩形（0.000）⇒ 无候选，维持 y。
+    """
+    thinnest = min(ext, key=lambda a: ext[a])
+    prof = next((f for f in frames.values() if f.p_axis == thinnest), None)
+    fill = _ring_fill(d, prof) if prof is not None else None
+    if fill is None or fill > PROFILE_RECT_EPS:
+        return thinnest, "projection:thinnest_extent", None
+    best: tuple[str, float] | None = None
+    for vid, f in frames.items():
+        if prof is not None and vid == prof.view_id:
+            continue
+        v = _ring_fill(d, f)
+        if v is None or v < PROFILE_SWITCH_MIN:
+            continue
+        if best is None or v > best[1]:
+            best = (vid, v)
+    if best is None:
+        return thinnest, "projection:thinnest_extent", None
+    f = frames[best[0]]
+    rep.notes.append(
+        f"基体：最薄方向 {thinnest}（跨度 {ext[thinnest]:.2f}）的轮廓视图 "
+        f"{prof.view_id if prof else '?'} 的环恰好铺满包围盒"
+        f"（非矩形度 {fill:.3f}）—— 该视图没有形状信息，"
+        f"改取非矩形度最大的视图 {f.view_id}（{best[1]:.3f}，p={f.p_axis}）"
+        f"沿 {f.p_axis} 拉伸 {ext[f.p_axis]:.2f}")
+    return f.p_axis, "projection:informative_view", f.view_id
+
+
 def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature:
     """基体：正对轮廓平面的视图 → **轮廓环** → 一块拉伸体。
 
@@ -562,6 +637,8 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
     **选哪条轴拉伸**：取零件最小的那个正跨度 —— 板类零件的自然读法是
     "沿最薄的方向拉伸"。这条是启发式（tier=PROJECTION 而非 CONVENTION），
     且必须报出来，因为"最薄方向不是拉伸方向"的零件（如长轴套）会被读错。
+    最薄方向的轮廓视图恰好是包围盒矩形时改取形状最完整的视图，见
+    ``_choose_extrude_dir``（P1-B，轴测量按 x 拉出包围盒棱柱的根因）。
     三角形剪影（``_detect_taper``）优先于它：那直接给出锥化轴与收敛方向
     （图形练习的四棱锥），此时基体带 `taper_scale` 参数、按锥化拉伸发射。
 
@@ -583,6 +660,8 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
         # 方向与底/顶两端），且三向跨度并列时"最薄"本来就无从选起
         # （图形练习三向都是 60，按 min 取到的是字典序首位的 x）
         dir_name = tap.axis
+        dir_method = "projection:taper_axis"
+        chosen_vid = None
     else:
         # 回转体优先于"最薄方向"：≥3 条共轴同心圆 + 轴向剖面扫出母线，
         # 是比"沿最薄向拉板"强得多的读法（PF60K 按板读体积 −63%）。
@@ -592,10 +671,14 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
         if rv is not None:
             rep.revolve = rv
             return rv.base
-        dir_name = min(ext, key=lambda a: ext[a])
-    # 轮廓取"看不出的正是拉伸方向"的那个视图（它正对着这个平面）
-    prof_view = next((f for f in frames.values() if f.p_axis == dir_name),
-                     next(iter(frames.values())))
+        dir_name, dir_method, chosen_vid = _choose_extrude_dir(
+            d, frames, ext, rep)
+    # 轮廓取"看不出的正是拉伸方向"的那个视图（它正对着这个平面）；
+    # ``_choose_extrude_dir`` 判最薄视图无形状信息时可能改指别的视图
+    prof_view = (frames.get(chosen_vid) if chosen_vid is not None else None)
+    if prof_view is None:
+        prof_view = next((f for f in frames.values() if f.p_axis == dir_name),
+                         next(iter(frames.values())))
     b1_axis, b2_axis = _PLANE_AXES[dir_name]
     lo1 = min(f.model_span(b1_axis)[0] for f in frames.values()
               if f.model_span(b1_axis) is not None)
@@ -639,10 +722,7 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
         pmethod = "projection:view_bounds"
         profile_claim = Claim(box, pmethod, Tier.PROJECTION, evidence=ev)
     params: dict[str, Claim] = {
-        "dir": Claim(dir_name,
-                     "projection:taper_axis" if tap is not None
-                     else "projection:thinnest_extent",
-                     Tier.PROJECTION, evidence=ev),
+        "dir": Claim(dir_name, dir_method, Tier.PROJECTION, evidence=ev),
         "length": Claim(length, "projection:view_bounds", Tier.PROJECTION,
                         evidence=ev),
         # 轮廓**相对 origin**（发射器按 ir_point(origin, dir, a, b, t) 落位）；

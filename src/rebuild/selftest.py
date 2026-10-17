@@ -1970,6 +1970,83 @@ def test_features() -> None:
           and any("#4.axial_at" in q.detail for q in qb), str(qb))
 
 
+    # ---- H13 轮廓视图选择（P1-B）：最薄视图没形状信息时换视图 ----
+    # 通用性盲测 P0 的轴测量：三向跨度 x40 / y44 / z60，沿最薄 x 拉伸的
+    # V2 环面积 2640 = 44×60 恰好铺满包围盒 ⇒ 基体是包围盒棱柱（105,600，
+    # 金值 42,380.2，+149%）。判据只用图纸：最薄视图的**非矩形度**为 0
+    # （环没有任何形状信息）时，改取非矩形度最大（≥10%）的视图作轮廓。
+    # 这条不碰"最薄视图没有环"的情形——那是没读出来，不该拿别的视图猜。
+    from src.rebuild.features import recognizer as _rec
+    from types import SimpleNamespace as _NS13
+
+    def _frame13(vid, p_axis):
+        return _NS13(view_id=vid, p_axis=p_axis)
+
+    def _choose13(ext, frames, fills):
+        rep = _NS13(notes=[])
+        orig = _rec._ring_fill
+        _rec._ring_fill = lambda d, f: fills.get(f.view_id)
+        try:
+            out = _rec._choose_extrude_dir(None, frames, ext, rep)
+        finally:
+            _rec._ring_fill = orig
+        return out, rep.notes
+
+    f13 = {"V0": _frame13("V0", "z"), "V1": _frame13("V1", "y"),
+           "V2": _frame13("V2", "x")}
+    out13, notes13 = _choose13({"x": 40.0, "y": 44.0, "z": 60.0}, f13,
+                               {"V0": 0.509, "V1": 0.167, "V2": 0.0})
+    check("最薄 x 的 V2 是矩形 ⇒ 改取非矩形度最大的 V0 沿 z 拉伸（轴测量形态）",
+          out13 == ("z", "projection:informative_view", "V0")
+          and len(notes13) == 1 and "没有形状信息" in notes13[0],
+          f"{out13} notes={notes13}")
+
+    out13, notes13 = _choose13({"x": 203.3, "y": 51.0, "z": 44.0}, f13,
+                               {"V0": 0.232, "V1": 0.326, "V2": 0.0})
+    check("最薄视图本身有形状（bracket V0 非矩形度 0.232）⇒ 不换视图",
+          out13 == ("z", "projection:thinnest_extent", None) and not notes13,
+          f"{out13} notes={notes13}")
+
+    out13, notes13 = _choose13({"x": 40.0, "y": 20.0, "z": 45.0}, f13,
+                               {"V0": 0.0, "V1": 0.003, "V2": 0.0})
+    check("其余视图全是矩形 ⇒ 没有可换的视图，维持最薄 y（IMU 形态）",
+          out13 == ("y", "projection:thinnest_extent", None) and not notes13,
+          f"{out13} notes={notes13}")
+
+    out13, notes13 = _choose13({"x": 40.0, "y": 44.0, "z": 60.0}, f13,
+                               {"V0": 0.509, "V1": 0.167, "V2": None})
+    check("最薄视图**没有环** ⇒ 维持原行为（包围盒回退 + 拦路，不拿别视图猜）",
+          out13 == ("x", "projection:thinnest_extent", None) and not notes13,
+          f"{out13} notes={notes13}")
+
+    # 集成锚：真实图纸上的基体选择（P1-B 转绿的那一刀）
+    _d13, _c13, _co13, rep13 = understand(
+        str(ROOT / "CAD" / "temp_output" / "轴测量.dxf"))
+    base13 = next((x for x in rep13.part.features
+                   if x.type.value == "base"), None)
+    check("轴测量 基体沿 z 拉伸、轮廓取 V0 的 L 形环 864（不再是包围盒）",
+          base13 is not None
+          and base13.params["dir"].value == "z"
+          and base13.params["dir"].method == "projection:informative_view"
+          and base13.source_view == "V0"
+          and abs(base13.params["profile"].value.signed_area() - 864.0) < 1e-6,
+          f"{None if base13 is None else base13.params['dir']} "
+          f"view={None if base13 is None else base13.source_view} "
+          f"area={None if base13 is None else base13.params['profile'].value.signed_area()}")
+
+    _d13b, _c13b, _co13b, rep13b = understand(
+        str(ROOT / "CAD" / "temp_output" / "bracket_angker_三视图_v4.dxf"))
+    base13b = next((x for x in rep13b.part.features
+                    if x.type.value == "base"), None)
+    check("bracket 基体仍沿最薄 z 取 V0（P1-B 不碰已对的靶子）",
+          base13b is not None
+          and base13b.params["dir"].value == "z"
+          and base13b.params["dir"].method == "projection:thinnest_extent"
+          and base13b.source_view == "V0",
+          f"{None if base13b is None else base13b.params['dir']} "
+          f"view={None if base13b is None else base13b.source_view}")
+
+
 # ---- 阶段 4：汇流（理解层；发射层要 OCC/SW，见 emit 自己的 --demo） ----
 
 _FIXTURES = {
@@ -2279,6 +2356,67 @@ def test_ring() -> None:
         r = extract_ring(d, v)
         check(f"剖面图纸 {v.id} 剖视图让位",
               r.ring is None and r.note == "section_view", r.note)
+
+    # J7 顶点胶合兜底（P1-B）：长边端点间 0.01~0.5mm 微缝落在 SNAP 网格
+    #    两侧 ⇒ raw/welded 的度 1 修剪把整条链级联删掉。胶合**只在两遍都
+    #    没过门时**跑——已成功的视图结果必须逐位不变（v15 误焊教训的边界）。
+    from src.rebuild.views import ring as _rg
+
+    # 合成正方形：左下角断 0.02mm（v0 与 v4 两个顶点，跨越 SNAP 网格）
+    vp = {0: (0.0, 0.0), 1: (100.0, 0.0), 2: (100.0, 100.0),
+          3: (0.0, 100.0), 4: (0.02, 0.0)}
+    es = [_rg._E("L", 0, 1), _rg._E("L", 1, 2),
+          _rg._E("L", 2, 3), _rg._E("L", 3, 4)]
+    check("0.02mm 断口：raw 提不出环（度 1 修剪级联）",
+          _rg._one_pass(es, vp, {}) is None)
+    gvp, ges = _rg._glue(es, vp)
+    gp = _rg._one_pass(ges, gvp, {})
+    check("胶合把 0.02mm 断口并上 ⇒ 100×100 闭环",
+          gp is not None and abs(gp.area - 10000.0) < 1e-6,
+          f"{None if gp is None else gp.area}")
+    check("胶合保持边数/边序（micro_len 的 eid 下标仍有效）",
+          len(ges) == len(es), f"{len(ges)} vs {len(es)}")
+
+    # 真实锚：D79307（P0 的 no_ring_found 靶子，35×20×40 拱形件）
+    d79 = read_dxf(tmp / "D79307A264FCA6D8EC32E95B1B11BDBD.dxf")
+    detect_views(d79)
+    type_views(d79)
+    r79 = {v.id: extract_ring(d79, v) for v in d79.views}
+    check("D79307 V1 raw/welded 都无环 ⇒ 胶合救回 270.50",
+          r79["V1"].raw is None and r79["V1"].welded is None
+          and r79["V1"].ring is not None
+          and r79["V1"].ring.rule == "glued"
+          and abs(r79["V1"].ring.area - 270.4968) < 0.01,
+          f"{r79['V1'].note} "
+          f"{None if r79['V1'].ring is None else r79['V1'].ring.area}")
+    check("D79307 V0 raw 环 356.8 覆盖率不足 ⇒ 胶合救回 685.80",
+          r79["V0"].raw is not None
+          and abs(r79["V0"].raw.area - 356.8) < 0.1
+          and r79["V0"].ring is not None
+          and r79["V0"].ring.rule == "glued"
+          and abs(r79["V0"].ring.area - 685.7969) < 0.01,
+          f"raw={None if r79['V0'].raw is None else r79['V0'].raw.area} "
+          f"ring={None if r79['V0'].ring is None else r79['V0'].ring.area}")
+    check("D79307 V2 raw 已过门 ⇒ 胶合不跑（glued 诊断恒 None）",
+          r79["V2"].ring is not None and r79["V2"].ring.rule == "raw"
+          and r79["V2"].glued is None,
+          f"{None if r79['V2'].ring is None else r79['V2'].ring.rule} "
+          f"glued={r79['V2'].glued}")
+
+    # 破坏性证明：raw 已过门的视图根本不会调用 _glue
+    _orig_glue = _rg._glue
+
+    def _boom(*a, **k):
+        raise AssertionError("_glue 不该在 raw 成功时被调用")
+
+    _rg._glue = _boom
+    try:
+        r = ring_of(ROOT / "CAD" / "图形练习.dxf", "V0")
+    finally:
+        _rg._glue = _orig_glue
+    check("raw 已过门的视图不跑胶合（已成功结果逐位不变的保证）",
+          r.ring is not None and r.ring.rule == "raw",
+          f"{r.ring.rule if r.ring else r.note}")
 
 
 # ============ 主入口 ============

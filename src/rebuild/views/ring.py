@@ -78,6 +78,16 @@ WELD_GAP = 0.3        # 微链自由端 → 长边端点的焊接距离上限
 COVER_MIN = 0.75      # 覆盖率门控（旧管线 v0.6.20 口径）
 AREA_FLOOR = 10.0     # 候选环最小面积 mm²（旧 keep_all=False 口径）
 
+#: 第三遍「顶点胶合」参数（旧管线 :932 ``merge_close_vertices`` /
+#: :979 ``merge_dangling_vertices`` 的口径，原样移植）。只在 raw/welded
+#: 两遍都失败时作为兜底跑——HLR 长边端点间的 0.01mm 级微缝落在 SNAP
+#: 网格两侧（D79307 V1：ARC 端点 (45.013,16.373) 与 LINE 端点
+#: (45.011,16.375) 各吸附到 (45.01,16.37)/(45.01,16.38)），度 1 修剪
+#: 会把整条底脚链删掉 ⇒ no_ring_found。``_weld`` 救不了（长-长绝不
+#: 焊接，v15 误焊教训），故胶合必须是**独立兜底**、不与成功的环竞逐。
+GLUE_CLOSE = 0.5      # 近邻顶点合并距离（含端点）
+GLUE_GAP = 1.5        # 悬空顶点吸附到最近非悬空顶点的距离上限
+
 #: 置 RING_DBG=1 打印遍历决策 / =2 全步输出（排查用，对照旧管线 SLANT_DBG 先例）
 _DBG = int(os.environ.get("RING_DBG") or 0)
 
@@ -94,7 +104,7 @@ class Ring:
     segs: tuple[RingSeg, ...]
     area: float                                # 顶点鞋带面积
     bbox: BBox2                                # 几何 bbox（含弧顶）
-    rule: str                                  # "raw" | "welded"
+    rule: str                                  # "raw" | "welded" | "glued"
     coverage: tuple[float, float]              # (环/视图) 宽、高覆盖比
     n_edges: int                               # 视图参与提取的轮廓边数
     n_micro: int                               # 其中微边条数
@@ -107,12 +117,17 @@ class Ring:
 
 @dataclass(frozen=True)
 class RingResult:
-    """提取结果：``ring`` 为通过门控的环；``raw``/``welded`` 为两遍诊断。"""
+    """提取结果：``ring`` 为通过门控的环；三遍诊断各自保留。
+
+    ``glued`` 是第三遍（顶点胶合兜底）的诊断结果——只有 raw/welded 都
+    失败时才会跑，故正常视图恒为 None。
+    """
 
     ring: Ring | None
     raw: Ring | None
     welded: Ring | None
     note: str = ""
+    glued: Ring | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +561,97 @@ def _weld(edges: list[_E], vpos):
     return vpos2, edges2
 
 
+def _glue(edges: list[_E], vpos):
+    """顶点胶合第三遍（旧 :932/:979 两遍合并的移植）。返回 (vpos2, edges2)。
+
+    与 ``_weld`` 的分工是**证据强度**：``_weld`` 只焊微边链自由端
+    （长-长绝不焊接，v15 误焊教训），胶合放开到全部顶点——它消费的
+    正是"长边端点之间 0.01~0.5mm 微缝落在网格两侧、SNAP 合并不上"的
+    情形（D79307 V1 底脚链整条被度 1 修剪删掉即此）。因此胶合只作为
+    raw/welded **都失败**时的兜底，不参与已成功视图的竞逐。
+
+    **边数/边序保持不变**：合并后退化成自环的边留在表里（``_one_pass``
+    会跳过度 0 的边），这样 ``micro_len``（eid→链长）的下标依旧有效。
+    """
+    parent = {v: v for v in vpos}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # 1) 近邻顶点合并（旧 :932，0.5mm 含端点）
+    ids = list(vpos)
+    grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for v in ids:
+        x, y = vpos[v]
+        grid[(int(x / GLUE_CLOSE), int(y / GLUE_CLOSE))].append(v)
+    for v in ids:
+        x, y = vpos[v]
+        cx, cy = int(x / GLUE_CLOSE), int(y / GLUE_CLOSE)
+        for bx in (-1, 0, 1):
+            for by in (-1, 0, 1):
+                for w in grid.get((cx + bx, cy + by), ()):
+                    if w <= v:
+                        continue
+                    xw, yw = vpos[w]
+                    if math.hypot(xw - x, yw - y) <= GLUE_CLOSE:
+                        union(v, w)
+
+    # 2) 悬空顶点吸附（旧 :979，1.5mm）到最近的非悬空顶点。
+    #    度在合并后的簇上算：簇内端点已合并，度 1 才是真断口。
+    deg: Counter = Counter()
+    for e in edges:
+        vs, ve = find(e.vs), find(e.ve)
+        if vs != ve:
+            deg[vs] += 1
+            deg[ve] += 1
+    dangling = [v for v, d in deg.items() if d == 1]
+    if dangling:
+        live = [v for v in deg if deg[v] > 1]
+        live_grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for w in live:
+            x, y = vpos[w]
+            live_grid[(int(x / GLUE_GAP), int(y / GLUE_GAP))].append(w)
+        for v in dangling:
+            x, y = vpos[v]
+            cx, cy = int(x / GLUE_GAP), int(y / GLUE_GAP)
+            best, bd = None, GLUE_GAP
+            for bx in (-1, 0, 1):
+                for by in (-1, 0, 1):
+                    for w in live_grid.get((cx + bx, cy + by), ()):
+                        xw, yw = vpos[w]
+                        d = math.hypot(xw - x, yw - y)
+                        if d < bd:
+                            bd, best = d, w
+            if best is not None:
+                union(v, best)
+
+    # 簇代表位置：**弧端点优先**（同 ``_weld``——弧是刚性几何，
+    # 被卷进簇的其他端点会把弧起点拖离圆）
+    rep_pos: dict[int, tuple[float, float]] = {}
+    for v in vpos:
+        rep_pos.setdefault(find(v), vpos[v])
+    anchor: dict[int, tuple[float, float]] = {}
+    for e in edges:
+        if e.t == "A" and e.r > 0.0:
+            anchor.setdefault(find(e.vs), vpos[e.vs])
+            anchor.setdefault(find(e.ve), vpos[e.ve])
+    rep_pos.update(anchor)
+    vpos2 = {v: rep_pos[find(v)] for v in vpos}
+    edges2 = [replace(e, vs=find(e.vs), ve=find(e.ve),
+                      sa_v=find(e.sa_v) if e.sa_v >= 0 else -1,
+                      ea_v=find(e.ea_v) if e.ea_v >= 0 else -1)
+              for e in edges]
+    return vpos2, edges2
+
+
 # ---------------------------------------------------------------------------
 # 单遍提取（旧管线 _extract_rings_impl 的移植）
 # ---------------------------------------------------------------------------
@@ -972,14 +1078,27 @@ def extract_ring(d: Drawing, v: View) -> RingResult:
         # 视图错报 no_ring_found（flange_d80 / 法兰练习 V0 实测）
         return RingResult(None, r_raw, r_welded, "circles_only_view")
     pool = [r for r in (r_raw, r_welded) if r is not None]
-    if not pool:
-        return RingResult(None, r_raw, r_welded, "no_ring_found")
-    chosen = max(pool, key=lambda r: r.area)
+    chosen = max(pool, key=lambda r: r.area) if pool else None
+    if chosen is not None:
+        cw, ch = chosen.coverage
+        if cw >= COVER_MIN and ch >= COVER_MIN:
+            return RingResult(chosen, r_raw, r_welded, "")
+
+    # 第三遍：顶点胶合兜底（见 ``_glue``）。只在 raw/welded 都没给出
+    # 过门环时跑——已成功的视图结果逐位不变（v15 误焊教训的边界）。
+    glued_vpos, glued_edges = _glue(edges, vpos)
+    glued = _one_pass(glued_edges, glued_vpos, micro_len)
+    r_glued = _mk(glued, glued_edges, glued_vpos, "glued")
+    if r_glued is not None:
+        gw, gh = r_glued.coverage
+        if gw >= COVER_MIN and gh >= COVER_MIN:
+            return RingResult(r_glued, r_raw, r_welded, "", r_glued)
+
+    if chosen is None:
+        return RingResult(None, r_raw, r_welded, "no_ring_found", r_glued)
     cw, ch = chosen.coverage
-    if cw < COVER_MIN or ch < COVER_MIN:
-        return RingResult(None, r_raw, r_welded,
-                          f"coverage({cw:.2f}×{ch:.2f})<{COVER_MIN}")
-    return RingResult(chosen, r_raw, r_welded, "")
+    return RingResult(None, r_raw, r_welded,
+                      f"coverage({cw:.2f}×{ch:.2f})<{COVER_MIN}", r_glued)
 
 
 # ---------------------------------------------------------------------------
