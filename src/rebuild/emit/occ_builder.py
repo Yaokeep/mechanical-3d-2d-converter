@@ -67,6 +67,7 @@ b1 取"与 z、x、y 依次叉积的第一个非退化方向"（同 `library._pe
 from __future__ import annotations
 
 import math
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -74,14 +75,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 from OCC.Core.Bnd import Bnd_Box
+from OCC.Core.BRep import BRep_Builder, BRep_Tool
+from OCC.Core.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
 from OCC.Core.BRepBndLib import brepbndlib
-from OCC.Core.BRepBuilderAPI import (BRepBuilderAPI_MakeEdge,
+from OCC.Core.BRepBuilderAPI import (BRepBuilderAPI_Copy,
+                                     BRepBuilderAPI_MakeEdge,
                                      BRepBuilderAPI_MakeFace,
                                      BRepBuilderAPI_MakePolygon,
                                      BRepBuilderAPI_MakeVertex,
                                      BRepBuilderAPI_MakeWire)
-from OCC.Core.BRepCheck import BRepCheck_Analyzer
+from OCC.Core.BRepCheck import (BRepCheck_Analyzer,
+                                BRepCheck_ListIteratorOfListOfStatus,
+                                BRepCheck_NoError)
+from OCC.Core.BRepClass import BRepClass_FaceClassifier
+from OCC.Core.BRepClass3d import BRepClass3d_SolidClassifier
 from OCC.Core.BRepExtrema import BRepExtrema_DistShapeShape
 from OCC.Core.BRepFilletAPI import BRepFilletAPI_MakeChamfer, BRepFilletAPI_MakeFillet
 from OCC.Core.BRepGProp import brepgprop
@@ -91,12 +99,18 @@ from OCC.Core.BRepPrimAPI import (BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakePris
                                   BRepPrimAPI_MakeRevol)
 from OCC.Core.GC import GC_MakeArcOfCircle
 from OCC.Core.GProp import GProp_GProps
+from OCC.Core.Geom import Geom_Circle
+from OCC.Core.GeomAbs import GeomAbs_Circle, GeomAbs_Plane
 from OCC.Core.STEPControl import (STEPControl_AsIs, STEPControl_Reader,
                                   STEPControl_Writer)
-from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_SOLID
+from OCC.Core.TopAbs import (TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_SHELL,
+                             TopAbs_SOLID, TopAbs_WIRE)
 from OCC.Core.TopExp import TopExp_Explorer, topexp
-from OCC.Core.TopTools import TopTools_IndexedMapOfShape
-from OCC.Core.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Vec
+from OCC.Core.TopTools import (TopTools_IndexedDataMapOfShapeListOfShape,
+                               TopTools_IndexedMapOfShape)
+from OCC.Core.TopoDS import (TopoDS_Compound, TopoDS_Shell, TopoDS_Solid,
+                             topods)
+from OCC.Core.gp import gp_Ax1, gp_Ax2, gp_Circ, gp_Dir, gp_Pnt, gp_Vec
 
 from ..features import library
 from ..model.claim import Claim, Tier
@@ -708,6 +722,510 @@ def select_edges(shape: Any, f: Feature, tol: float = _EDGE_TOL) -> list[Any]:
     if redundant:
         print(f"  [emit] 特征 #{f.id}：edges 里 {redundant} 个点指向已选中的棱，已去重")
     return selected
+
+
+# ---------------------------------------------------------------------------
+# B-rep 卫生清理：剔除"寄生悬空面"，圆盘孔口膜连带把孔口还给宿主面
+# ---------------------------------------------------------------------------
+#
+# 布尔残留的经典一景（2026-10-17 YZYX 实测定位到特征）：盲孔刀底/顶与材料面
+# 精确共面时，后续布尔把该面两侧的材料都切掉、却没把它从壳里删掉 —— 留下一张
+# **两侧皆空**的零厚度膜。它不是实体边界（不分隔材料），但 HLR 拿它当几何算：
+# 膜遮住的棱被投影判成"隐藏"，BL 视图只导可见线 ⇒ 整圈孔口圆消失
+# （YZYX 8 张 z=12 圆盘扣 8 个螺孔口，BL 因此缺 128 段）。
+#
+# 清理判据（**只用材料分类，不看数值**）：
+#   1) 平面面（曲面暂不碰）且面积 ≥ _PRUNE_MIN_AREA（碎/退化面宁可不删）
+#   2) 面内取一点 P（最长棱中点朝面内偏，BRepClass_FaceClassifier 复核）；
+#      沿面法向 P±_PRUNE_EPS 用 BRepClass3d_SolidClassifier 分类：
+#      两侧皆 OUT ⇒ 该面两侧都不是材料 ⇒ 寄生膜
+#   3) 从所在壳里删掉该面（按面重建壳，见下）——实体材料一字未变，
+#      变的只是 B-rep 拓扑
+#
+# 两类膜，处置不同：
+#   · **普通膜**（plain）：直接删。删完外环棱若变孤儿，护栏会否决整批，
+#     效果即"保持原样"（宁可不动）。
+#   · **孔口膜**（cap，外环恰一条整圆棱 + 该棱邻一个圆柱孔壁）：只删不行 ——
+#     那条圆棱会变孤儿，孔口圆反而更不可见。正解 = **把圆棱交给孔所在的那个
+#     平面宿主面当内环**（宿主重建：原曲面 + 外环 + 旧内环 + 各孔口圆棱），
+#     删膜后圆棱的邻面仍是 2 个（孔壁 + 宿主）⇒ 流形，孔口圆以宿主内环身份
+#     回到 HLR 里。宿主判定：孔心半径 r+0.5 的 8 方向采样，找与孔口共面
+#     （|Δz| ≤ 0.01mm）且采样点判 IN 的平面面。
+#
+# ⚠️ 25nm 病根（2026-10-17 实测）：YZYX 的圆盘膜/圆棱在图纸原生坐标
+# z=1553.248475，而宿主面的曲面与全部 wire 在 4 位量化体系 z=1553.248500 ——
+# 两者差 **25nm**，超 OCC 顶点/棱容差（1e-7mm = 0.1nm）250 倍，圆棱直接挂上
+# 宿主面会让 BRepCheck 报 UnorientableShape(27)（最小复现 _t_gap.py：同面
+# valid / 错位 1.5µm 即 [27]）。修法 = `_lift_rim_to()`：原地把圆棱几何与
+# 顶点平移到宿主曲面 z（UpdateEdge/UpdateVertex，顶点容差 1e-4mm 让顶点与
+# 曲线端点的 nm 级差别落在容差内）。wall 与 seam 引用的是同一个共享
+# TShape，不需要重建。图纸本身干净（实测底面线与腔底线差精确 12.000000），
+# 25nm 是"两套视图原点口径"的账。
+#
+# 护栏（每阶段各自判）：BRepCheck 有效、非流形/孤儿棱不增、**体积不变**
+# （Δ ≤ max(1.0mm³, 1e-6·V)，实测挪棱后 Δ 0.01mm³）。cap 阶段失败 ⇒ 整批
+# 回滚到入参形状（挪棱是原地改共享对象，没法逐条撤销）；plain 阶段失败 ⇒
+# 只回滚 plain 阶段、保留 cap 成果。
+# 埋入材料内部的两侧皆 IN 面（另一类布尔残留）**不动**：从壳里删它们会开口。
+# `REBUILD_NO_PRUNE=1` 关闭（受控实验用，与 CSG_WELD 同类）。
+
+#: 悬空判定沿面法向的偏置（mm）
+_PRUNE_EPS = 0.05
+#: 面内探针点从最长棱中点朝内偏的距离候选（mm），取第一个确认落在面内的
+_PRUNE_INSETS = (0.5, 0.2, 0.05, 0.02)
+#: 面积小于它的面不动（mm²）
+_PRUNE_MIN_AREA = 0.05
+#: 孔口盘找宿主面时，宿主平面与孔口平面的 z 容差（mm）——膜与宿主本该共面，
+#: 实测偏差 25nm，0.01 足够宽又窄于任何有意义的几何间隔
+_CAP_HOST_DZ = 0.01
+#: 挪棱后圆棱顶点容差（mm = 0.1µm > 25nm 的量化差；同时远小于任何真实几何间隙）
+_CAP_LIFT_TOL = 1e-4
+
+
+def _edge_length(e: Any) -> float:
+    props = GProp_GProps()
+    brepgprop.LinearProperties(e, props)
+    return props.Mass()
+
+
+def _face_inner_point(face: Any, surf: Any) -> Any:
+    """在（平面）面内找一个**确定落面**的探针点：最长棱中点朝面内偏。
+
+    朝内方向取 T×n（面内、垂直棱），两侧都试 —— 哪边经
+    `BRepClass_FaceClassifier` 判 IN 就用哪边；都不行返回 None（宁可不判）。
+    """
+    best, best_len = None, -1.0
+    fexp = TopExp_Explorer(face, TopAbs_EDGE)
+    while fexp.More():
+        e = topods.Edge(fexp.Current())
+        ln = _edge_length(e)
+        if ln > best_len:
+            best_len, best = ln, e
+        fexp.Next()
+    if best is None or best_len <= 0.0:
+        return None
+    try:
+        c = BRepAdaptor_Curve(best)
+        # 数值切线：这版 pythonocc 里 `D1(u)` 单参绑定是 4-arg 形式（TypeError），
+        # 而 `Curve()` 取底层几何会**堆损坏**（0xc0000374 静默杀进程）——
+        # 只走 `Value(u)`，切线用两点差分。
+        u0, u1 = c.FirstParameter(), c.LastParameter()
+        if not u1 > u0:
+            return None
+        u = 0.5 * (u0 + u1)
+        p0 = c.Value(u)
+        du = (u1 - u0) * 1e-3
+        pa = c.Value(max(u0, u - du))
+        pb = c.Value(min(u1, u + du))
+    except Exception:
+        return None
+    tx, ty, tz = pb.X() - pa.X(), pb.Y() - pa.Y(), pb.Z() - pa.Z()
+    tn = math.sqrt(tx * tx + ty * ty + tz * tz)
+    if tn < 1e-12:
+        return None
+    t = (tx / tn, ty / tn, tz / tn)
+    d = surf.Plane().Axis().Direction()
+    n = (d.X(), d.Y(), d.Z())
+    ud = (t[1] * n[2] - t[2] * n[1],
+          t[2] * n[0] - t[0] * n[2],
+          t[0] * n[1] - t[1] * n[0])
+    for off in _PRUNE_INSETS:
+        for sgn in (1.0, -1.0):
+            q = gp_Pnt(p0.X() + sgn * off * ud[0],
+                       p0.Y() + sgn * off * ud[1],
+                       p0.Z() + sgn * off * ud[2])
+            try:
+                if BRepClass_FaceClassifier(face, q, 1e-6).State() == TopAbs_IN:
+                    return q
+            except Exception:
+                break
+    return None
+
+
+def _edge_face_stats(shape: Any) -> tuple[int, int, int]:
+    """(棱数, 非流形棱数[相邻面≠2], 孤儿棱数[相邻面=1])。"""
+    emap = TopTools_IndexedMapOfShape()
+    topexp.MapShapes(shape, TopAbs_EDGE, emap)
+    fmap = TopTools_IndexedMapOfShape()
+    topexp.MapShapes(shape, TopAbs_FACE, fmap)
+    counts: dict[int, set[int]] = {}
+    fexp = TopExp_Explorer(shape, TopAbs_FACE)
+    while fexp.More():
+        f = fexp.Current()
+        fi = fmap.FindIndex(f)
+        eexp = TopExp_Explorer(f, TopAbs_EDGE)
+        while eexp.More():
+            counts.setdefault(emap.FindIndex(eexp.Current()), set()).add(fi)
+            eexp.Next()
+        fexp.Next()
+    bad = sum(1 for s in counts.values() if len(s) != 2)
+    orphan = sum(1 for s in counts.values() if len(s) == 1)
+    return len(counts), bad, orphan
+
+
+def _wire_edges(w: Any) -> list[Any]:
+    out = []
+    ee = TopExp_Explorer(w, TopAbs_EDGE)
+    while ee.More():
+        out.append(topods.Edge(ee.Current()))
+        ee.Next()
+    return out
+
+
+def _faces_of_edge(amap: Any, e: Any) -> list[Any]:
+    """棱的相邻面（去重，IsSame 口径）。amap 须是 edge→faces 的祖先表。"""
+    idx = amap.FindIndex(e)
+    if idx == 0:
+        return []
+    lst = amap.FindFromIndex(idx)
+    raw = []
+    try:
+        for x in lst:
+            raw.append(x)
+    except TypeError:
+        from OCC.Core.TopTools import TopTools_ListIteratorOfListOfShape
+        it = TopTools_ListIteratorOfListOfShape(lst)
+        while it.More():
+            raw.append(it.Value())
+            it.Next()
+    seen: list[Any] = []
+    for x in raw:
+        if not any(x.IsSame(s) for s in seen):
+            seen.append(x)
+    return seen
+
+
+def _cap_rim(face: Any) -> Any:
+    """孔口膜判据：外环恰一条棱且是整圆 ⇒ 返回该棱，否则 None。
+
+    （只认圆盘：外环多段/非圆的膜走普通删除路径。）
+    """
+    try:
+        edges = _wire_edges(breptools.OuterWire(face))
+    except Exception:
+        return None
+    if len(edges) != 1:
+        return None
+    try:
+        if BRepAdaptor_Curve(edges[0]).GetType() == GeomAbs_Circle:
+            return edges[0]
+    except Exception:
+        return None
+    return None
+
+
+def _cap_host(rim: Any, cap: Any, wall: Any, all_faces: list[Any]) -> Any:
+    """孔口膜的宿主平面面：孔心半径 r+0.5 的 8 方向采样，找共面且判 IN 的平面。
+
+    找不到返回 None（该盘退化为普通膜处理）。
+    """
+    try:
+        circ = BRepAdaptor_Curve(rim).Circle()
+    except Exception:
+        return None
+    cen, rr = circ.Location(), circ.Radius()
+    for k in range(8):
+        ang = k * math.pi / 4.0
+        q = gp_Pnt(cen.X() + (rr + 0.5) * math.cos(ang),
+                   cen.Y() + (rr + 0.5) * math.sin(ang), cen.Z())
+        for g in all_faces:
+            if g.IsSame(cap) or g.IsSame(wall):
+                continue
+            try:
+                s = BRepAdaptor_Surface(g)
+                if s.GetType() != GeomAbs_Plane:
+                    continue
+                if abs(s.Plane().Location().Z() - cen.Z()) > _CAP_HOST_DZ:
+                    continue
+                if BRepClass_FaceClassifier(g, q, 1e-6).State() == TopAbs_IN:
+                    return g
+            except Exception:
+                continue
+    return None
+
+
+def _lift_rim_to(rim: Any, z_h: float) -> float:
+    """把圆棱的几何与顶点**原地**平移到宿主曲面 z（dz 返回值，单位 mm）。
+
+    pythonocc 未暴露 gp_Circ 拷贝构造，只能由 gp_Ax2 重建；UpdateEdge/
+    UpdateVertex 改的是共享 TShape，孔壁面/接缝自动看到新几何。
+    """
+    c = BRepAdaptor_Curve(rim)
+    circ = c.Circle()
+    dz = z_h - circ.Location().Z()
+    if abs(dz) < 1e-9:
+        return 0.0
+    ax2 = circ.Position()
+    ax2.Translate(gp_Vec(0.0, 0.0, dz))
+    b = BRep_Builder()
+    b.UpdateEdge(rim, Geom_Circle(gp_Circ(ax2, circ.Radius())), _CAP_LIFT_TOL)
+    v1 = topods.Vertex(topexp.FirstVertex(rim))
+    p1 = BRep_Tool.Pnt(v1)
+    b.UpdateVertex(v1, gp_Pnt(p1.X(), p1.Y(), p1.Z() + dz), _CAP_LIFT_TOL)
+    v2 = topods.Vertex(topexp.LastVertex(rim))
+    if not v2.IsSame(v1):
+        p2 = BRep_Tool.Pnt(v2)
+        b.UpdateVertex(v2, gp_Pnt(p2.X(), p2.Y(), p2.Z() + dz), _CAP_LIFT_TOL)
+    return dz
+
+
+def _face_statuses(face: Any) -> list[int] | None:
+    """单面 BRepCheck 状态码（空列表=无错；None=查询不到子状态表）。"""
+    an = BRepCheck_Analyzer(face)
+    an.IsValid()
+    res = an.Result(face)
+    if res is None:
+        return None
+    it = BRepCheck_ListIteratorOfListOfStatus(res.Status())
+    bad = []
+    while it.More():
+        if it.Value() != BRepCheck_NoError:
+            bad.append(it.Value())
+        it.Next()
+    return bad
+
+
+def _rebuild_host_face(host: Any, rims: list[Any]) -> Any:
+    """宿主面重建：原曲面 + 外环 + 旧内环 + 各孔口圆棱（作新内环）。
+
+    返回新面（朝向随宿主）；构建失败或单面自检不过返回 None。
+    圆棱方向试原向/反向两种（孔壁与膜的环绕向不一定同向，实测反向才是
+    valid 的那侧）。
+    """
+    surf = BRep_Tool.Surface(host)
+    outer = breptools.OuterWire(host)
+    old_inner = []
+    wexp = TopExp_Explorer(host, TopAbs_WIRE)
+    while wexp.More():
+        w = topods.Wire(wexp.Current())
+        wexp.Next()
+        if not w.IsSame(outer):
+            old_inner.append(w)
+
+    def build(reverse_inner: bool) -> Any:
+        mk = BRepBuilderAPI_MakeFace(surf, outer)
+        if not mk.IsDone():
+            return None
+        for w in old_inner:
+            mk.Add(w)
+        for e in rims:
+            wm = BRepBuilderAPI_MakeWire(e.Reversed() if reverse_inner else e)
+            if not wm.IsDone():
+                return None
+            mk.Add(wm.Wire())
+        return mk.Face()
+
+    nf_a, nf_b = build(False), build(True)
+    st_a = _face_statuses(nf_a) if nf_a is not None else None
+    st_b = _face_statuses(nf_b) if nf_b is not None else None
+    nf = None
+    if st_b == []:
+        nf = nf_b
+    elif st_a == []:
+        nf = nf_a
+    if nf is None:
+        return None
+    nf.Orientation(host.Orientation())
+    return nf
+
+
+def _rebuild_shells(shape: Any, drop: list[Any],
+                    replace: list[tuple[Any, Any]]) -> Any:
+    """按面重建全部壳：丢掉 drop 里的面、把 replace 的旧面换成新面。
+
+    不做 BRep_Builder.Remove：它只摘面、壳的棱/点表里会残留"死边"，
+    BRepCheck 立刻判无效（实测 21→36 非流形）。改为每个 solid 的每个壳用
+    保留面重新 MakeShell+Add —— 表干净、无冻结核问题。
+    """
+    builder = BRep_Builder()
+    new_solids: list[Any] = []
+    sexp = TopExp_Explorer(shape, TopAbs_SOLID)
+    while sexp.More():
+        solid = topods.Solid(sexp.Current())
+        sexp.Next()
+        new_shells: list[Any] = []
+        ssexp = TopExp_Explorer(solid, TopAbs_SHELL)
+        while ssexp.More():
+            shell = topods.Shell(ssexp.Current())
+            ssexp.Next()
+            keep: list[Any] = []
+            ff = TopExp_Explorer(shell, TopAbs_FACE)
+            while ff.More():
+                f = topods.Face(ff.Current())
+                ff.Next()
+                if any(f.IsSame(d) for d in drop):
+                    continue
+                nh = None
+                for old, new in replace:
+                    if f.IsSame(old):
+                        nh = new
+                        break
+                keep.append(nh if nh is not None else f)
+            ns = TopoDS_Shell()
+            builder.MakeShell(ns)
+            for f in keep:
+                builder.Add(ns, f)
+            new_shells.append(ns)
+        nsolid = TopoDS_Solid()
+        builder.MakeSolid(nsolid)
+        for sh in new_shells:
+            builder.Add(nsolid, sh)
+        new_solids.append(nsolid)
+    out = TopoDS_Compound()
+    builder.MakeCompound(out)
+    for s in new_solids:
+        builder.Add(out, s)
+    return out
+
+
+def _prune_guard(before: Any, after: Any) -> tuple[bool, str]:
+    """清理护栏：BRepCheck 有效 + 非流形/孤儿棱不增 + 实体材料（体积）不变。"""
+    n0, bad0, orphan0 = _edge_face_stats(before)
+    n1, bad1, orphan1 = _edge_face_stats(after)
+    valid = BRepCheck_Analyzer(after).IsValid()
+    try:
+        v0, v1 = volume_of(before), volume_of(after)
+    except Exception as e:
+        return False, f"体积测量失败（{e}）"
+    vol_ok = abs(v1 - v0) <= max(1.0, 1e-6 * abs(v0))
+    ok = valid and orphan1 <= orphan0 and bad1 <= bad0 and vol_ok
+    return ok, (f"有效={valid} 棱{n0}->{n1} 非流形{bad0}->{bad1} "
+                f"孤儿{orphan0}->{orphan1} 体积{v0:.2f}->{v1:.2f} (Δ{v1 - v0:+.2f})")
+
+
+def _prune_dangling_faces(shape: Any) -> tuple[Any, list[Any]]:
+    """剔除寄生悬空面（两侧皆 OUT 的平面膜），返回 (shape, 处理的面列表)。
+
+    孔口膜（圆盘 + 圆柱孔壁邻面）走「圆棱挪到宿主平面 → 宿主重建带孔内环
+    → 删膜」：孔口圆以宿主内环身份回到 HLR，不再被膜扣成隐藏。
+    普通膜直接删（外环棱若变孤儿，plain 阶段护栏回滚 = 保持原样）。
+
+    失败时按阶段回滚：cap 阶段失败整批回滚到入参形状（挪棱是原地改共享
+    对象，没法逐条撤销）；plain 阶段失败只回滚该阶段。清理是卫生工作，
+    宁可不动，也不能把 B-rep 修坏。
+    """
+    # 在**副本**上作业：挪棱原地改共享 TShape，失败时逐条撤销不成立，
+    # 只有整棵树是副本、失败时丢掉整棵树，回滚才成立。
+    work = BRepBuilderAPI_Copy(shape).Shape()
+
+    # ---- ① 候选：两侧皆 OUT 的平面膜 ----
+    cands: list[Any] = []
+    fexp = TopExp_Explorer(work, TopAbs_FACE)
+    while fexp.More():
+        f = topods.Face(fexp.Current())
+        fexp.Next()
+        try:
+            surf = BRepAdaptor_Surface(f)
+            if surf.GetType() != GeomAbs_Plane:
+                continue
+            props = GProp_GProps()
+            brepgprop.SurfaceProperties(f, props)
+            if props.Mass() < _PRUNE_MIN_AREA:
+                continue
+        except Exception:
+            continue
+        p = _face_inner_point(f, surf)
+        if p is None:
+            continue
+        d = surf.Plane().Axis().Direction()
+        try:
+            cls = BRepClass3d_SolidClassifier(work)
+            cls.Perform(gp_Pnt(p.X() + _PRUNE_EPS * d.X(),
+                               p.Y() + _PRUNE_EPS * d.Y(),
+                               p.Z() + _PRUNE_EPS * d.Z()), 1e-6)
+            a = cls.State() == TopAbs_IN
+            cls.Perform(gp_Pnt(p.X() - _PRUNE_EPS * d.X(),
+                               p.Y() - _PRUNE_EPS * d.Y(),
+                               p.Z() - _PRUNE_EPS * d.Z()), 1e-6)
+            b = cls.State() == TopAbs_IN
+        except Exception:
+            continue
+        if not a and not b:
+            cands.append(f)
+    if not cands:
+        return shape, []
+
+    # ---- ② 分类：孔口膜（cap）vs 普通膜（plain） ----
+    amap = TopTools_IndexedDataMapOfShapeListOfShape()
+    topexp.MapShapesAndAncestors(work, TopAbs_EDGE, TopAbs_FACE, amap)
+    all_faces: list[Any] = []
+    fexp = TopExp_Explorer(work, TopAbs_FACE)
+    while fexp.More():
+        all_faces.append(topods.Face(fexp.Current()))
+        fexp.Next()
+    caps: list[tuple[Any, Any, Any]] = []      # (膜, 圆棱, 宿主)
+    plain: list[Any] = []
+    for f in cands:
+        rim = _cap_rim(f)
+        wall = None
+        if rim is not None:
+            for g in _faces_of_edge(amap, rim):
+                if g.IsSame(f):
+                    continue
+                try:
+                    if BRepAdaptor_Surface(g).GetType() != GeomAbs_Plane:
+                        wall = g
+                        break
+                except Exception:
+                    continue
+        host = _cap_host(rim, f, wall, all_faces) if wall is not None else None
+        if host is None:
+            plain.append(f)
+        else:
+            caps.append((f, rim, host))
+
+    # ---- ③ cap 阶段：挪棱 → 重建宿主 → 删膜 ----
+    cur = shape
+    handled: list[Any] = []
+    if caps:
+        host_rims: list[tuple[Any, list[Any]]] = []
+        for cf, rim, hf in caps:
+            try:
+                z_h = BRepAdaptor_Surface(hf).Plane().Location().Z()
+                _lift_rim_to(rim, z_h)
+            except Exception:
+                print("  [清洁] 孔口膜圆棱挪移失败 —— cap 阶段整批放弃")
+                return shape, []
+            ent = None
+            for x in host_rims:
+                if x[0].IsSame(hf):
+                    ent = x
+                    break
+            if ent is None:
+                ent = (hf, [])
+                host_rims.append(ent)
+            ent[1].append(rim)
+        replace = []
+        for hf, rims in host_rims:
+            nf = _rebuild_host_face(hf, rims)
+            if nf is None:
+                print("  [清洁] 孔口膜宿主面重建失败 —— cap 阶段整批放弃")
+                return shape, []
+            replace.append((hf, nf))
+        cand_a = _rebuild_shells(work, [c for c, _, _ in caps], replace)
+        ok, desc = _prune_guard(shape, cand_a)
+        if ok:
+            cur = cand_a
+            handled.extend(c for c, _, _ in caps)
+            print(f"  [清洁] 孔口膜 {len(caps)} 张 → 圆棱并入宿主内环后删膜"
+                  f"（宿主 {len(replace)} 张；{desc}）")
+        else:
+            print(f"  [清洁] 孔口膜 {len(caps)} 张清理护栏不过（{desc}）"
+                  f"—— cap 阶段整批回滚")
+            return shape, []
+
+    # ---- ④ plain 阶段：普通膜直接删（失败只回滚本阶段） ----
+    if plain:
+        cand_b = _rebuild_shells(cur, plain, [])
+        ok, desc = _prune_guard(cur, cand_b)
+        if ok:
+            cur = cand_b
+            handled.extend(plain)
+            print(f"  [清洁] 普通悬空膜 {len(plain)} 张已删（{desc}）")
+        else:
+            print(f"  [清洁] 普通悬空膜 {len(plain)} 张护栏不过（{desc}）"
+                  f"—— plain 阶段回滚（保持原样）")
+    return cur, handled
 
 
 # ---------------------------------------------------------------------------
@@ -1496,6 +2014,20 @@ def build_shape(part: Part, *, validate: bool = True,
         print(f"  [OK] #{f.id:<3} {f.type.value:8} {info}")
     if shape is None:
         raise OccBuildError("建模结束但没有任何实体")
+    if os.environ.get("REBUILD_NO_PRUNE", "").strip().lower() not in ("1", "true", "yes"):
+        shape, pruned = _prune_dangling_faces(shape)
+        if pruned:
+            where = []
+            for f in pruned[:12]:
+                box = Bnd_Box()
+                brepbndlib.AddOptimal(f, box, False, False)
+                x0, y0, z0, x1, y1, z1 = box.Get()
+                where.append(f"({(x0 + x1) / 2:.1f},{(y0 + y1) / 2:.1f},"
+                             f"{(z0 + z1) / 2:.1f})")
+            tail = " 等" if len(pruned) > 12 else ""
+            print(f"  [清洁] 剔除 {len(pruned)} 张寄生悬空面"
+                  f"（两侧皆 OUT 的平面膜，布尔残留；实体材料未变）："
+                  f"面心 {' '.join(where)}{tail}")
     return shape
 
 
