@@ -43,7 +43,13 @@ from src.rebuild.conventions import (                                    # noqa:
 )
 from src.rebuild.conventions import registry as REG                      # noqa: E402
 from src.rebuild.conventions.section import _classify                    # noqa: E402
-from src.rebuild.model import Claim, OpenQuestion, Tier, merge           # noqa: E402
+from src.rebuild.model import (                                          # noqa: E402
+    Claim,
+    OpenQuestion,
+    QuestionList,
+    Tier,
+    merge,
+)
 from src.rebuild.model.feature_tree import (                             # noqa: E402
     ConstraintType,
     Feature,
@@ -1793,6 +1799,175 @@ def test_features() -> None:
     check("非剖帧 span 全覆盖 ⇒ 过（盘 r145 [2484.3,2504.3] 形态）",
           ok_disc is True)
     check("剖面帧（在 mats 里）不算支持票——空非剖 ⇒ 拒", ok_none is False)
+
+
+    # ---- H12 轴向起点绑定（P1-A）：span 在图纸系，发射系可能要平移 ----
+    # 通用性盲测 P0 的结论：7/7 held-out 件的孔/凸台都缺 axial_at ⇒ 发射器
+    # 静默按 0 起（IMU 基体 y101..121，一个孔也没切中）。这一组的四条不变式：
+    #   ① 轮廓对 span ⇒ axial_at（图纸系）；
+    #   ② 回转体基体的轴向发射系从 0 起 ⇒ span 必须平移（否则法兰练习的
+    #      Ø10 通孔落到 1786 之外，切出零厚度圆盘 = 静默不切）；
+    #   ③ 棱柱基体的两套系重合 ⇒ 不平移；
+    #   ④ 没有依据的盲孔/凸台 ⇒ 拦路，不许交给发射器按 0 起。
+    from src.rebuild.features.recognizer import (
+        _axis_shift,
+        _base_emit_range,
+        bind_axial_positions,
+    )
+    from types import SimpleNamespace as _NS
+
+    def _frame12(vid, u_axis, u_span, v_axis, v_span, p_axis):
+        spans = {u_axis: u_span, v_axis: v_span}
+        return _NS(view_id=vid, u_axis=u_axis, v_axis=v_axis, p_axis=p_axis,
+                   model_span=lambda a: spans.get(a))
+
+    # 前视图 v=z 复刻法兰练习：图纸 z 1786.7..1806.7；俯视图给 x/y 跨度
+    corr12 = _NS(frames={
+        "V1": _frame12("V1", "x", (-40.0, 40.0), "z", (1786.706984, 1806.706984), "y"),
+        "V0": _frame12("V0", "x", (-40.0, 40.0), "y", (-40.0, 40.0), "z"),
+    })
+    ev12 = ("b0",)
+
+    def _rev_base12():
+        return Feature(
+            id=FeatureId(0),
+            type=Claim(FeatureType.REVOLVE, "t", Tier.PROJECTION, ev12),
+            params={
+                "dir": Claim("z", "t", Tier.PROJECTION, ev12),
+                "angle_deg": Claim(360.0, "t", Tier.PROJECTION, ev12),
+                "radius_profile": Claim([(0.0, 40.0), (20.0, 40.0)], "t",
+                                        Tier.PROJECTION, ev12),
+                "origin": Claim(Point3(0.0, 0.0, 0.0), "t",
+                                Tier.PROJECTION, ev12),
+            },
+            axis=Claim(Axis3(Point3(0.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0)),
+                       "t", Tier.PROJECTION, ev12),
+        )
+
+    base_r = _rev_base12()
+    check("回转体基体的轴向发射区间 0..20（origin 沿轴分量恒 0）",
+          _base_emit_range(base_r, "z") == (0.0, 20.0),
+          str(_base_emit_range(base_r, "z")))
+    check("图纸系→发射系平移 = 0 − 1786.707（只沿自身轴）",
+          abs(_axis_shift(base_r, corr12, "z") + 1786.706984) < 1e-6
+          and _axis_shift(base_r, corr12, "x") == 0.0,
+          f"dz={_axis_shift(base_r, corr12, 'z')}")
+
+    def _hole12(fid, **params):
+        return Feature(
+            id=FeatureId(fid),
+            type=Claim(FeatureType.HOLE, "t", Tier.PROJECTION, ("h1",)),
+            params=params,
+            axis=Claim(Axis3(Point3(10.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0)),
+                       "t", Tier.PROJECTION, ("h1",)),
+        )
+
+    # ①+② span 读出的起点（图纸系 1786.707）必须平移到发射系 0
+    part12 = Part(features=[
+        base_r,
+        _hole12(1, radius=Claim(5.0, "t", Tier.PROJECTION, ("h1",)),
+                through=Claim(False, "t", Tier.PROJECTION, ("h1",)),
+                depth=Claim(20.0, "t", Tier.PROJECTION, ("h1",)),
+                axial_at=Claim(1786.706984, "projection:outline_pair_span",
+                               Tier.PROJECTION, ("h1",))),
+        # ③ 通孔无 span ⇒ 取基体材料端（发射系 0），不是图纸端 1786.7
+        _hole12(2, radius=Claim(5.0, "t", Tier.PROJECTION, ("h2",)),
+                through=Claim(True, "t", Tier.PROJECTION, ("h2",))),
+    ])
+    rep12 = _NS(questions=QuestionList(), notes=[])
+    bind_axial_positions(part12, rep12, corr12)
+    check("span 起点随回转体基体平移：1786.707 → 0（法兰练习 Ø10 通孔形态）",
+          abs(part12.by_id(FeatureId(1)).params["axial_at"].value) < 1e-6,
+          str(part12.by_id(FeatureId(1)).params["axial_at"]))
+    check("通孔无 span ⇒ 取基体材料端 0（derived:through_base_span）",
+          part12.by_id(FeatureId(2)).params["axial_at"].value == 0.0
+          and part12.by_id(FeatureId(2)).params["axial_at"].method
+          == "derived:through_base_span",
+          str(part12.by_id(FeatureId(2)).params["axial_at"]))
+    check("通孔补齐不报拦路（几何推论有依据）",
+          not rep12.questions.by_kind(OpenQuestion.MISSING_DIMENSION),
+          str(rep12.questions.items))
+
+    # ③ 棱柱基体：origin 即图纸跨度下界 ⇒ 平移量 0、通孔锚 = 101（IMU 形态）
+    base_p = Feature(
+        id=FeatureId(0),
+        type=Claim(FeatureType.BASE, "t", Tier.PROJECTION, ev12),
+        params={
+            "dir": Claim("y", "t", Tier.PROJECTION, ev12),
+            "length": Claim(20.0, "t", Tier.PROJECTION, ev12),
+            "profile": Claim([(40.0, 30.0)], "t", Tier.PROJECTION, ev12),
+            "origin": Claim(Point3(2.0, 101.0, 2.0), "t",
+                            Tier.PROJECTION, ev12),
+        },
+    )
+    corr_p = _NS(frames={
+        "V1": _frame12("V1", "x", (2.0, 42.0), "y", (101.0, 121.0), "z"),
+        "V0": _frame12("V0", "x", (2.0, 42.0), "z", (2.0, 32.0), "y"),
+    })
+    check("棱柱基体：两套系重合（平移 0）",
+          _axis_shift(base_p, corr_p, "y") == 0.0,
+          str(_axis_shift(base_p, corr_p, "y")))
+    part_p = Part(features=[
+        base_p,
+        # 轴沿基体方向 y（_hole12 固定给 +z，这里单独建）
+        Feature(
+            id=FeatureId(3),
+            type=Claim(FeatureType.HOLE, "t", Tier.PROJECTION, ("h3",)),
+            params={"radius": Claim(4.0, "t", Tier.PROJECTION, ("h3",)),
+                    "through": Claim(True, "t", Tier.PROJECTION, ("h3",))},
+            axis=Claim(Axis3(Point3(22.0, 0.0, 43.0), Vector3(0.0, 1.0, 0.0)),
+                       "t", Tier.PROJECTION, ("h3",)),
+        ),
+    ])
+    rep_p = _NS(questions=QuestionList(), notes=[])
+    bind_axial_positions(part_p, rep_p, corr_p)
+    check("棱柱基体通孔锚 = 基体材料低端 101（IMU y101..121 形态）",
+          part_p.by_id(FeatureId(3)).params["axial_at"].value == 101.0,
+          str(part_p.by_id(FeatureId(3)).params["axial_at"]))
+
+    # ⑤ 通孔哨兵 axial_at=0.0（callouts 的"下界不拘"）也要换成真实锚：
+    #    图纸原点落在材料内部/负半轴时，0.0 会把通孔切成半截
+    part_s = Part(features=[
+        base_p,
+        Feature(
+            id=FeatureId(5),
+            type=Claim(FeatureType.HOLE, "t", Tier.PROJECTION, ("h5",)),
+            params={"radius": Claim(4.0, "t", Tier.PROJECTION, ("h5",)),
+                    "through": Claim(True, "convention:no_depth_means_through",
+                                     Tier.CONVENTION, ("h5",)),
+                    "axial_at": Claim(0.0, "convention:no_depth_means_through",
+                                      Tier.CONVENTION, ("h5",))},
+            axis=Claim(Axis3(Point3(22.0, 0.0, 43.0), Vector3(0.0, 1.0, 0.0)),
+                       "t", Tier.PROJECTION, ("h5",)),
+        ),
+    ])
+    rep_s = _NS(questions=QuestionList(), notes=[])
+    bind_axial_positions(part_s, rep_s, corr_p)
+    ax_s = part_s.by_id(FeatureId(5)).params["axial_at"]
+    check("通孔哨兵 0.0 → 基体材料端 101（切穿语义不变、不再依赖原点巧合）",
+          ax_s.value == 101.0
+          and ax_s.method == "derived:through_base_span",
+          str(ax_s))
+
+    # ④ 盲孔无依据 ⇒ 拦路（发射器的 0 默认不是读数）
+    part_b = Part(features=[
+        base_p,
+        Feature(
+            id=FeatureId(4),
+            type=Claim(FeatureType.HOLE, "t", Tier.PROJECTION, ("h4",)),
+            params={"radius": Claim(4.0, "t", Tier.PROJECTION, ("h4",)),
+                    "through": Claim(False, "t", Tier.PROJECTION, ("h4",)),
+                    "depth": Claim(10.0, "t", Tier.PROJECTION, ("h4",))},
+            axis=Claim(Axis3(Point3(22.0, 0.0, 43.0), Vector3(0.0, 1.0, 0.0)),
+                       "t", Tier.PROJECTION, ("h4",)),
+        ),
+    ])
+    rep_b = _NS(questions=QuestionList(), notes=[])
+    bind_axial_positions(part_b, rep_b, corr_p)
+    qb = rep_b.questions.by_kind(OpenQuestion.MISSING_DIMENSION)
+    check("盲孔没有轴向起点 ⇒ 报拦路 MISSING_DIMENSION（不按 0 起）",
+          "axial_at" not in part_b.by_id(FeatureId(4)).params
+          and any("#4.axial_at" in q.detail for q in qb), str(qb))
 
 
 # ---- 阶段 4：汇流（理解层；发射层要 OCC/SW，见 emit 自己的 --demo） ----

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
      HEAD 落后 tag 18 个提交，簿记见"版本号同步"节）。本轮复核修正：ruff 基线
      155→158（F401 +2 / F841 +1）、根目录 `_*.py` 计数 444→550（`_*.log` 19→22）、
      版本字面量按实际计 9 处、CHANGELOG 覆盖范围补到 v0.6.37；其余声明
-     （selftest 439 项、环境表/PyQt6 缺失、CAD/ 51 个 .bas、tests/ 空、
+     （selftest 448 项、环境表/PyQt6 缺失、CAD/ 51 个 .bas、tests/ 空、
      sw_constants.py 55 行、gitignore 行号）逐项实测无误。本次未重跑 OCC 验收表
      （其 9 绿引自 v0.6.36/v0.6.37 提交记录） -->
 
@@ -341,7 +341,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 99.5%+ 时局部可见缺陷仍零命中（bracket 三缺陷、YZYX 五处标记全靠目视）——
 历史缺陷已转成自动断言，**每次修复的例行检查序列**：
 
-1. `python -m src.rebuild.selftest` — 439 项
+1. `python -m src.rebuild.selftest` — 448 项
 2. `PYTHONIOENCODING=utf-8 $PY run_rebuild_acceptance.py` — 9 绿 + 体积/bbox
    阈值判红（0.5%/1mm，仅 expect=="ok"）+ bracket 缺陷盒·点断言（PROBES 表：
    三缺陷盒 + 凸台右弧两盒 + 3 点分类；gold/shift 2026-10-11 定标实测，
@@ -653,6 +653,36 @@ HATCH**、分区 u 投影区间内 4 层材料覆盖率 ≤2%、同高度带**�
 （`(14.5,187.5)->(137.5,122.5)` maxd=15.1）。当前评分：TL 缺 56/多 63、
 BL 缺 150/多 116、TR 缺 47/多 64；非拦路疑问（V1 剖切面、塔顶三孔族、
 #7 的 depth 48.25 疑误）不变。
+**v0.6.38 通用性盲测 P0**：`run_generalization_benchmark.py`（**诊断仪**，
+不判红绿）用 **held-out 4 件 7 用例**（D79307 / IMU / 轴测量 / spoon，各配
+剖面版）跑默认管线：**0/7 命中**、4 个 blocked（正确拒绝）、**3 个 gate
+放行的静默错误**（IMU +10.05%、轴测量 +166.96%、轴测量-剖面 +29.54%）。
+根因是**基本层**而非词汇缺口：①`axial_at` 7/7 全缺（发射器默默按 0 起）
+②基体轮廓视图选择不鲁棒（轴测量取俯视图 V0 → bbox +20/+116、D79307
+`no_ring_found`、spoon `coverage(0.27×0.50)<0.75`）③gate 拦不住这两类。
+详见 `docs/GENERALIZATION_20261017.md`。
+**v0.6.39 P1-A 轴向起点绑定**（`recognizer.bind_axial_positions`，`recognize`
+末尾、`derive_through` 之后）：①`CylinderHint.span` 换算到模型系直接写
+`axial_at`（`projection:outline_pair_span`，PROJECTION）；②通孔无 span ⇒
+取**基体材料区间**里与 +轴向相反那一端（`derived:through_base_span`，证据
+借基体的 —— `Claim` 不变式要求 DERIVED 带证据）；③盲孔/凸台无依据 ⇒ 拦路
+`MISSING_DIMENSION`，不许交给发射器按 0 起；④callouts 的通孔哨兵 0.0
+（`_THROUGH_START`）也换锚（图纸原点落在材料内部/负半轴时 0.0 会把通孔切成
+半截）。⚠️ **坐标系陷阱**：span 是**图纸系**坐标，而 `_revolve_base` 的母线
+沿轴坐标写死 0 起（origin 沿轴分量来自 `to_model`，恒 0）⇒ 回转体基体的
+发射系相对图纸系有一个轴向平移（实测法兰练习前视图 v=1786.7..1806.7、发射
+基体 0..20；不补平移，通孔 `t_lo=min(1786.7, t_hi≈20)−eps` 退化成零厚度
+圆盘 = 静默不切）。`_axis_shift` 只在**回转体自身轴向**上非 0，且只平移
+`_DRAWING_SPAN_METHODS`（span 读数）的 claim；分区切/剖面标题/标注与基体
+同源，不动。**实测**：IMU +10.05%→+8.63%、IMU-剖面 +3.90%→+2.47%、
+D79307 +540.83%→+537.70%、轴测量 +166.96%→+158.07%、轴测量-剖面 +29.54%
+→+27.60%；发射日志"没有 axial_at ⇒ 按 0 起"**零出现**。IMU 残余由逐 1mm
+薄板（`_probe_imu_slabs.py`）定位为**未读出的内部腔体**（y 相对 3..10 每板
++138.3、11..19 每板 +188.6）+ 三个小孔读浅 1mm，与轴向位置无关；轴测量
+bbox +20 仍是 P1-B 的视图选择。回归：OCC 表 9 绿逐位不变、YZYX 重建
+8,544,416.1 逐位持平、selftest 439→448（H12 八条）。**下一堵墙 = P1-B**
+（基体轮廓视图选择 + 环鲁棒性）→ P1-C（gate 扩展，消灭静默错误）→ P1-D
+（发射器 B-rep）。
 ✅ 无基准三件套（`yz_accept.py`：27
 材料点 + 五视图 HLR 评分）建在 **v15a 零件系**上（探针点、`yz_hlr.SPLIT_X=−96.5`
 都是零件系常量），新框架模型在**图纸坐标系**——2026-10-13 **零件系变换已落地**
@@ -677,7 +707,7 @@ linetype 断裂/虚线/**细实线**、section 剖切种类/材料（v0.6.31 起
 （「c 向」标题 + 剖面线覆盖比 <0.9 ⇒ local）、细实线=被盖轮廓（Role.THIN，
 环提取只认 VISIBLE 自动排除）、DIMENSION「数值↔几何锚点」配对（tier=ANNOTATED），
 实测 YZYX C—C 定性 section/scope=local、52 条尺寸 45 锚上、20/3/120 逐位吻合）、
-`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **material** HATCH 材料判据工具箱）、`verify/`（compare/coverage/
+`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **material** HATCH 材料判据工具箱 + **`recognizer.bind_axial_positions` 轴向起点收口**（v0.6.39 P1-A：span→axial_at / 通孔按基体材料端 / 盲孔无依据拦路 / 回转体轴向平移））、`verify/`（compare/coverage/
 gate/step_probe/box_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
 step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
@@ -685,7 +715,7 @@ step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 439 项自检（2026-10-17 剖面补扫/塔腔后实测），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 448 项自检（2026-10-17 P1-A 轴向绑定后实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
@@ -895,7 +925,13 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   （`git rev-list --count v0.6.25..HEAD`）、版本字面量 9 处仍为 0.6.25。
   本文件已含 v0.6.32~v0.6.37 正文（§C6 第三~第六刀、孔口膜清理、剖面材料
   反证），CHANGELOG / ASSESSMENT 各配一节；selftest 439 项、OCC 验收表
-  9 绿逐位不变（v0.6.36/v0.6.37 提交记录，本次复核未重跑））
+  9 绿逐位不变（v0.6.36/v0.6.37 提交记录，本次复核未重跑）
+  （2026-10-17 续：**通用性转向**——v0.6.38（b857d93）建 held-out 盲测
+  诊断仪 `run_generalization_benchmark.py` + `docs/GENERALIZATION_20261017.md`
+  （7 用例 0 命中、3 个静默错误）；v0.6.39（P1-A 轴向起点绑定）重跑 OCC 表
+  **9 绿逐位不变**、YZYX 8,544,416.1 逐位持平、selftest **448 项**，CHANGELOG
+  配 v0.6.38/v0.6.39 两节。至此 tag 落后 HEAD **20 个提交**、版本字面量仍
+  0.6.25，待下次发版一并 bump）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。

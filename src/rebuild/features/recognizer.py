@@ -854,6 +854,16 @@ def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
         params: dict[str, Claim] = {}
         if hint.axis.radius is not None:
             params["radius"] = hint.axis.radius
+        if hint.span is not None and hint.span[1] > hint.span[0]:
+            # 轴向位置（P1-A）：轮廓对的 span 是"从哪儿到哪儿"的实测区间，
+            # 换算到模型系后直接就是轴向起点。契约：HOLE 的 axial_at = 孔口、
+            # BOSS 的 axial_at = 凸台起始处 —— 两者的几何区间都是 [lo, hi]，
+            # 而轴向单位向量恒为 +轴（correspondence 的 dirs 表），故取 lo。
+            # 不写它，发射器只能按 0 起：held-out 件上孔全部落到零件外
+            # （IMU 基体 y101..121，孔按 0 起 → 一个也没切中）。
+            params["axial_at"] = mk_claim(
+                hint.span[0], "projection:outline_pair_span",
+                Tier.PROJECTION, ev)
         if hint.length is not None:
             params["height" if t.value == FeatureType.BOSS else "depth"] = mk_claim(
                 hint.length, "projection:outline_pair", Tier.PROJECTION, ev)
@@ -1301,12 +1311,245 @@ def derive_through(part: Part, rep: RecognizeReport) -> None:
             "暂按通孔、备选盲孔")
 
 
+#: ``axial_at`` 里**坐标在图纸系**的那几种方法（P1-A 平移的适用表）。
+#: 反例（本表绝不收录）：``height:zone_cut`` / ``projection:side_axis_span``
+#: （高度分解只在棱柱基体上跑，发射系与图纸系重合）、``revolve:*`` /
+#: ``axis_bore:*`` / ``side_axis:*``（本来就按发射系/轴系写）、
+#: ``derived:through_base_span``（本函数刚写的，已是发射系）。
+_DRAWING_SPAN_METHODS = frozenset({
+    "projection:outline_pair_span",     # cylinder_features 的轮廓对
+    "projection:outline_pair",          # callouts 本圆轮廓对
+    "callout:group_span",               # callouts 组内传播
+    "zone:concentric_mouth",            # 孔口=同心分区顶面（图纸系读数）
+})
+
+#: ``axial_at`` 是**切刀下界哨兵**而不是读数的方法（通孔"下界不拘"那条路）。
+#: 它们原先一律写 0.0（``callouts._THROUGH_START``）——在图纸原点落在材料
+#: 内部、或材料全在负半轴时，发射器的 ``t_lo = min(t0, t_hi−EPS)−EPS``
+#: 会把"通孔"切成半截（只剩 t0 以上的材料被去掉）。故这里把它们换成
+#: **基体材料端**（同一套 ``_base_emit_range``），几何上严格等价于"切穿"。
+_THROUGH_SENTINEL_METHODS = frozenset({
+    "convention:no_depth_means_through",
+    "annotation:hole_callout",
+})
+
+
 def _axis_name(d: Vector3) -> str:
     for name, v in (("+X", (1, 0, 0)), ("−X", (-1, 0, 0)), ("+Y", (0, 1, 0)),
                     ("−Y", (0, -1, 0)), ("+Z", (0, 0, 1)), ("−Z", (0, 0, -1))):
         if max(abs(d.x - v[0]), abs(d.y - v[1]), abs(d.z - v[2])) < 1e-6:
             return name
     return f"({d.x:.2f},{d.y:.2f},{d.z:.2f})"
+
+
+def _total_span(corr, axis: str) -> tuple[float, float] | None:
+    """零件在某个模型轴上的总跨度（所有视图给出的最大值）。"""
+    spans = [f.model_span(axis) for f in corr.frames.values()]
+    spans = [s for s in spans if s is not None]
+    if not spans:
+        return None
+    return (min(s[0] for s in spans), max(s[1] for s in spans))
+
+
+def _coord(p: Point3, axis: str) -> float:
+    return float({"x": p.x, "y": p.y, "z": p.z}[axis])
+
+
+def _base_emit_range(base: Feature | None, axis: str
+                     ) -> tuple[float, float] | None:
+    """基体在**发射坐标系**里沿某个模型轴的材料区间 (lo, hi)。
+
+    这张表是 P1-A 的锚：特征树的轴向坐标必须和基体在同一坐标系里。
+    两种基体的口径不同（这是既有实现，不是本函数引入的）：
+
+    * **BASE（棱柱）**：``origin`` 就是图纸系里的轮廓角点，profile 坐标
+      相对它 ⇒ 发射坐标 = 图纸坐标，平移量 0。
+    * **REVOLVE（回转体）**：``radius_profile`` 的沿轴坐标**相对轴原点**，
+      而 ``_revolve_base`` 的轴原点沿轴分量恒为 0 ⇒ 基体总落在 0 起，
+      图纸里的轴向偏移（实测法兰练习前视图 v=1786.7..1806.7）没有带进来。
+      两者的差就是需要的平移量；不补，span 读出的 ``axial_at`` 会落到
+      零件外（法兰练习的 Ø10 通孔会被切成零厚度圆盘）。
+
+    回转体的径向轴：材料区间 = 轴原点 ± 母线最大半径（母线绕轴回转）。
+    """
+    if base is None:
+        return None
+    if base.type.value == FeatureType.REVOLVE.value:
+        prof = base.params.get("radius_profile")
+        ax = base.axis.value if base.axis is not None else None
+        if prof is None or ax is None:
+            return None
+        name = _axis_name(ax.direction)
+        if name[:1] not in "+−":
+            return None
+        ax_axis = name[-1].lower()
+        pts = [(float(t), float(r)) for t, r in prof.value]
+        if axis == ax_axis:
+            sgn = 1.0 if name.startswith("+") else -1.0
+            o = _coord(ax.origin, axis)
+            vals = [o + sgn * t for t, _ in pts]
+            return (min(vals), max(vals))
+        rmax = max(r for _, r in pts)
+        o = _coord(ax.origin, axis)
+        return (o - rmax, o + rmax)
+    if base.type.value != FeatureType.BASE.value:
+        return None
+    dirn = base.params.get("dir")
+    org = base.params.get("origin")
+    length = base.params.get("length")
+    if dirn is None or org is None or length is None:
+        return None
+    dirn = dirn.value
+    org = org.value
+    if axis == dirn:
+        o = _coord(org, axis)
+        return (o, o + float(length.value))
+    b1, b2 = _PLANE_AXES[dirn]
+    if axis not in (b1, b2):
+        return None
+    prof = base.params.get("profile")
+    if prof is None:
+        return None
+    if isinstance(prof.value, Profile2):
+        bb = prof.value.bbox()
+        rng = (bb.xmin, bb.xmax) if axis == b1 else (bb.ymin, bb.ymax)
+    else:
+        w1, w2 = profile_span(prof.value)
+        rng = (0.0, w1) if axis == b1 else (0.0, w2)
+    o = _coord(org, axis)
+    return (o + rng[0], o + rng[1])
+
+
+def _axis_shift(base: Feature | None, corr, axis: str) -> float:
+    """图纸系 → 发射系的轴向平移量（基体区间低端之差）。
+
+    只在**回转体基体的轴向**上非 0（``_revolve_base`` 把沿轴坐标写成 0 起，
+    图纸里的轴向偏移没有带进发射系）。两条"必为 0"的情形要显式返回 0，
+    不能靠区间相减碰运气：
+
+    * 棱柱基体：``origin`` 就取图纸跨度下界（``ir_point(…, lo1, lo2, t_lo)``）
+      ⇒ 两套系本来就重合；
+    * 回转体的**径向**轴：``origin`` 的径向坐标来自 ``to_model`` 换算，
+      仍是图纸系 ⇒ 两套系也重合（用总区间相减反而会被"轴外还有别的特征"
+      拉出假平移）。
+    """
+    if base is None or base.type.value != FeatureType.REVOLVE.value:
+        return 0.0
+    ax = base.axis.value if base.axis is not None else None
+    if ax is None:
+        return 0.0
+    name = _axis_name(ax.direction)
+    if name[:1] not in "+−" or name[-1].lower() != axis:
+        return 0.0
+    draw = _total_span(corr, axis)
+    emit = _base_emit_range(base, axis)
+    if draw is None or emit is None:
+        return 0.0
+    return emit[0] - draw[0]
+
+
+def bind_axial_positions(part: Part, rep: RecognizeReport, corr) -> None:
+    """轴向起点收口（P1-A）：每条 HOLE/BOSS 的 ``axial_at`` 都必须在发射系。
+
+    三件事，按证据强弱依次做：
+
+    1. **平移**：识别期由轮廓对 span 读出的起点是**图纸系**坐标；回转体基体
+       的发射系相对图纸系有一个轴向平移（``_axis_shift``）。不补这一步，
+       法兰练习的 Ø10 通孔会被切到 1786 之外（旧行为"按 0 起"恰好落在
+       发射系的 0，是巧合而不是读数）。
+    2. **通孔补齐起点**：材料必在孔口的 +轴向 一侧（发射器契约），故起点取
+       基体材料区间里与 +轴向相反的那一端 —— 几何推论（tier=DERIVED），
+       不是"默认 0"。实测 IMU 基体在 y101..121，通孔按 0 起时一个也没切中
+       材料（+10.05% 静默错误的主因）。
+    3. **盲孔 / 凸台无依据 ⇒ 拦路**：没有 span 就没有孔口/起始处，按 §3
+       原则二报疑问，不许交给发射器按 0 起（那会把孔切到零件外、把凸台
+       长到空气里）。
+
+    轴向非主轴（斜孔）时区间表里没有可用行 —— 只记账，不改。
+    """
+    base = next((f for f in part.features
+                 if f.type.value in (FeatureType.BASE.value,
+                                     FeatureType.REVOLVE.value)), None)
+    for f in part.features:
+        if f.type.value not in (FeatureType.HOLE.value, FeatureType.BOSS.value):
+            continue
+        ax = f.axis.value if f.axis is not None else None
+        if ax is None:
+            continue
+        name = _axis_name(ax.direction)
+        if name[:1] not in "+−":
+            continue                     # 斜轴：跨度/基体区间都无定义
+        axis = name[-1].lower()
+        # DERIVED 级必须带证据（Claim 不变式）：特征自己没有就借基体的 ——
+        # "材料从哪儿起"本来就是基体读出来的
+        ev = tuple(f.evidence[:1]) or (tuple(base.evidence[:1]) if base else ())
+
+        cur = f.params.get("axial_at")
+        if cur is not None:
+            th = f.params.get("through")
+            through = bool(th.value) if th is not None else False
+            if through and cur.method in _THROUGH_SENTINEL_METHODS:
+                # 通孔哨兵（0.0）⇒ 换成基体材料端：几何等价于"切穿"，
+                # 但不再依赖"图纸原点恰在材料外侧"这个未言明的巧合
+                emit = _base_emit_range(base, axis)
+                if emit is not None:
+                    val = emit[0] if name.startswith("+") else emit[1]
+                    if abs(float(cur.value) - val) > 1e-9:
+                        f.params["axial_at"] = Claim(
+                            val, "derived:through_base_span",
+                            Tier.DERIVED if ev else Tier.GUESS, ev)
+                        rep.notes.append(
+                            f"#{f.id} 通孔切刀下界由哨兵 {float(cur.value):g}"
+                            f" 换成基体材料端 {val:.2f}（derived:through_base_span）")
+                continue
+            # 只有"从图纸系读出的 span"需要平移；分区切/剖面标题/标注
+            # 各自已经与基体同源，不动（避免二次平移）
+            if cur.method in _DRAWING_SPAN_METHODS:
+                shift = _axis_shift(base, corr, axis)
+                if abs(shift) > 1e-9:
+                    val = float(cur.value) + shift
+                    alts = tuple(
+                        float(a) + shift if isinstance(a, (int, float)) else a
+                        for a in cur.alternatives)
+                    f.params["axial_at"] = Claim(
+                        val, cur.method, cur.tier, cur.evidence,
+                        tuple(a for a in alts if a != val))
+                    rep.notes.append(
+                        f"#{f.id} 轴向起点图纸系 {float(cur.value):.2f}"
+                        f" → 发射系 {float(cur.value) + shift:.2f}"
+                        f"（回转体基体的轴向平移 {shift:+.2f}）")
+            continue
+
+        if f.type.value == FeatureType.HOLE.value:
+            th = f.params.get("through")
+            through = bool(th.value) if th is not None else False
+            if through:
+                emit = _base_emit_range(base, axis)
+                if emit is not None:
+                    # t = (p−o)·d：d 指向 +轴 ⇒ 起点取低端；d 指向 −轴 ⇒ 取高端
+                    val = emit[0] if name.startswith("+") else emit[1]
+                    f.params["axial_at"] = Claim(
+                        val, "derived:through_base_span",
+                        Tier.DERIVED if ev else Tier.GUESS, ev)
+                    rep.notes.append(
+                        f"#{f.id} 通孔没有轮廓对 span ⇒ 轴向起点取基体材料端 "
+                        f"{val:.2f}（{name} 向，derived:through_base_span）")
+                else:
+                    rep.notes.append(
+                        f"#{f.id} 通孔没有轮廓对 span，基体区间也取不到 ⇒ "
+                        "发射器按 0 起（未消除的缺口）")
+                continue
+
+        # 盲孔 / 凸台：起点无依据 ⇒ 拦路（发射器的 0 默认不是读数）
+        what = "孔口" if f.type.value == FeatureType.HOLE.value else "凸台起始处"
+        detail = (f"#{f.id}.axial_at：{'盲孔' if f.type.value == FeatureType.HOLE.value else '凸台'}"
+                  f"的{what}位置图上没有读出（无轮廓对 span / 无分区切 / 无标注）"
+                  f"—— 按 0 起会把特征放到零件外")
+        key = f"#{f.id}.axial_at"
+        if not any(key in q.detail for q in rep.questions):
+            rep.questions.add(Question(
+                OpenQuestion.MISSING_DIMENSION, detail,
+                view=f.source_view, evidence=ev))
 
 
 # ---- 4) 约定：阵列 / 螺纹 / 对称 ----
@@ -1627,6 +1870,8 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
         rep.notes.append("螺纹标注已挂到对应孔上")
     # 通孔/盲孔必须等剖面标题那一路也进树之后才能判（标题可能已明写「穿…」）
     derive_through(part, rep)
+    # 轴向起点收口（P1-A）：通孔取零件跨度端、盲孔/凸台无依据即拦路
+    bind_axial_positions(part, rep, corr)
     # 求解**在层内收尾**：先验/关系/欠定兜底共用同一个待确认清单，
     # 否则调用方忘了传 qs 就会重复报（求解层去重正是靠这份清单）
     rep.solved = solve(part, qs=questions)
@@ -1641,6 +1886,7 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
 
 __all__ = [
     "RecognizeReport", "axis_distance", "base_feature", "cylinder_features",
-    "derive_through", "merge_section_axes", "pattern_features", "recognize",
+    "derive_through", "bind_axial_positions", "merge_section_axes",
+    "pattern_features", "recognize",
     "symmetries", "thread_links",
 ]
