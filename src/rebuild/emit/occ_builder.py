@@ -555,6 +555,19 @@ def _bbox_of(shape: Any) -> tuple[tuple[float, float, float], tuple[float, float
     return (x1, y1, z1), (x2, y2, z2)
 
 
+def extents_of(shape: Any) -> tuple[float, float, float] | None:
+    """实体域三向尺寸 (dx, dy, dz)；没有实体则 None（发射后自检用）。
+
+    与 `_bbox_of` 同一口径（只并 SOLID、AddOptimal）—— 虚胖的盒子会把
+    "超出图纸跨度"的判据搅乱，这里必须和验收量尺一致。
+    """
+    bb = _bbox_of(shape)
+    if bb is None:
+        return None
+    lo, hi = bb
+    return (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2])
+
+
 def _check(shape: Any, f: Feature, validate: bool) -> None:
     """建完一个特征立刻自检：没有实体、或 B-rep 无效，都点名报错。"""
     if shape is None or shape.IsNull():
@@ -2079,8 +2092,21 @@ def build_step(part: Part, path: Path, *, validate: bool = True,
     SW 侧之所以要时间戳后缀，是因为 SW 进程会锁住文件导致保存失败；STEP 是
     普通文件写，调用方想覆盖就覆盖。**文件名由调用方负责唯一**。
     """
-    return write_step(build_shape(part, validate=validate,
-                                  allow_guess=allow_guess), Path(path))
+    return build_step_with_extents(part, path, validate=validate,
+                                   allow_guess=allow_guess)[0]
+
+
+def build_step_with_extents(part: Part, path: Path, *, validate: bool = True,
+                            allow_guess: bool = False
+                            ) -> tuple[Path, tuple[float, float, float] | None]:
+    """同 `build_step`，另外量一次**建出来的形状**的三向尺寸。
+
+    尺寸取自内存里的 shape（不必读回 STEP），供 `pipeline` 的发射后自检
+    （P1-C：模型 bbox vs 图纸跨度）用。量不了（没有实体）时尺寸为 None。
+    """
+    shape = build_shape(part, validate=validate, allow_guess=allow_guess)
+    ext = extents_of(shape)
+    return write_step(shape, Path(path)), ext
 
 
 def read_step_volume(path: Path) -> tuple[float, int]:

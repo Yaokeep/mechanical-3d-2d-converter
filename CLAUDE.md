@@ -65,7 +65,9 @@ PYTHONIOENCODING=utf-8 python run_rebuild_acceptance.py --sw [靶子...] # SW �
 
 # 通用性盲测表（P0 **诊断仪**，不判红绿）：held-out 件 → 特征树 → STEP，
 # 回答"框架是否只会做已参与开发的靶子"。2026-10-17 首跑 7 用例 **0 命中**、
-# 3 个 gate 放行的**静默错误**（IMU +10.05% / 轴测量 +166.96%）——
+# 4 个 gate 放行的**静默错误**；P1-A/B/C 后静默错误剩 2（D79307 +20.71% /
+# IMU +8.63%，均为"尺寸对、内容错"）。P1-C 起 gate 包含**发射后自检**
+# （模型 bbox vs 图纸视图跨度，INCONSISTENT_EXTENT），第 1 遍真的发射一次。
 # 结论与逐靶子根因见 docs/GENERALIZATION_20261017.md
 PYTHONIOENCODING=utf-8 $PY run_generalization_benchmark.py [--sections] [靶子...]
 
@@ -702,7 +704,29 @@ bbox +20 = **r20 半圆槽被读成 boss**（特征 #1 boss r20、轴沿 y、轴
 自基体右缘伸出）—— 特征角色问题，留 P1-C（gate 拦"发射 bbox 超出图纸视图跨度"）。
 回归：OCC 表 9 绿逐位不变、YZYX 8,544,416.1 逐位持平、selftest 448→**461**
 （H13 六条视图选择 + J7 七条胶合，含"raw 成功时 `_glue` 不跑"的破坏性证明）。
-**下一堵墙 = P1-C**（gate 扩展）→ P1-D（发射器 B-rep）。
+**v0.6.41 P1-C 发射后自检**：`pipeline.extent_questions` +
+`_extent_selfcheck` —— `rebuild(step=...)` 建完后拿**建出来的 B-rep 实体域
+bbox 尺寸**与**图纸各轴跨度并集**（`drawing_extents`，只取 `model_span`、
+断裂轴跳过）比，超出且无回转体半径包络（`_revolve_sizes`）可解释就记拦路
+疑问 `INCONSISTENT_EXTENT`；**非 force 时连同刚写出的 STEP/sldprt 一起删掉**
+（不留"图纸说没有这块材料"的模型），force 保留供诊断。只比尺寸不比绝对
+位置（发射系有平移，如回转体 `_axis_shift`）；容差 `max(1mm, 0.5%)`。
+为什么必须**发射后**：用特征树解析包围盒会在 PF60K 上误杀——Ø80 盘外伸后
+被帽切裁回 60 以内，解析式只看加材料必报超；也无法预知切除裁掉什么。
+为什么回转体豁免：PF60K 俯视图只画 60×60 方框，Ø80 盘边只在四个倒角缺口处
+露 r40 短弧、不撑视图 bbox（凸台/切除**没有**豁免——外伸必须画得出来）。
+发射器接口：`occ_builder.build_step_with_extents` → `emit.build_part_occ_
+with_extents` → `RebuildResult.emitted_extents`（进 `as_dict`）；SW 路径
+暂不自检（已知缺口）。**实测**：轴测量 +31.22% 与轴测量-剖面 −28.31% 由
+静默错误转 **blocked**（"X 向发射尺寸 60.00 超出图纸允许 40.00，超 20 >
+容差 1"——r20 半圆槽读成 boss）；静默错误 4→2（剩 D79307/IMU，bbox 精确、
+体积偏来自未读结构/腔体，属"尺寸对、内容错"，不是本 gate 的判据）。
+回归：OCC 表 9 绿逐位不变、YZYX 8,544,416.1 逐位持平（extents
+345.00/395.00/202.95 未触发自检）、selftest 461→**472**（I8 十一条：
+跨度读数/拦路文案/容差 0.9 不报 1.1 报/单视图无 z 跳过/PF60K 包络豁免与
+z=120 仍报的破坏性证明/非 force 删文件与 force 保留的落地行为）。
+**下一堵墙 = P1-D**（发射器 B-rep：D79307-剖面基体 BRepCheck 无效）；
+其后是"特征角色裁决（槽 vs 凸台）+ 内部结构识别"（吃掉剩余两个静默错误）。
 ✅ 无基准三件套（`yz_accept.py`：27
 材料点 + 五视图 HLR 评分）建在 **v15a 零件系**上（探针点、`yz_hlr.SPLIT_X=−96.5`
 都是零件系常量），新框架模型在**图纸坐标系**——2026-10-13 **零件系变换已落地**
@@ -731,12 +755,14 @@ linetype 断裂/虚线/**细实线**、section 剖切种类/材料（v0.6.31 起
 `features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **material** HATCH 材料判据工具箱 + **`recognizer.bind_axial_positions` 轴向起点收口**（v0.6.39 P1-A：span→axial_at / 通孔按基体材料端 / 盲孔无依据拦路 / 回转体轴向平移）+ **`_choose_extrude_dir` 基体拉伸视图选择**（v0.6.40 P1-B：最薄视图的环是纯矩形时改取非矩形度最大的视图））、`verify/`（compare/coverage/
 gate/step_probe/box_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
-step=|sldprt=|sw=|force=)`）**、`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
+step=|sldprt=|sw=|force=)`；v0.6.41 起含**发射后自检** `extent_questions` /
+`_extent_selfcheck`——模型 bbox 尺寸 vs 图纸跨度并集，超回转体包络即
+`INCONSISTENT_EXTENT` 拦路并撤回发射）**、`selftest.py`、`verify_legacy.py`。逐阶段叙事与实测数见 `docs/CHANGELOG.md`
 顶部「新框架 src/rebuild/」段；`docs/ARCHITECTURE.md` §8 各阶段带 ✅ 状态行。
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 461 项自检（2026-10-17 P1-B 视图选择/胶合后实测），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 472 项自检（2026-10-17 P1-C 发射后自检后实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
@@ -957,6 +983,11 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   胶合 `ring._glue`）同样按 `v0.6.x:` 前缀提交。至此 tag 落后 HEAD **21 个提交**、
   版本字面量仍 0.6.25。本文件已含 v0.6.40 正文，CHANGELOG / GENERALIZATION 各配
   一节；selftest **461 项**、OCC 验收表 9 绿逐位不变、YZYX 8,544,416.1 逐位持平）
+  （2026-10-17 续：v0.6.41（P1-C 发射后自检 `INCONSISTENT_EXTENT`）同样按
+  `v0.6.x:` 前缀提交。至此 tag 落后 HEAD **22 个提交**、版本字面量仍 0.6.25。
+  本文件已含 v0.6.41 正文，CHANGELOG / GENERALIZATION §8 各配一节；selftest
+  **472 项**、OCC 验收表 9 绿逐位不变、YZYX 8,544,416.1 逐位持平、盲测静默
+  错误 4→2）
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。

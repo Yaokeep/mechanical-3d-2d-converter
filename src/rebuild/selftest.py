@@ -2256,6 +2256,94 @@ def test_pipeline() -> None:
           t0b == 0.0 and buf2.getvalue() == "",
           f"{buf2.getvalue().strip()!r} {part.features[1].params['axial_at']}")
 
+    # ---- I8 发射后自检：模型 bbox vs 图纸跨度（P1-C，2026-10-17） ----
+    # 通用性盲测的静默错误里，轴测量是"多出的材料没图纸依据"：r20 半圆槽
+    # 被跨视图对应读成凸台，模型 x 向比图纸宽 20mm。判据只用两块 ——
+    # **图纸各轴跨度**（视图 span 并集，绝对位置不比）与**建出来的 bbox 尺寸**。
+    # 回转体半径由视图圆弧直接读出，给它一条包络豁免：PF60K 的 Ø80 盘边只
+    # 在四个倒角缺口处画了 r40 短弧，俯视图方框只有 60 —— 不豁免就误杀 9 绿。
+    from types import SimpleNamespace as _NS8
+
+    from src.rebuild.model.questions import QuestionList as _QL8
+    from src.rebuild.pipeline import (RebuildResult, _extent_selfcheck,
+                                      _revolve_sizes, drawing_extents,
+                                      extent_questions)
+
+    def _understand8(rel: str):
+        p8 = ROOT / rel
+        return understand(p8) if p8.exists() else None
+
+    u8 = _understand8("CAD/temp_output/轴测量.dxf")
+    if u8 is not None:
+        _d8, _c8, corr8, rep8 = u8
+        dr8 = drawing_extents(corr8)
+        check("轴测量图纸跨度尺寸 40/44/60",
+              all(abs((dr8[a][1] - dr8[a][0]) - v) < 0.01
+                  for a, v in (("x", 40.0), ("y", 44.0), ("z", 60.0))),
+              str({a: round(v[1] - v[0], 2) for a, v in dr8.items()}))
+        q8 = extent_questions(rep8.part, (60.0, 44.0, 60.0), corr8)
+        check("x 向发射 60 > 图纸 40 ⇒ 一条 INCONSISTENT_EXTENT 拦路疑问",
+              len(q8) == 1 and q8[0].kind is OpenQuestion.INCONSISTENT_EXTENT
+              and "X 向" in q8[0].detail,
+              str([q.detail[:70] for q in q8]))
+        check("同一棵树按图纸尺寸发射 ⇒ 不报（判据只看超量，不看树像不像）",
+              not extent_questions(rep8.part, (40.0, 44.0, 60.0), corr8))
+        check("容差 max(1mm, 0.5%)：x 超 0.9 不报、超 1.1 报",
+              not extent_questions(rep8.part, (40.9, 44.0, 60.0), corr8)
+              and len(extent_questions(rep8.part, (41.1, 44.0, 60.0),
+                                       corr8)) == 1)
+
+        # 落地行为：非 force 时连文件一起撤回；force 时保留供诊断
+        tmp8 = ROOT / "CAD" / "temp_output" / "_selftest_extent.step"
+        tmp8.parent.mkdir(parents=True, exist_ok=True)
+        tmp8.write_text("x", encoding="utf-8")
+        res8 = RebuildResult(source=ROOT / "x.dxf")
+        res8.report = _NS8(part=rep8.part, questions=_QL8())
+        res8.step = tmp8
+        res8.emitted_extents = (60.0, 44.0, 60.0)
+        _extent_selfcheck(res8, rep8.part, corr8, force=False)
+        check("非 force：自检判矛盾 ⇒ 删掉刚写出的模型、step 置 None、疑问拦路",
+              res8.step is None and not tmp8.exists() and bool(res8.blocking()),
+              f"step={res8.step} exists={tmp8.exists()}")
+        tmp8.write_text("x", encoding="utf-8")
+        res8b = RebuildResult(source=ROOT / "x.dxf")
+        res8b.report = _NS8(part=rep8.part, questions=_QL8())
+        res8b.step = tmp8
+        res8b.emitted_extents = (60.0, 44.0, 60.0)
+        _extent_selfcheck(res8b, rep8.part, corr8, force=True)
+        check("force：模型保留（供诊断），疑问照样入册",
+              res8b.step == tmp8 and tmp8.exists() and bool(res8b.blocking()))
+        tmp8.unlink(missing_ok=True)
+
+    _d8p, _c8p, corr8p, rep8p = understand(_fixture("plate_100x60"))
+    check("单视图图纸没有 z 向跨度 ⇒ 该轴不参与自检",
+          "z" not in drawing_extents(corr8p)
+          and not extent_questions(rep8p.part, (100.0, 60.0, 999.0), corr8p),
+          str(drawing_extents(corr8p)))
+
+    u8f = _understand8("CAD/temp_output/pf60k_闭环_三视图_20260817.dxf")
+    if u8f is not None:
+        _df8, _cf8, corrf, repf = u8f
+        drf = drawing_extents(corrf)
+        revf = _revolve_sizes(repf.part)
+        check("PF60K 图纸 y 跨度只有 60，回转体半径包络给到 80",
+              abs((drf["y"][1] - drf["y"][0]) - 60.0) < 0.01
+              and abs(revf.get("y", 0.0) - 80.0) < 0.01,
+              f"drawn={drf.get('y')} "
+              f"rev={ {k: round(v, 2) for k, v in revf.items()} }")
+        check("PF60K 按 80×80×96.9 发射 ⇒ 包络解释得通，不报（9 绿不被误杀）",
+              not extent_questions(repf.part, (80.0, 80.0, 96.9), corrf))
+        check("同一棵树若 z 向硬长到 120 ⇒ 仍报（包络不是万能豁免）",
+              any(q.detail.startswith("Z 向")
+                  for q in extent_questions(repf.part, (80.0, 80.0, 120.0),
+                                            corrf)))
+
+    u8b = _understand8("CAD/temp_output/bracket_angker_三视图_v4.dxf")
+    if u8b is not None:
+        _db8, _cb8, corrb, repb = u8b
+        check("bracket 按图纸跨度 203.3/51/44 发射 ⇒ 不报（9 绿回归锚）",
+              not extent_questions(repb.part, (203.3, 51.0, 44.0), corrb))
+
 
 # ============ J. 轮廓环提取（views/ring） ============
 

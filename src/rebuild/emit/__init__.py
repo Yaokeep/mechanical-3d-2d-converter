@@ -23,7 +23,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:                      # 仅供类型标注，运行时不 import
     from ..model.feature_tree import Part
 
-__all__ = ["build_part_occ", "build_part_sw", "occ_available", "sw_available"]
+__all__ = ["build_part_occ", "build_part_occ_with_extents", "build_part_sw",
+           "occ_available", "sw_available"]
 
 
 def sw_available() -> bool:
@@ -66,3 +67,12 @@ def build_part_occ(part: "Part", path: Path, **kw: Any) -> Path:
     from . import occ_builder
 
     return occ_builder.build_step(part, path, **kw)
+
+
+def build_part_occ_with_extents(
+        part: "Part", path: Path, **kw: Any
+) -> tuple[Path, tuple[float, float, float] | None]:
+    """同 `build_part_occ`，附带建出形状的三向尺寸（发射后自检用）。"""
+    from . import occ_builder
+
+    return occ_builder.build_step_with_extents(part, path, **kw)

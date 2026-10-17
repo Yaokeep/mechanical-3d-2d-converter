@@ -14,9 +14,11 @@
 
 判读口径：
   * `gate=pass`   —— 拦路疑问 0，框架自己认为可以发射；
-  * `gate=blocked`—— 有拦路疑问，默认拒绝发射（这是框架的设计产出，不是 bug）；
-    本脚本默认再用 `force=True` 照建一份，**仅用于量化"硬推会偏多少"**，
-    体积/bbox 偏差不计成败。
+  * `gate=blocked`—— 有拦路疑问，默认拒绝发射（这是框架的设计产出，不是 bug）。
+    2026-10-17 P1-C 起 gate 包含**发射后自检**（模型 bbox vs 图纸视图跨度，
+    `INCONSISTENT_EXTENT`）——所以本脚本第 1 遍就真的发射一次；自检判矛盾时
+    管线会把刚写出的 STEP 删掉。本脚本默认再用 `force=True` 照建一份，
+    **仅用于量化"硬推会偏多少"**，体积/bbox 偏差不计成败。
   * `volume ±%`   —— force 模型 vs 金值；`gate=pass` 时才是真正的精度信号。
 
 金值来源（均已核实）：
@@ -135,8 +137,14 @@ def run_case(case: Case, *, force_blocked: bool) -> Result:
         res.errors.append(f"金值不存在：{case.gold}")
         return res
 
-    # ---- 第 1 遍：只理解，看 gate 自己怎么说 ----
-    r = rebuild(p)
+    # ---- 第 1 遍：完整流程（含**发射后自检**），gate 以这一步为准 ----
+    # 2026-10-17 P1-C 起 gate 不再只是"理解层疑问清单"：`rebuild(step=...)`
+    # 建完会拿模型 bbox 与图纸跨度比，矛盾记 INCONSISTENT_EXTENT 并把文件删掉。
+    # 所以这里必须真的走一遍发射——只调 `rebuild(p)` 会漏掉发射后自检。
+    out = OUT / f"_gen_{case.name}.step"
+    if out.exists():
+        out.unlink()          # 防止上一次的残留文件让"已发射"判断失真
+    r = rebuild(p, step=out)
     res.notes = list(r.notes)
     res.errors = list(r.errors)
     if r.part is None:
@@ -150,19 +158,18 @@ def run_case(case: Case, *, force_blocked: bool) -> Result:
     res.blocking_details = [f"[{q.kind.value}] {getattr(q, 'detail', '')[:180]}"
                             for q in blk[:8]]
     res.gate = "blocked" if blk else "pass"
-    if blk and not force_blocked:
+    if blk:
+        if not force_blocked:
+            return res
+        # ---- 第 2 遍：有拦路时 force 硬推，仅量化"未定型照建会偏多少" ----
+        res.force_used = True
+        r = rebuild(p, step=out, force=True)
+        res.notes.extend(n for n in r.notes if n not in res.notes)
+        res.errors.extend(e for e in r.errors if e not in res.errors)
+    if r.step is None or not Path(r.step).exists():
         return res
-
-    # ---- 第 2 遍：发射（有拦路时 force=True，仅量化硬推偏差） ----
-    res.force_used = bool(blk)
-    out = OUT / f"_gen_{case.name}.step"
-    r2 = rebuild(p, step=out, force=True)
-    res.notes.extend(r2.notes)
-    res.errors.extend(e for e in r2.errors if e not in res.errors)
-    if r2.step is None or not Path(r2.step).exists():
-        return res
-    res.step = str(r2.step)
-    m = _measure(Path(r2.step))
+    res.step = str(r.step)
+    m = _measure(Path(r.step))
     if not m.ok:
         res.errors.append(f"STEP 读不回：{m.error}")
         return res
