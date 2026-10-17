@@ -1967,6 +1967,11 @@ def _dispatch(shape: Any, f: Feature, part: Part, built: set[FeatureId],
 # 建模主流程
 # ---------------------------------------------------------------------------
 
+def _trace_on() -> bool:
+    """``EMIT_TRACE=1`` 打开逐特征体积追踪（调试用，不影响建模结果）。"""
+    return os.environ.get("EMIT_TRACE", "").strip().lower() in ("1", "true", "yes")
+
+
 def build_shape(part: Part, *, validate: bool = True,
                 allow_guess: bool = False) -> Any:
     """把特征树建成一个 OCC 实体（`TopoDS_Shape`）。
@@ -2012,6 +2017,13 @@ def build_shape(part: Part, *, validate: bool = True,
             raise OccBuildError(f"特征 #{f.id}（{f.type.value}）建模抛异常: {e}") from e
         built.add(f.id)
         print(f"  [OK] #{f.id:<3} {f.type.value:8} {info}")
+        # 体积追踪（EMIT_TRACE=1）：逐特征打印累计体积，定位"哪条特征加了/删了
+        # 多少材料"——排查假料/缺料时不用逐特征重建
+        if _trace_on():
+            try:
+                print(f"       [trace] 体积 {volume_of(shape):.2f}")
+            except Exception:
+                pass
     if shape is None:
         raise OccBuildError("建模结束但没有任何实体")
     if os.environ.get("REBUILD_NO_PRUNE", "").strip().lower() not in ("1", "true", "yes"):

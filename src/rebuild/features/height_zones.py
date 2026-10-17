@@ -103,6 +103,15 @@ MERGE_GAP = 0.80
 SIDE_MIN_SPAN = 1.0
 #: 按 pp 归组时的同位置容差（轮廓环焊接会把 150.055 吸到 150.050，mm）
 PP_CLUSTER = 0.02
+#: 剖面反证：分区内材料覆盖率 ≤ 它 ⇒ 该区在剖面图上没有材料
+REBUT_ZONE = 0.02
+#: 剖面反证：同高度带（视图 u 跨度内、分区投影之外）材料覆盖率 ≥ 它
+#: ⇒ 这一高度带确实画了剖面线（"0%" 不是"剖面线本来就没画到"）
+REBUT_BAND = 0.10
+#: 剖面反证的分层数（沿拉伸方向等分，逐层比对）
+REBUT_LAYERS = 4
+#: 剖面反证同高度带的采样点数（视图 u 跨度内均匀取）
+REBUT_SAMPLES = 32
 
 _DIRS: dict[str, tuple[float, float, float]] = {
     "x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0),
@@ -824,6 +833,83 @@ def _bound(h: CylinderHint, exclude: frozenset[str]) -> bool:
     return any(str(x) in exclude for x in h.axis.radius.evidence)
 
 
+def _rebut_materials(d: "Drawing", corr: CorrespondenceResult,
+                     zones: list[Zone], b1_axis: str, b2_axis: str,
+                     dir_name: str) -> list[str]:
+    """剖面材料反证：material 分区在剖面图里**明确是空** ⇒ 角色翻 cut。
+
+    角色来自「同轴圆半径序奇偶」——这是俯视几何的猜测：俯视里一个大圆
+    既可能是凸台顶面，也可能是**盲孔口**（口径同形，俯视不可分）。剖面图
+    能说死它：若同高度带在剖面别处**明确画着剖面线**（材料），而该区
+    在剖面里一点材料都没有，那里就是空腔。实测 YZYX：r50 圆（Ø100 盲孔口）
+    被奇偶判成 material 抬升区，剖面 V1 同带别处有剖面线、孔区 0% ⇒ 翻 cut，
+    基体里那块假料才被切掉。
+
+    **采样按 u 投影区间均匀取，不取几何中心点**——分区可能是环（凸台 +
+    中间的孔），材料在环壁上、中心是空的；只采中心点会把"有材料的环"
+    误判成空腔（实测 bracket 塔柱 r25.5/r15.7 正是如此，selftest 4 项
+    拉红）。按 u 投影才能看到环壁那一段材料。
+
+    只动 ``role == "material"``；只认**本身带 HATCH** 的剖面视图（主视图
+    局部剖的 45° 斜线不是 HATCH，不参与判定——图里没剖面线不等于没材料）。
+    """
+    from .material import material_map
+
+    views = []
+    for fr in corr.frames.values():
+        if fr.p_axis == dir_name or fr.u_axis not in (b1_axis, b2_axis):
+            continue
+        v = _view(d, fr.view_id)
+        if v is None:
+            continue
+        mm = material_map(d, fr, v.bbox)
+        if getattr(mm, "has_hatch", False):
+            views.append((fr, mm))
+    if not views:
+        return []
+
+    notes: list[str] = []
+    for z in zones:
+        if z.role != "material" or z.t_hi - z.t_lo <= 0.5:
+            continue
+        for fr, mm in views:
+            ax = fr.u_axis
+            k = 0 if ax == b1_axis else 1
+            lo = min(c[k] - c[2] for c in z.circles)
+            hi = max(c[k] + c[2] for c in z.circles)
+            if hi - lo <= 1e-6:
+                continue
+            zone_u = [lo + (hi - lo) * (i + 0.5) / REBUT_SAMPLES
+                      for i in range(REBUT_SAMPLES)]
+            u0, u1 = fr.u_span
+            band_u = [u0 + (u1 - u0) * (i + 0.5) / REBUT_SAMPLES
+                      for i in range(REBUT_SAMPLES)
+                      if not (lo - 1.0 <= u0 + (u1 - u0) * (i + 0.5)
+                              / REBUT_SAMPLES <= hi + 1.0)]
+            if not band_u:
+                continue
+            good = 0
+            band_covs: list[float] = []
+            for li in range(REBUT_LAYERS):
+                t = (li + 0.5) / REBUT_LAYERS
+                zc = z.t_lo + (z.t_hi - z.t_lo) * t
+                zone_cov = sum(1 for u in zone_u
+                               if mm(Point2(u, zc))) / len(zone_u)
+                band_cov = sum(1 for u in band_u
+                               if mm(Point2(u, zc))) / len(band_u)
+                band_covs.append(band_cov)
+                if zone_cov <= REBUT_ZONE and band_cov >= REBUT_BAND:
+                    good += 1
+            if good >= 2:
+                z.role = "cut"
+                notes.append(
+                    f"剖面反证：{z.lead} 在 {fr.view_id} 同高度带"
+                    f"（剖面线覆盖 {max(band_covs):.0%}）里无材料 ⇒ 角色 "
+                    "material → cut（俯视同形的盲孔口，剖面图上是空的）")
+                break
+    return notes
+
+
 def decompose(d: "Drawing", corr: CorrespondenceResult, base: Feature,
               rep: "RecognizeReport",
               exclude: frozenset[str] = frozenset()) -> HeightPlan | None:
@@ -911,6 +997,9 @@ def decompose(d: "Drawing", corr: CorrespondenceResult, base: Feature,
         z.t_hi = band.top_over(z.b1_lo, z.b1_hi)
         z.t_lo = band.bot_over(z.b1_lo, z.b1_hi)
         z.resolved = z.t_hi is not None and z.t_lo is not None
+    # ---- ③b 剖面材料反证（角色纠正） ----
+    for msg in _rebut_materials(d, corr, zones, b1_axis, b2_axis, dir_name):
+        rep.notes.append("高度分解：" + msg)
     base_top = min(tops)
     plan = HeightPlan(dir_name, b1_axis, t_lo, base_top, t_hi, zones, band.view_id,
                       float(base.params["length"].value),
