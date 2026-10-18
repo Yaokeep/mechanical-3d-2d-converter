@@ -2,17 +2,28 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-<!-- 最后同步：2026-10-17 事实复核（正文已含 v0.6.26~v0.6.37 内容；tag 仍 v0.6.25，
-     HEAD 落后 tag 18 个提交，簿记见"版本号同步"节）。本轮复核修正：ruff 基线
-     155→158（F401 +2 / F841 +1）、根目录 `_*.py` 计数 444→550（`_*.log` 19→22）、
-     版本字面量按实际计 9 处、CHANGELOG 覆盖范围补到 v0.6.37；其余声明
-     （selftest 448 项、环境表/PyQt6 缺失、CAD/ 51 个 .bas、tests/ 空、
-     sw_constants.py 55 行、gitignore 行号）逐项实测无误。本次未重跑 OCC 验收表
-     （其 9 绿引自 v0.6.36/v0.6.37 提交记录） -->
+<!-- 最后同步：2026-10-18 事实复核（正文已含 v0.6.26~v0.6.41 内容；tag 仍 v0.6.25，
+     HEAD 落后 tag 22 个提交，规则见"版本号同步"节、流水见 CHANGELOG「发版簿记」）。本轮复核：selftest 实测
+     472 项、ruff 基线实测 158 告警、根目录 `_*.py` 计数 550→567（`_*.log` 仍 22）、
+     CHANGELOG 覆盖范围已到 v0.6.41、环境表/PyQt6 缺失/tests 空/CAD 24+27 个 .bas
+     逐项实测无误。OCC 验收表本轮未重跑（9 绿引自 v0.6.39~v0.6.41 提交记录） -->
 
 ## 项目概述
 
 机械三维二维图互转 — 基于 PyQt6 + OpenCASCADE (PythonOCC) 的桌面 CAD 工具，实现 3D 模型 ↔ 2D 工程图的双向互转。
+
+## 先读这里（30 秒）
+
+- **现役开发线 = `src/rebuild/`**（图纸 → 证据/视图/约定 → 特征树 → STEP/SW）。新功能与修复落这里；
+  `src/core/reconstruction/` 已判定过时，**不要填它的 TODO**。
+- **生产可用 = 根目录独立脚本**（`dxf_to_3d_general.py` / `dxf_to_sw_features.py` / `model_to_drawing.py` 等）。
+  `src/gui` 与 `src/core/`（除 `sw_automation`）是 GUI 骨架，且三个环境均无 PyQt6，`python main.py` 起不来。
+- **改动后必跑**：`python -m src.rebuild.selftest`（472 项）→ `$PY run_rebuild_acceptance.py`（OCC 表 9 绿）
+  → 涉 SW 发射再加 `--sw` 表；无基准靶子跑 `$PY yz_accept.py`。`$PY` 定义见下方命令区。
+- **当前主线**：通用性 P1-D（发射器 B-rep）。优先级以 `docs/GENERALIZATION_20261017.md` 为准，
+  不以 YZYX 的 HLR 分数为准。
+- **验收判据**：体积吻合不算过——必须实际生成模型，并用视觉链（`_render_dxf.py` / `_make_viewer.py` /
+  截面叠加）复核结构；图纸没携带的信息不可"修"（见"信息论局限"表）。
 
 ## 常用命令
 
@@ -117,8 +128,8 @@ $PY _make_viewer.py                            # 生成 CAD/temp_output/_viewer/
                                                # 用户目视标记缺陷的入口（v0.6.18 三缺陷即由此而来）。
                                                # 脚本内路径写死 bracket：换重建结果改 main() 里 read_step 的 _3d.step 路径
 # 注：上面两个 debug_*.py 是入库的通用工具。针对特定靶子的一次性脚本一律用 `_` 前缀，
-# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃（根目录现存 550 个
-# `_*.py` + 22 个 `_*.log`，2026-10-17 计数，分十类：_probe 几何探针（含
+# 由 .gitignore 的 `/_*.py`、`CAD/temp_output/_*` 排除，调试完即弃（根目录现存 567 个
+# `_*.py` + 22 个 `_*.log`，2026-10-18 计数，分十类：_probe 几何探针（含
 # _probe_yz_* 齿箱上盖 / _probe_sw_e* SW 发射器）/ _sw SW COM API 探测 / _diag 根因诊断 /
 # _wx 样本真值 / _d79 D79307 探针 / _yz 齿箱上盖 / _dump+_draw 截面叠加工具链 /
 # _csg+_bak 版本备份 / _z7+_z8+_z9 阶段 7 高度分解/圆角/侧通道调试 / 杂项）。
@@ -343,7 +354,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 99.5%+ 时局部可见缺陷仍零命中（bracket 三缺陷、YZYX 五处标记全靠目视）——
 历史缺陷已转成自动断言，**每次修复的例行检查序列**：
 
-1. `python -m src.rebuild.selftest` — 448 项
+1. `python -m src.rebuild.selftest` — 472 项
 2. `PYTHONIOENCODING=utf-8 $PY run_rebuild_acceptance.py` — 9 绿 + 体积/bbox
    阈值判红（0.5%/1mm，仅 expect=="ok"）+ bracket 缺陷盒·点断言（PROBES 表：
    三缺陷盒 + 凸台右弧两盒 + 3 点分类；gold/shift 2026-10-11 定标实测，
@@ -382,12 +393,12 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.25（git tag 为准；**正文内容已写到 v0.6.37 但未收口**——tag 落后 HEAD
-18 个提交，见"版本号同步"节）。
+版本 v0.6.25（git tag 为准；**正文内容已写到 v0.6.41 但未收口**——tag 落后 HEAD
+22 个提交，见"版本号同步"节）。
 版本字面量共 9 处（`src/app.py:15` / `src/gui/main_window.py:28` / 同文件 `:535` /
 `dxf_to_3d_general.py:2,9789` / `dxf_to_sw_features.py:2,965,1032` / `README.md:89`），
 均仍为 0.6.25。
-**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.37）——
+**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.41）——
 本节只留仍在影响决策的部分。
 
 **通用性现状（P0，2026-10-17）**：held-out 盲测 7 用例 **0/7 命中**——4 个被
@@ -768,7 +779,7 @@ PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
 ```
 阶段 4 实测（2026-09-28）→ 阶段 5 表（2026-10-07）→ 阶段 6 表（2026-10-09）→
-**当前表（v0.6.25 全量定标、9 靶子两表全绿；v0.6.26~v0.6.37 各版记录 OCC 表
+**当前表（v0.6.25 全量定标、9 靶子两表全绿；v0.6.26~v0.6.41 各版记录 OCC 表
 逐位不变；2026-10-11 验证制度化起 OCC 表加体积/bbox 阈值判红 0.5%/1mm +
 bracket 缺陷盒·点断言）**：
 6 个简单靶子**全部体积逐位吻合**（block_3view / plate_100x60 / flange_d80 /
@@ -796,8 +807,8 @@ revolve 证据覆盖裁决；9 绿逐位不变，自检 336 项）。
 `run_rebuild_acceptance.py` 顶部注释。反向同样成立：阶段 7 把 SW 的 top_round
 圆角推迟发射后体积 +0.48%→+0.54%（更远离金值），但圆角面从过延伸 578.59
 收敛到 453.14 ≈ OCC 453.10——**为结构忠实宁可数值倒退**。
-SW 表（最近一次全量复核 2026-10-12 v0.6.25）：**9 绿**（v0.6.26~v0.6.37 的
-识别侧改动未重跑 SW 表；emit 未改时按惯例跳过）。PF60K 转绿靠发射器三修——
+SW 表（最近一次全量复核 2026-10-12 v0.6.25）：**9 绿**（v0.6.26~v0.6.41 的
+识别侧改动未重跑 SW 表；`sw_builder` 未改按惯例跳过）。PF60K 转绿靠发射器三修——
 `emit/sw_builder.py` 的「切除类草图一律 `SetAddToDB` 关推理捕捉」（#9 键槽
 角点被吸到 r8.5 圆，0.45mm 畸变致切除相切失败；吸附与否随视图缩放变）+
 「零宽缝环带剥缝 + 整圆改画原生圆实体」（#16 环带补偿切；自重合轮廓 SW
@@ -909,85 +920,18 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
 - Windows 环境下 PythonOCC 的 `pip install` 容易失败，务必使用 conda-forge 安装。
 - SolidWorks 自动化功能仅限 Windows，需要安装 SolidWorks 2025 和 `pywin32`。
 - **`convert_dwg_to_3d.py` OCC 懒加载**: OCC 导入已改为延迟加载（`_ensure_occ()`），仅需 DXF 解析时（如 `dxf_to_sldprt.py` 引用 `parse_shaft_from_dxf`）不再依赖 PythonOCC。该脚本本身是**完整可用的**——包含 DXF 几何解析、旋转体建模、键槽布尔减运算、STEP 导出。
-- **版本号同步**（发版时全部要改，当前均为 `0.6.25`，共 9 处，已核对一致）:
+- **版本号同步**（发版时全部要改，当前均为 `0.6.25`，共 9 处）:
   `src/app.py:15` `APP_VERSION` / `src/gui/main_window.py:28` `setWindowTitle` /
   同文件 `:535` 关于对话框 / `CLAUDE.md` 本节 / `README.md`（"当前版本"行
   + 路线图段）/ git tag，外加两个转换器脚本横幅（`dxf_to_3d_general.py` 与
   `dxf_to_sw_features.py` 的 docstring 与结尾 print）。
-  惯例：内容入正文即可按 `v0.6.x:` 前缀提交，tag 簿记待下次发版收口；发版 =
+  惯例：内容按 `v0.6.x:` 前缀提交即可，**tag 只在发版收口时打**——发版 =
   bump 上述全部字符串 + tag 打在收口提交上（2026-10-02 曾"先提交、后收口"致
-  tag 落后 HEAD 16 个提交；v0.6.21/v0.6.22 收口已各清一次账，覆盖范围见
-  docs/CHANGELOG.md 顶部三节）。
-  （2026-10-11 收口：约定沉淀（局部剖几何推断/细实线/DIMENSION 锚点）入账并
-  **发版 v0.6.23**——v0.6.22 tag 之后的 5 个提交（8fa7e8b 消影推理 + 三个
-  收口提交 + 255e8e8 约定沉淀）一次落定：bump 上述全部字符串 + tag `v0.6.23`
-  打在收口提交上。v0.6.23 覆盖：YZYX 手工读图三约定前移进 conventions/
-  （10 条规则）+ MTEXT 字体规格码清洗修复，selftest 367 项、9 绿逐位不变）
-  （2026-10-11 收口：验证制度化（ASSESSMENT §D：缺陷盒·点断言 + 阈值判红 +
-  YZYX 三件套 yz_accept + 例行检查 SOP）入账并**发版 v0.6.24**——bump 上述
-  全部字符串 + tag `v0.6.24` 打在收口提交上。v0.6.24 覆盖：`verify/box_probe.py`
-  + 验收表 PROBES/阈值判红、yz_probe_mat/yz_hlr/yz_match/yz_accept 入库、
-  CLAUDE.md SOP 节，selftest 367 项、9 绿逐位不变、破坏性证明四条判红路径）
-  （2026-10-12 收口：PF60K 残余追平（OCC 侧 DUP_TOL/锥台 REVOLVE）+ SW 发射器
-  三修入账并**发版 v0.6.25**——两提交（a99bb5e OCC 侧 + dd32a98 SW 侧/文档）
-  一次落定：bump 上述全部字符串 + tag `v0.6.25` 打在收口提交上。v0.6.25 覆盖：
-  correspondence `DUP_TOL=0.05`、revolve `_cone_zone`、sw_builder `no_snap`/
-  `_split_zero_width_slits`/`_full_circle_of`，OCC 表 9 绿 + SW 表 9 绿
-  （PF60K 261,943.9 / 261,776.7 两表转绿）、selftest 367 项）
-  （2026-10-12 内容已入正文、**未收口**：v0.6.26 提交（5692df4 密集大图视图分离
-  ——递归 XY 切分 + 图框/家具剔除 + 三等定律主视图裁决）按惯例只带 `v0.6.x:`
-  前缀——tag 仍 `v0.6.25`、8 处版本字符串仍 0.6.25，待下次发版一并 bump。
-  该提交已同步更新本文件：新框架节「密集大图视图分离」段、MKL PATH 环境坑、
-  8A9 细实线断裂线修正，selftest 367→373（OCC 验收表 9 绿逐位不变））
-  （2026-10-13 续未收口：v0.6.27 提交（3b814ac 零件系变换 `yz_frame.py`——三件套
-  `--frame auto` 直接可评新框架模型，`--force` 首评 11/27）+ v0.6.28 提交
-  （f3ae0ec 中心线交点判真 + 交点圆补半径——YZYX 拦路 107→10、疑问 113→16、
-  缺尺寸标注 98→1，特征树逐位不变）同样按 `v0.6.x:` 前缀提交。至此 tag 落后
-  HEAD **4 个提交**（5692df4 / b14124e / 3b814ac / f3ae0ec）、8 处版本字符串仍
-  0.6.25。两版正文已入本文件新框架节（含 §C6 第一刀收口段）+ ASSESSMENT §C6、
-  CHANGELOG 各一节，selftest 373 项、OCC 验收表 9 绿逐位不变）
-  （2026-10-14 续未收口：v0.6.29 提交（7418203 向视图语义「c 向」+ MTEXT 转义
-  解码——YZYX 拦路 10→8，selftest 373→390，OCC 验收表 9 绿逐位不变）同样按
-  `v0.6.x:` 前缀提交。至此 tag 落后 HEAD **6 个提交**（5692df4 / b14124e /
-  3b814ac / f3ae0ec / d34997f / 7418203）、8 处版本字符串仍 0.6.25。本版正文
-  已入本文件新框架节（§C6 第二刀第一段）；ASSESSMENT §C6 / CHANGELOG 两处
-  尚待补）
-  （2026-10-15 续未收口：v0.6.30 提交（Phase D 孔标注绑定——YZYX 拦路 8→8
-  换构成、特征树 22→21、selftest 390→421、OCC 验收表 9 绿逐位不变）同样按
-  `v0.6.x:` 前缀提交。至此 tag 落后 HEAD **7 个提交**（5692df4 / b14124e /
-  3b814ac / f3ae0ec / d34997f / 7418203 + 本次）、8 处版本字符串仍 0.6.25。
-  本版正文已入本文件新框架节（§C6 第二刀第二段），v0.6.29 的两处欠账
-  （ASSESSMENT §C6 / CHANGELOG）于本次一并补为 v0.6.29 + v0.6.30 各一节）
-  （2026-10-15 续未收口：v0.6.31 提交（半剖语义识别 + 孔口由同心材料分区顶面
-  定出——YZYX 拦路 8→0、特征树 21→24、selftest 421→431、OCC 验收表 9 绿逐位
-  不变）同样按 `v0.6.x:` 前缀提交。至此 tag 落后 HEAD **8 个提交**（5692df4 /
-  b14124e / 3b814ac / f3ae0ec / d34997f / 7418203 / 1c06418 + 本次）、8 处版本
-  字符串仍 0.6.25。本版正文已入本文件新框架节（§C6 第二刀第三段）+ CHANGELOG
-  与 ASSESSMENT §C6 各一节）
-  （2026-10-16~17 续未收口：v0.6.32~v0.6.37 共 18 个提交（v0.6.32 7718f01
-  轮廓弧判据「缺口>半圈」/ v0.6.33 9cdc38c 侧凹槽族六件套 / v0.6.34 60a9a03
-  轴回转族 + 母线真弧 / v0.6.35 946e112 剖面补扫 + 塔腔 / v0.6.36 1f6a312
-  孔口膜清理 / v0.6.37 d9e2607 剖面材料反证，各配文档收口提交）同样按
-  `v0.6.x:` 前缀提交。至此 tag 落后 HEAD **18 个提交**
-  （`git rev-list --count v0.6.25..HEAD`）、版本字面量 9 处仍为 0.6.25。
-  本文件已含 v0.6.32~v0.6.37 正文（§C6 第三~第六刀、孔口膜清理、剖面材料
-  反证），CHANGELOG / ASSESSMENT 各配一节；selftest 439 项、OCC 验收表
-  9 绿逐位不变（v0.6.36/v0.6.37 提交记录，本次复核未重跑）
-  （2026-10-17 续：**通用性转向**——v0.6.38（b857d93）建 held-out 盲测
-  诊断仪 `run_generalization_benchmark.py` + `docs/GENERALIZATION_20261017.md`
-  （7 用例 0 命中、3 个静默错误）；v0.6.39（P1-A 轴向起点绑定）重跑 OCC 表
-  **9 绿逐位不变**、YZYX 8,544,416.1 逐位持平、selftest **448 项**，CHANGELOG
-  配 v0.6.38/v0.6.39 两节。至此 tag 落后 HEAD **20 个提交**、版本字面量仍
-  0.6.25，待下次发版一并 bump）
-  （2026-10-17 续：v0.6.40（P1-B 基体轮廓视图选择 `_choose_extrude_dir` + 顶点
-  胶合 `ring._glue`）同样按 `v0.6.x:` 前缀提交。至此 tag 落后 HEAD **21 个提交**、
-  版本字面量仍 0.6.25。本文件已含 v0.6.40 正文，CHANGELOG / GENERALIZATION 各配
-  一节；selftest **461 项**、OCC 验收表 9 绿逐位不变、YZYX 8,544,416.1 逐位持平）
-  （2026-10-17 续：v0.6.41（P1-C 发射后自检 `INCONSISTENT_EXTENT`）同样按
-  `v0.6.x:` 前缀提交。至此 tag 落后 HEAD **22 个提交**、版本字面量仍 0.6.25。
-  本文件已含 v0.6.41 正文，CHANGELOG / GENERALIZATION §8 各配一节；selftest
-  **472 项**、OCC 验收表 9 绿逐位不变、YZYX 8,544,416.1 逐位持平、盲测静默
-  错误 4→2）
+  tag 落后 HEAD 16 个提交，此后 v0.6.21~v0.6.25 各清一次账）。
+  **当前欠账（2026-10-18 核对）**：tag 仍 `v0.6.25`，HEAD 已含 v0.6.26~v0.6.41
+  内容（`git rev-list --count v0.6.25..HEAD` = **22**），9 处字面量仍 0.6.25。
+  逐版本内容见 `docs/CHANGELOG.md` 各节；**收口流水账已移至该文件「发版簿记」节，
+  本文件不再逐条记录**——此前逐日追加的写法是文档漂移的主要来源。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。
   **迭代产物一律以 `_` 前缀命名**——`.gitignore:85-87` 已落地 `CAD/temp_output/_*`、`/_*.py`、`*.diff` 三条规则（v0.6.16 补齐），`git status` 现已干净，可直接作为提交前检查依据。新建一次性调试脚本/版本备份/diff 时必须带 `_` 前缀，否则会重新污染 `git status`。
   ⚠️ `*.exe` 全局排除：根目录三个安装器（`micromamba.exe`、`Miniconda3-latest`、`Miniforge3-latest`，共约 180MB）因此未入库——它们是环境安装遗留物，不是项目产物。
