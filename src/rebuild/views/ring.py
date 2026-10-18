@@ -338,7 +338,19 @@ def _split_primitives(prims: list) -> list:
             span = (ea - sa) % TAU
             if span < 1e-9:
                 span = TAU
-            angs = sorted(params, key=lambda a: (a - sa) % TAU)
+            # 拆分角度必须**解缠到 [sa, sa+span]**：``params`` 是
+            # ``ang % TAU`` 的原始值，而 sa/sa+span 可能为负或超 TAU。
+            # 直接混用会让跨 0/2π 缝的弧拆出 ``sa > ea`` 的段（实测
+            # D79307-剖面 sa=-10.23° 的圆角弧拆出 sa=359.99° > ea=0°），
+            # 破坏 ``_arc_prims`` 的「ea = sa + span」契约——下游按模运算
+            # 把 0.013° 的微弧读成 359.987° 近整圆，剖面图基体自交。
+            angs = []
+            for a in params:
+                off = (a - sa) % TAU
+                if off > span:
+                    off = span          # _angle_in_arc 端点容差 1e-4 的裁剪
+                angs.append(sa + off)
+            angs.sort()
             ordered = [sa] + angs + [sa + span]
             for a1, a2 in zip(ordered, ordered[1:]):
                 if abs(a2 - a1) < 1e-9:

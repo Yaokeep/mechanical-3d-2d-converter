@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -2505,6 +2506,52 @@ def test_ring() -> None:
     check("raw 已过门的视图不跑胶合（已成功结果逐位不变的保证）",
           r.ring is not None and r.ring.rule == "raw",
           f"{r.ring.rule if r.ring else r.note}")
+
+    # J8 跨 0/2π 缝拆分 + 微弧旋向（P1-D）：D79307-剖面基体曾把 0.013°
+    #    微弧读成 359.987° 近整圆 ⇒ 轮廓自交、BRepCheck 判 B-rep 无效。
+    #    两条根因各自锚住：
+    #    ① ``_split_primitives`` 混用 ``ang % TAU`` 原始角与可能为负的
+    #       ``sa``/``sa+span``，拆出 sa > ea 的段（契约是 ea = sa + span）；
+    #    ② recognizer 的朝向判据用吸附后的顶点做弦叉积——微弧矢高
+    #       （~0.001mm）小于顶点吸附误差时符号由噪声决定。
+    # ①合成锚：弧 -10°→0° 被 -0.2° 的横线切开（跨缝，raw 角 ≈ 6.2797）
+    r10 = 10.0
+    th = math.radians(-0.2)
+    arc_seam = ("A", 0.0, 0.0, r10, math.radians(-10.0), 0.0)
+    line_cut = ("L", 0.0, r10 * math.sin(th), 20.0, r10 * math.sin(th))
+    outs = _rg._split_primitives([arc_seam, line_cut])
+    arcs = [p for p in outs if p[0] == "A"]
+    check("跨 0/2π 缝拆分：输出弧满足 ea ≥ sa 契约",
+          bool(arcs) and all(p[5] >= p[4] - 1e-12 for p in arcs),
+          str([(round(math.degrees(p[4]), 3),
+                round(math.degrees(p[5]), 3)) for p in arcs]))
+    check("跨 0/2π 缝拆分：无跨缝伪整圆（跨度 ≤ 输入 10°）",
+          bool(arcs) and all(p[5] - p[4] <= math.radians(10.0) + 1e-9
+                             for p in arcs),
+          str([round(math.degrees(p[5] - p[4]), 3) for p in arcs]))
+
+    # ②真实锚：D79307-剖面基体轮廓不得含「近整圆伪弧」（发射器口径）
+    d79s, _c, _co, rep79s = understand(
+        tmp / "D79307A264FCA6D8EC32E95B1B11BDBD_剖面图.dxf")
+    prof79 = next((f.param("profile").value for f in rep79s.part.features
+                   if f.type.value == "base"), None)
+    pseudo = []
+    tiny = 0
+    if prof79 is not None:
+        for i, s in enumerate(prof79.segments):
+            if s.kind != "arc" or s.center is None:
+                continue
+            span = ((s.ea - s.sa) if s.ccw else (s.sa - s.ea)) % (2 * math.pi)
+            chord = math.hypot(s.p2.x - s.p1.x, s.p2.y - s.p1.y)
+            if chord < 0.1:
+                tiny += 1
+            if span > math.pi and chord < 0.3:
+                pseudo.append((i, round(math.degrees(span), 3)))
+    check("D79307-剖面 基体轮廓存在", prof79 is not None)
+    check("D79307-剖面 基体无近整圆伪弧（P1-D 自交根因）",
+          prof79 is not None and not pseudo, str(pseudo))
+    check("D79307-剖面 基体保留 4 条 <0.1mm 微弧（未被静默丢弃）",
+          prof79 is not None and tiny == 4, str(tiny))
 
 
 # ============ 主入口 ============

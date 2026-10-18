@@ -284,8 +284,12 @@ def _outline_ring_profile(d, frame: ViewFrame, dir_name: str,
 
     坐标转置时**弧的旋向可能翻转**：视图的 (u, v) 与平面的 (b1, b2)
     顺序未必一致（沿 y 拉伸的平面是 (z, x)，而前视图 u=x、v=z 恰好
-    对调），故弧的 ``ccw``/``sa``/``ea`` 一律在 (a, b) 系里**重判重算**
-    ——判据与 SW 发射器同一套（弧中点弦叉积符号），不搬运视图系角度。
+    对调）。映射是轴置换 + 翻面，线性部分行列式恒为 ±1，故整幅环
+    **统一保向或统一反向**——用基向量叉积一次定号，逐段沿用环的
+    ``ccw``（反向时取反），``sa``/``ea`` 按映射后的端点重算。
+    曾用「弧中点弦叉积」逐段重判，但那是拿**吸附后的顶点**与圆上
+    精确中点比：微弧矢高小于顶点吸附误差时符号由噪声决定（实测
+    D79307-剖面 0.013° 微弧被翻成 359.987° 近整圆，基体自交）。
 
     返回 ``(profile, 说明)``；不可用时 profile=None，说明串写明原因供
     报告与待确认项引用。注意**跨度覆盖率门控**（``RING_SPAN_MIN``）：
@@ -314,6 +318,17 @@ def _outline_ring_profile(d, frame: ViewFrame, dir_name: str,
              frame.v_axis: frame.v_to_model(p.y)}
         return Point2(m[b1_axis] - lo1, m[b2_axis] - lo2)
 
+    # 映射朝向：fwd 的线性部分是轴置换 × 翻面，行列式恒为 ±1。
+    # 整幅环在映射后统一保向（det>0）或统一反向（det<0），一次定号即可。
+    o = fwd(Point2(0.0, 0.0))
+    ex = fwd(Point2(1.0, 0.0))
+    ey = fwd(Point2(0.0, 1.0))
+    det = ((ex.x - o.x) * (ey.y - o.y)
+           - (ex.y - o.y) * (ey.x - o.x))
+    if abs(det) < 1e-12:
+        return None, "轮廓映射退化（u/v 轴共线）"
+    flip = det < 0.0
+
     segs: list[ProfileSeg2] = []
     for s in res.ring.segs:
         p1, p2 = fwd(s.p1), fwd(s.p2)
@@ -323,18 +338,8 @@ def _outline_ring_profile(d, frame: ViewFrame, dir_name: str,
         if s.center is None or s.radius <= 0:
             return None, "弧段缺圆心/半径（环数据不完整）"
         c = fwd(s.center)
-        # 弧中点：先按视图系 sa/ea/ccw 取参数中点，跟着端点一起映射
-        tau = 2.0 * math.pi
-        span = ((s.ea - s.sa) if s.ccw else (s.sa - s.ea)) % tau
-        thm = s.sa + span / 2.0 if s.ccw else s.sa - span / 2.0
-        pm = fwd(Point2(s.center.x + s.radius * math.cos(thm),
-                        s.center.y + s.radius * math.sin(thm)))
-        cross = ((pm.x - p1.x) * (p2.y - pm.y)
-                 - (pm.y - p1.y) * (p2.x - pm.x))
-        if abs(cross) < 1e-9:
-            return None, "弧段旋向不可判（弦叉积为零）"
         segs.append(ProfileSeg2(
-            "arc", p1, p2, c, s.radius, cross > 0.0,
+            "arc", p1, p2, c, s.radius, s.ccw != flip,
             math.atan2(p1.y - c.y, p1.x - c.x),
             math.atan2(p2.y - c.y, p2.x - c.x)))
     prof = Profile2(tuple(segs))
