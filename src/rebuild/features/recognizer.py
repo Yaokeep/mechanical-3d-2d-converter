@@ -49,7 +49,7 @@ from ..model.questions import OpenQuestion, Question, QuestionList
 from ..views.correspondence import (MATCH_TOL, CorrespondenceResult,
                                     CylinderHint, ViewFrame)
 from ..views.ring import extract_ring
-from .library import ir_point, mk_claim
+from .library import ir_point, mk_claim, profile_plane
 from .solver import Conflict, SolveReport, merge_with_conflict, solve
 
 if TYPE_CHECKING:
@@ -785,18 +785,149 @@ def base_feature(d, corr: CorrespondenceResult, rep: RecognizeReport) -> Feature
 
 # ---- 2) 圆柱（跨视图对应） ----
 
-def _cyl_claim(hint: CylinderHint) -> Claim[FeatureType]:
+#: 剖面材料反证（圆角色）的门槛 —— 与 height_zones 的分区反证同源
+#: （``REBUT_ZONE``/``REBUT_BAND``），但对象是圆柱提示而不是高度分区。
+REBUT_CYL_EMPTY = 0.03      # 圆区间内材料覆盖率 ≤ 此值 ⇒ 剖切面上是空的
+REBUT_CYL_END = 0.03        # 沿轴一端 25% 段空 ⇒ 盲孔开口那一端
+REBUT_CYL_MATERIAL = 0.10   # 另一端 25% 段有材料（证明确实画了剖面线）
+REBUT_CYL_OVERALL = 0.10    # 视图整体材料覆盖率下限（局部剖/非剖面保护）
+_REBUT_CYL_NU = 32          # 沿轴采样点数
+_REBUT_CYL_NP = 5           # 垂直轴分层数
+
+
+def _axis_name_of(vec: Vector3) -> str | None:
+    """方向向量 → 轴名（只认与坐标轴平行的方向）。"""
+    for name, comp in (("x", vec.x), ("y", vec.y), ("z", vec.z)):
+        if abs(abs(comp) - 1.0) < 1e-6:
+            return name
+    return None
+
+
+def _section_materials(d, corr) -> dict:
+    """剖视帧 → HATCH 材料判据。只收**带剖面线**的剖视（``has_hatch``）。
+
+    返回 ``{view_id: (frame, material_fn, view)}``。
+    """
+    from ..evidence.model import ViewType
+    from .material import material_map
+
+    out: dict = {}
+    for fr in corr.frames.values():
+        if fr.view_type != ViewType.SECTION:
+            continue
+        v = next((x for x in d.views if x.id == fr.view_id), None)
+        if v is None or v.bbox is None:
+            continue
+        mm = material_map(d, fr, v.bbox)
+        if getattr(mm, "has_hatch", False):
+            out[fr.view_id] = (fr, mm, v)
+    return out
+
+
+def _rebut_by_section(hint: CylinderHint, mats: dict
+                      ) -> tuple[bool | None, tuple[float, float] | None]:
+    """剖面材料反证：轮廓对来自剖视图时，用**剖面线**复核"凸台"判定。
+
+    为什么需要：剖视图里可见轮廓**全是实线**（剖切面的轮廓），"实线对 ⇒
+    凸台"在那里不成立 —— 孔壁在剖视图中同样是实线。实测 20180425 气缸
+    前盖：r57.5 / r18 / r3.5 的轮廓对全部来自 A—A 剖视的实线，逐条判成
+    凸台；而剖面线说死 r18 区间整段无材料（中心方孔）、r3.5 区间贴一端
+    无材料（Ø7 盲孔）——那些是孔，不是凸台。
+
+    **只做单向修正**（True → False），绝不做 False/None → True：
+    剖切面可能根本没穿过这个圆（剖面图上"有材料"只说明周围有料），
+    "有材料"不能证明是凸台（§3 原则二：没定就不许定）。
+
+    判据（圆轴必须落在剖视帧的 u/v 之内，否则剖切面不含该轴 ⇒ 跳过）：
+
+    - 圆区间内材料覆盖 ≤ 3% ⇒ **通孔/空腔**（沿轴全空）；
+    - 沿轴一端 25% 段 ≤ 3% 且另一端 ≥ 10% ⇒ **盲孔/腔**，开口在那端；
+    - 其余不动。
+
+    返回 ``(solid, span_override)``：判成通孔时 ``span_override`` 取剖面
+    视野里沿轴的**全跨度**（剖切面上整段无料 = 沿轴贯穿，轮廓对只量到
+    其中一段）；其余情况 ``None``（不改 span —— 盲孔深度仍以轮廓对为准，
+    剖面的空白段可能连着别的腔，比轮廓对更不可靠）。
+    """
+    if hint.solid is not True:
+        return hint.solid, None
+    pm = hint.profile_method or ""
+    if not pm.startswith("outline:"):
+        return hint.solid, None
+    got = mats.get(pm.split(":", 1)[1])
+    if got is None:
+        return hint.solid, None
+    fr, mm, _v = got
+    ax = _axis_name_of(hint.axis.direction)
+    if ax is None:
+        return hint.solid, None
+    if fr.u_axis == ax:
+        along_u = True
+        perp = fr.v_axis
+    elif fr.v_axis == ax:
+        along_u = False
+        perp = fr.u_axis
+    else:
+        return hint.solid, None            # 剖切面不含该圆轴
+    org = hint.axis.origin
+    perp_val = {"x": org.x, "y": org.y, "z": org.z}[perp]
+    span_a = fr.model_span(ax)
+    span_p = fr.model_span(perp)
+    if span_a is None or span_p is None:
+        return hint.solid, None
+    a0, a1 = span_a
+    if a1 - a0 <= 1e-6:
+        return hint.solid, None
+    r = hint.radius
+
+    def sample(plo: float, phi: float, alo: float, ahi: float) -> float:
+        hit = 0
+        tot = 0
+        for j in range(_REBUT_CYL_NP):
+            p = plo + (phi - plo) * (j + 0.5) / _REBUT_CYL_NP
+            for i in range(_REBUT_CYL_NU):
+                a = alo + (ahi - alo) * (i + 0.5) / _REBUT_CYL_NU
+                tot += 1
+                pt = Point2(a, p) if along_u else Point2(p, a)
+                if mm(pt):
+                    hit += 1
+        return hit / max(tot, 1)
+
+    overall = sample(span_p[0], span_p[1], a0, a1)
+    if overall < REBUT_CYL_OVERALL:
+        return hint.solid, None            # 视图没画足剖面线（局部剖）⇒ 无判据
+    zone = sample(perp_val - r, perp_val + r, a0, a1)
+    if zone <= REBUT_CYL_EMPTY:
+        return False, (a0, a1)             # 剖切面上整段无料 ⇒ 通孔/空腔
+    quart = (a1 - a0) * 0.25
+    lo_end = sample(perp_val - r, perp_val + r, a0, a0 + quart)
+    hi_end = sample(perp_val - r, perp_val + r, a1 - quart, a1)
+    if lo_end <= REBUT_CYL_END and hi_end >= REBUT_CYL_MATERIAL:
+        return False, None                 # 开口在 a0 端（盲孔）
+    if hi_end <= REBUT_CYL_END and lo_end >= REBUT_CYL_MATERIAL:
+        return False, None                 # 开口在 a1 端（盲孔）
+    return hint.solid, None
+
+
+def _cyl_claim(hint: CylinderHint,
+               solid: bool | None = None) -> Claim[FeatureType]:
     """孔还是凸台 —— **没定就不许定**（§3 原则二）。
 
     ``CylinderHint.solid`` 由正交视图里那两条轮廓线是实线还是虚线给出，
     这是二者唯一的消解依据。它没算出来（None）时只能给 GUESS + 备选。
+    ``solid`` 参数是剖面材料反证（``_rebut_by_section``）给的修正值：
+    只可能把 True 翻成 False，依据是剖面线而不是轮廓线，故 method 记
+    ``projection:section_empty``。
     """
     ev = hint.axis.radius.evidence if hint.axis.radius else ()
-    if hint.solid is True:
+    s = hint.solid if solid is None else solid
+    if s is True:
         return Claim(FeatureType.BOSS, "projection:outline_visible",
                      Tier.PROJECTION, evidence=ev)
-    if hint.solid is False:
-        return Claim(FeatureType.HOLE, "projection:outline_hidden",
+    if s is False:
+        return Claim(FeatureType.HOLE,
+                     "projection:outline_hidden" if hint.solid is False
+                     else "projection:section_empty",
                      Tier.PROJECTION, evidence=ev)
     return Claim(FeatureType.HOLE, "unresolved:outline", Tier.GUESS,
                  alternatives=(FeatureType.BOSS,))
@@ -809,24 +940,61 @@ def _base_outline(base: Feature):
     沿基体自己的轴、半径又等于基体半径的圆柱只可能是基体的轮廓线
     （实测 flange_d80：Ø80 外圆被读成一个 r40 的孔、法兰练习里被读成
     一个 r40 的凸台 —— 两者都是把零件本身又加/减了一遍）。
+
+    两条通道：回转体基体比 ``radius_profile``；轮廓环基体比**环上的弧**
+    —— 轮廓由大弧构成时同样会被读成"圆柱"（实测 20180425 气缸前盖：
+    φ155 双平边盘的外轮廓是两段 r77.5 弧，合计 191.6° ≥ 180°，corr 层
+    把它合成一个 r77.5 的 GUESS 孔，``--force`` 发射时布尔把整个基体
+    切空）。弧的圆心与半径都在轮廓 (a, b) 系里，圆心的 3D 点先减基体
+    原点、再投影到轮廓基向量上比对。
     """
+    # ① 回转体基体：外径圆
     prof = base.params.get("radius_profile")
-    if prof is None or not isinstance(prof.value, (list, tuple)) or not prof.value:
-        return None
-    r_max = max(float(r) for _, r in prof.value)
-    ax = base.axis.value if base.axis is not None else None
-    if ax is None:
-        return None
+    if prof is not None and isinstance(prof.value, (list, tuple)) and prof.value:
+        r_max = max(float(r) for _, r in prof.value)
+        ax = base.axis.value if base.axis is not None else None
+        if ax is None:
+            return None
 
-    def skip(hint: CylinderHint) -> bool:
-        if abs(hint.radius - r_max) > 0.05:
-            return False
-        if not _dirs_parallel_either_way(hint.axis.direction, ax.direction):
-            return False
-        d = axis_distance(hint.axis, ax)
-        return d is not None and d <= AXIS_POS_TOL
+        def skip_revolve(hint: CylinderHint) -> bool:
+            if abs(hint.radius - r_max) > 0.05:
+                return False
+            if not _dirs_parallel_either_way(hint.axis.direction, ax.direction):
+                return False
+            d = axis_distance(hint.axis, ax)
+            return d is not None and d <= AXIS_POS_TOL
 
-    return skip
+        return skip_revolve
+
+    # ② 轮廓环基体：环上的弧（圆心 + 半径都对上 ⇒ 是轮廓线本身）
+    prof_claim = base.params.get("profile")
+    dir_claim = base.params.get("dir")
+    origin_claim = base.params.get("origin")
+    if (prof_claim is None or dir_claim is None or origin_claim is None
+            or not isinstance(prof_claim.value, Profile2)):
+        return None
+    dir_name = dir_claim.value
+    if dir_name not in _PLANE_AXES:
+        return None
+    origin = origin_claim.value
+    b1, b2 = profile_plane(dir_name)
+    arcs = [(s.center.x, s.center.y, s.radius)
+            for s in prof_claim.value.segments
+            if s.kind == "arc" and s.center is not None and s.radius > 0]
+    if not arcs:
+        return None
+    axis_dir = _axis_vector(dir_name)
+
+    def skip_profile(hint: CylinderHint) -> bool:
+        if not _dirs_parallel_either_way(hint.axis.direction, axis_dir):
+            return False
+        v = hint.axis.origin - origin
+        a, b = v.dot(b1), v.dot(b2)
+        return any(abs(hint.radius - r) <= 0.05
+                   and math.hypot(a - ca, b - cb) <= 0.05
+                   for ca, cb, r in arcs)
+
+    return skip_profile
 
 
 def _bound_hole_feature(b: "HoleBinding", hint: CylinderHint, c,
@@ -887,7 +1055,8 @@ def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
                       next_id: int, skip=None,
                       no_feature: list[CylinderHint] | None = None,
                       draws_hidden: bool = False,
-                      bindings=None) -> list[Feature]:
+                      bindings=None,
+                      mats: dict | None = None) -> list[Feature]:
     """一个 ``CylinderHint`` 一条特征。``skip`` 是基体外轮廓的判据（见上）。
 
     ``no_feature`` 收下"**没有建成特征**的圆"（供 ``_resolve_questions``
@@ -905,6 +1074,10 @@ def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
     是 ``Tier.ANNOTATED`` 的证据，比"从轮廓反推"更具体，而且这类圆之所以
     需要绑定，恰恰因为投影侧什么都没有（半剖省了孔壁、简化画法不画轮廓对）
     —— 所以绑定分支必须在下面那条"没有轮廓对 ⇒ 不建特征"的强负证据**之前**。
+
+    ``mats``：``_section_materials`` 的剖面材料判据。给了就用它复核"轮廓对
+    来自剖视图"的 solid 判定（见 ``_rebut_by_section``）——剖视图里实线
+    不代表凸台，剖面线才说话。
     """
     out: list[Feature] = []
     for c in corr.cylinders():
@@ -935,11 +1108,22 @@ def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
                 "间距 2r 的轮廓对 ⇒ 孔/凸台与轴向长度都判不出，**不建特征**"
                 "（记缺口，待确认项交 _resolve_questions 裁决）")
             continue
-        t = _cyl_claim(hint)
+        solid, span_ov = (_rebut_by_section(hint, mats) if mats
+                          else (hint.solid, None))
+        if solid != hint.solid:
+            rep.notes.append(
+                f"剖面反证：r{hint.radius:g} 在剖视图"
+                f"{hint.profile_method.split(':', 1)[-1]} 的圆区间里"
+                + ("整段无剖面线 ⇒ 判孔（不是凸台）"
+                   if span_ov is not None else
+                   "贴一端无剖面线 ⇒ 判孔/腔（不是凸台）"))
+        t = _cyl_claim(hint, solid)
+        span = span_ov if span_ov is not None else hint.span
+        length = (span[1] - span[0]) if span_ov is not None else hint.length
         params: dict[str, Claim] = {}
         if hint.axis.radius is not None:
             params["radius"] = hint.axis.radius
-        if hint.span is not None and hint.span[1] > hint.span[0]:
+        if span is not None and span[1] > span[0]:
             # 轴向位置（P1-A）：轮廓对的 span 是"从哪儿到哪儿"的实测区间，
             # 换算到模型系后直接就是轴向起点。契约：HOLE 的 axial_at = 孔口、
             # BOSS 的 axial_at = 凸台起始处 —— 两者的几何区间都是 [lo, hi]，
@@ -947,11 +1131,13 @@ def cylinder_features(corr: CorrespondenceResult, rep: RecognizeReport,
             # 不写它，发射器只能按 0 起：held-out 件上孔全部落到零件外
             # （IMU 基体 y101..121，孔按 0 起 → 一个也没切中）。
             params["axial_at"] = mk_claim(
-                hint.span[0], "projection:outline_pair_span",
+                span[0], "projection:section_empty_span" if span_ov is not None
+                else "projection:outline_pair_span",
                 Tier.PROJECTION, ev)
-        if hint.length is not None:
+        if length is not None:
             params["height" if t.value == FeatureType.BOSS else "depth"] = mk_claim(
-                hint.length, "projection:outline_pair", Tier.PROJECTION, ev)
+                length, "projection:section_empty_span" if span_ov is not None
+                else "projection:outline_pair", Tier.PROJECTION, ev)
         f = Feature(
             id=FeatureId(next_id), type=t, params=params,
             axis=Claim(hint.axis, "projection:circle_plus_outline",
@@ -1868,6 +2054,34 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
             rep.notes.append(
                 f"高度分解：{len(plan.raises)} 块抬升区、{len(plan.cuts)} 块"
                 f"切除区自 #{first} 号续编（这些圆已由分区表达，不再重复建圆柱）")
+    # 内腔轮廓：基体视图里**隐藏线围出的面** = 从外表面开进去的缺口/腔。
+    # 外环只描述最外一圈，这类结构此前没有消费者（IMU 两个 L 形角缺口被
+    # 基体填成实心）。只在基体视图取（其它视图的隐藏面是凸台/孔的背面
+    # 轮廓）；沿轴范围由垂直视图多数票读，读不到不建（原则二）。
+    # 判据与反例见 inner_profiles 模块文档。
+    from .inner_profiles import inner_pockets
+    for f in inner_pockets(d, corr, base, rep):
+        f.id = FeatureId(next_id)
+        part.add(f)
+        next_id += 1
+    # 外表面开口：圆所在的视图里，**可见面**的边界除孔提示圆边外还有其它段
+    # ⇒ 开口不是圆孔，是整个面的轮廓（stadium 槽、钥匙孔）。命中的提示由
+    # 这条 POCKET 覆盖，从 cylinder_features 的 skip 里排除（见该模块文档）。
+    from .openings import opening_pockets
+    open_feats, open_used = opening_pockets(d, corr, base, rep)
+    for f in open_feats:
+        f.id = FeatureId(next_id)
+        part.add(f)
+        next_id += 1
+    if open_used:
+        prev_open = skip
+
+        def skip(hint: CylinderHint) -> bool:
+            return ((prev_open is not None and prev_open(hint))
+                    or id(hint) in open_used)
+        rep.notes.append(
+            f"开口：{len(open_used)} 条孔的圆边已并入 POCKET 轮廓，"
+            "不再单独建圆柱")
     # 绕坐标轴的回转族（YZYX 塔/盘/止口/侧裙）：端视图里的**短弧簇**（同圆心
     # ≥3 条互异半径、画不满的轮廓弧）定出回转轴，子午视图的轴向线跨视图取交
     # 得母线。`detect_revolve` 的入口是圆柱提示（圆边 ≥ 3），短弧全被它当
@@ -1900,9 +2114,11 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
     # 直接 `e.role == Role.HIDDEN` 恒为假（Claim 与 Role 不同型）—— 取 `.value`。
     draws_hidden = any(e.role.value == Role.HIDDEN for e in d.evidence)
     no_feature: list[CylinderHint] = []
+    mats = _section_materials(d, corr)
     for f in cylinder_features(corr, rep, next_id=next_id, skip=skip,
                                no_feature=no_feature,
-                               draws_hidden=draws_hidden, bindings=binds):
+                               draws_hidden=draws_hidden, bindings=binds,
+                               mats=mats):
         part.add(f)
     # 塔腔（YZYX 式）：搭在圆柱塔上的「冠—拱壳」腔——剖面帧里冠线两端各接
     # 「同心弧对」（小弧 = 冠角、大弧 = 塔端部外形圆角、弧顶 = 塔顶母线，
@@ -1941,14 +2157,19 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
     if m:
         rep.notes.append(f"剖面补扫：{m} 个特征进树")
     merge_section_axes(corr, rep, part)
-    if rep.zones is not None or no_feature or binds.by_handle:
-        # 分区/轮廓证据把圆的角色定死之后，把 corr 层的歧义疑问**裁决**掉
-        # （移进 resolved 并记答案+裁决者）—— 不删条目，报告里仍可追"当时
-        # 怎么想的"。只在图元全部有结论时裁决，缺一条就保留疑问。
-        n = _resolve_questions(rep, rep.zones, no_feature, corr, binds)
-        if n:
-            rep.notes.append(
-                f"疑问消解：{n} 条圆歧义由分区角色/负轮廓证据裁决（见 resolved）")
+    # 圆角色信息来源有三路：高度分区的材料/切除、无轮廓对的负证据、孔标注，
+    # 以及**特征树里已建成的孔/凸台**（它的 type 本身就是一路证据——IMU 的
+    # r4 键孔圆靠 V0 的整段虚线对读成 hole，V1 壁带里的实/虚并存由它裁决；
+    # 此前守卫只看前三路，无分区也无标注的图纸上这类疑问会一直挂着 → 误拦
+    # 发射）。`_resolve_questions` 内部只在图元全部有结论时才裁决，缺一条
+    # 就保留疑问，故无条件调用是安全的。
+    # 分区/轮廓证据把圆的角色定死之后，把 corr 层的歧义疑问**裁决**掉
+    # （移进 resolved 并记答案+裁决者）—— 不删条目，报告里仍可追"当时
+    # 怎么想的"。
+    n = _resolve_questions(rep, rep.zones, no_feature, corr, binds)
+    if n:
+        rep.notes.append(
+            f"疑问消解：{n} 条圆歧义由分区角色/负轮廓证据裁决（见 resolved）")
     for f in pattern_features(conv, corr, rep, part):
         part.add(f)
     if thread_links(conv, rep, part):

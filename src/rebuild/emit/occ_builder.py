@@ -435,6 +435,66 @@ def _profile_face(f: Feature, profile: Any, t: float, what: str):
     return _polygon_face(pts, f, what)
 
 
+#: 弧端点吸附容差（mm）：PDF 矢量化的图纸把弧端点量化到 0.01mm，
+#: 与弧实体的圆心/半径可差几 µm（IMU 角缺口实测 6µm）。见 `_snap_arc_ends`。
+ARC_END_SNAP = 0.05
+
+
+def _snap_arc_ends(segs: tuple[ProfileSeg2, ...]) -> tuple[ProfileSeg2, ...]:
+    """弧端点吸附回它自己的圆心/半径，并把相邻段端点焊成同一坐标。
+
+    为什么必须做：``_profile2_face`` 用**三点弧**建棱，而
+    ``GC_MakeArcOfCircle(P1, Pm, P2)`` 是**按三点重新拟合圆**——端点离
+    圆弧几 µm，拟合出的圆心/半径就偏几十 µm；同一条圆被图纸拆成两段
+    45° 弧时，两段拟合出略不同的圆，``BRepCheck_Analyzer`` 判**面无效**
+    （IMU 角缺口实测：r2 拆 45°+45°、端点离圆 6µm，拟合 r=1.9616——
+    面无效后布尔把工具体当成空集：`Common` 体积 0、`Cut` 只在共面壁上
+    留一圈相切内环，材料一点没去）。偏差 ≤ ``ARC_END_SNAP`` 的端点按
+    圆心/半径原位吸附（图纸精度内）；超过则不碰——那是弧和端点真的
+    对不上，不能替图纸做主。
+
+    吸附只改端点，再由相邻段"焊接"把线端点跟过来，链不会断。``sa``/
+    ``ea`` 按吸附后的端点重算，保持"sa 是 p1 端角"的契约（Pm 由它取）。
+    """
+    n = len(segs)
+    pts: list[list[Point2]] = [[s.p1, s.p2] for s in segs]
+    snapped: list[list[bool]] = [[False, False] for _ in segs]
+    for i, s in enumerate(segs):
+        if s.kind != "arc" or s.center is None or s.radius <= 0.0:
+            continue
+        c, r = s.center, s.radius
+        d1 = abs(math.hypot(pts[i][0].x - c.x, pts[i][0].y - c.y) - r)
+        d2 = abs(math.hypot(pts[i][1].x - c.x, pts[i][1].y - c.y) - r)
+        if d1 > ARC_END_SNAP or d2 > ARC_END_SNAP:
+            continue                    # 弧与端点真的对不上：不替图纸做主
+        pts[i][0] = Point2(c.x + r * math.cos(s.sa), c.y + r * math.sin(s.sa))
+        pts[i][1] = Point2(c.x + r * math.cos(s.ea), c.y + r * math.sin(s.ea))
+        snapped[i][0] = snapped[i][1] = True
+    # 相邻段端点焊接：优先用吸附过的那个坐标（线端点差几 µm 跟过来）
+    for i in range(n):
+        j = (i + 1) % n
+        if pts[i][1].distance_to(pts[j][0]) > ARC_END_SNAP:
+            continue                    # 真断点：留给 chain_break 报
+        if snapped[i][1] and not snapped[j][0]:
+            pts[j][0] = pts[i][1]
+        elif snapped[j][0] and not snapped[i][1]:
+            pts[i][1] = pts[j][0]
+        elif pts[i][1].distance_to(pts[j][0]) > 0.0:
+            pts[j][0] = pts[i][1]       # 都不在圆上：取前一段端点为准
+    out: list[ProfileSeg2] = []
+    for i, s in enumerate(segs):
+        p1, p2 = pts[i]
+        if s.kind != "arc" or s.center is None or s.radius <= 0.0:
+            out.append(ProfileSeg2("line", p1, p2))
+            continue
+        c = s.center
+        out.append(ProfileSeg2(
+            "arc", p1, p2, c, s.radius, s.ccw,
+            math.atan2(p1.y - c.y, p1.x - c.x),
+            math.atan2(p2.y - c.y, p2.x - c.x)))
+    return tuple(out)
+
+
 def _profile2_face(f: Feature, profile: Profile2, t: float, what: str):
     """带圆弧的轮廓（``Profile2``）→ 轴上 t 处平面内的 face。
 
@@ -443,6 +503,7 @@ def _profile2_face(f: Feature, profile: Profile2, t: float, what: str):
     P1, P2)`` 在起点参数大于终点时会绕出补弧，朝向语义易错）。弧中点
     Pm 按 ``sa→ea``（``ccw`` 定方向）取跨度中角——与 views/ring.py 记
     角度同约定：``sa`` 恒为 ``p1`` 端角、``ea`` 恒为 ``p2`` 端角。
+    弧端点先过 ``_snap_arc_ends``（图纸量化误差会让三点弧拟合成另一个圆）。
 
     ⚠️ 段序必须是**遍历序**（首尾相接的闭合链）：``MakeWire.Add`` 对乱序
     边会自动重排，产出的 face 有时面积对、拉伸后体积错（实测乱序 D 形
@@ -450,12 +511,12 @@ def _profile2_face(f: Feature, profile: Profile2, t: float, what: str):
     """
     o, d = _axis_of(f)
     b1, b2 = basis_of(d)
-    segs = profile.segments
+    segs = _snap_arc_ends(profile.segments)
     if len(segs) < 2:
         raise OccBuildError(
             f"特征 #{f.id}（{f.type.value}）{what}：轮廓段数需 ≥2（两段弧可构成整圆），"
             f"实得 {len(segs)}")
-    brk = profile.chain_break()
+    brk = Profile2(segs).chain_break()
     if brk is not None:
         s0, s1 = segs[brk], segs[(brk + 1) % len(segs)]
         raise OccBuildError(

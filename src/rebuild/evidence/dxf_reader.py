@@ -23,7 +23,10 @@ from .text_parser import parse_text
 # ---- 角色判据词表 ----
 # 判据来自**图层名 / 线型名**（制图约定的命名习惯），故 tier=CONVENTION。
 
-_AXIS_WORDS = ("中心线", "中心", "轴线", "CENTER", "DASHDOT", "CTR")
+_AXIS_WORDS = ("中心线", "中心", "轴线", "CENTER", "DASHDOT", "CTR",
+               # 国标对点画线的正式叫法，不少图纸直接拿它当图层名
+               # （20180425-161001-43401 气缸前盖实测：整张图的中心线都在此层）
+               "点画线")
 _HIDDEN_WORDS = ("隐藏", "虚线", "HIDDEN", "DASHED", "DASH",
                  # ISO 虚线线型（实体级 linetype override 常见写法，YZYX 实测）：
                  "AM_ISO")

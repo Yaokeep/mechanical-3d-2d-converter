@@ -345,11 +345,66 @@ def _sheet_frame(geom: list[Evidence], gap_x: float, gap_y: float
             return set(), None
         handles, rect = got
         out |= handles
+        # 外沿框剥掉后继续试长线矩：正式图纸常见**两层框**（图幅外框 +
+        # 绘图区图框）。第一轮长线矩面对完整几何时，内层图框的边还留在
+        # 框内、把内容桥接成一簇 ⇒ 护栏②否决、退回本退路只剥外层；内框
+        # 线横跨全图，随后把各视图桥接成一个（实测 20180425 气缸前盖：
+        # 外框 0..420 剥掉后，图框 25..415 的四条边让 4 个视图聚成 1 个，
+        # 所有圆都找不到轮廓对、67 项拦路）。
+        rest = [e for e in geom if e.handle not in out]
+        for _ in range(2):
+            got = _frame_by_long_lines(rest, gap_x, gap_y)
+            if got is None:
+                break
+            handles, rect = got
+            out |= handles
+            rest = [e for e in rest if e.handle not in handles]
 
     for e in geom:
         if e.handle not in out and not _inside(rect, e.exact_bbox):
             out.add(e.handle)          # 判据是"不完全落在框内"，不是"与框不相交"
     return out, rect
+
+
+#: 标题栏/明细表识别：贴图框容差（mm）、最小图元数、占框面积上限
+_TITLE_TOL = 2.0
+_TITLE_MIN_ELEMS = 8
+_TITLE_MAX_AREA_FRAC = 0.35
+
+
+def _is_title_block(items: list[Evidence], rect: BBox2 | None) -> bool:
+    """标题栏/明细表：**紧贴图框角、全由轴对齐直线构成**的表格簇。
+
+    它不是视图，却是几十条轮廓线——留着会成为一个假视图，把视图间的
+    对齐关系搅乱（实测 20180425 气缸前盖：180×56 的标题栏成为 V4，抢走
+    右视图的列伙伴并把主视图候选打成平手 ⇒ 五个视图全 UNKNOWN）。
+
+    三条判据（全部来自图面，不看图层名）：
+    ① 至少两条**相邻**边贴住图框（容差 2mm）——视图与图框之间总有留白，
+       表格则靠边画；
+    ② 全部是水平/垂直直线（弧与斜线的包围盒两向都非零）；
+    ③ 面积占比 ≤ 35%——标题栏不可能是整张图。
+
+    没有图框（``rect=None``）时不判：缺少"贴边"这条硬判据，宁可留着。
+    """
+    if rect is None or len(items) < _TITLE_MIN_ELEMS:
+        return False
+    b = _bbox_of(items)
+    w, h = b.xmax - b.xmin, b.ymax - b.ymin
+    frame_area = (rect.xmax - rect.xmin) * (rect.ymax - rect.ymin)
+    if frame_area <= 0 or w * h > _TITLE_MAX_AREA_FRAC * frame_area:
+        return False
+    near_left = b.xmin - rect.xmin <= _TITLE_TOL
+    near_right = rect.xmax - b.xmax <= _TITLE_TOL
+    near_bottom = b.ymin - rect.ymin <= _TITLE_TOL
+    near_top = rect.ymax - b.ymax <= _TITLE_TOL
+    if not ((near_left or near_right) and (near_bottom or near_top)):
+        return False
+    for e in items:
+        eb = e.exact_bbox
+        if eb.xmax - eb.xmin > _FRAME_TOL and eb.ymax - eb.ymin > _FRAME_TOL:
+            return False                     # 斜线/弧 —— 表格没有
+    return True
 
 
 def detect_views(d: Drawing, params: DetectParams | None = None) -> list[View]:
@@ -402,6 +457,20 @@ def detect_views(d: Drawing, params: DetectParams | None = None) -> list[View]:
     # ---- 递归 XY 切分 ----
     groups = _xy_cut(list(range(len(geom))), boxes, gap_x, gap_y)
 
+    # 标题栏/明细表是**框内家具**：贴图框角的轴对齐表格簇不建视图。
+    # 它的几何已在 clustered 里，不会在 _assign 里被就近认领；其中的文字与
+    # 尺寸由 furniture_zones 一并排除（否则表格文字会污染剖面标题/视图标签）。
+    zones: list[BBox2] = []
+    kept: list[list[int]] = []
+    for g in groups:
+        items = [geom[i] for i in g]
+        if _is_title_block(items, frame_rect):
+            zones.append(_bbox_of(items))
+        else:
+            kept.append(g)
+    if len(kept) >= 2:          # 护栏：别把"整张图只有一块表格"的图纸吃光
+        groups = kept
+
     # 按位置排序（先上后下、先左后右），使 id 稳定可预期
     groups.sort(key=lambda g: (-max(boxes[i].ymax for i in g),
                                min(boxes[i].xmin for i in g)))
@@ -418,7 +487,7 @@ def detect_views(d: Drawing, params: DetectParams | None = None) -> list[View]:
         ))
 
     _assign(d, views, clustered={m.handle for m in geom}, excluded=frame,
-            furniture=frame_rect)
+            furniture=frame_rect, furniture_zones=zones)
 
     d.views = views
     return views
@@ -426,7 +495,8 @@ def detect_views(d: Drawing, params: DetectParams | None = None) -> list[View]:
 
 def _assign(d: Drawing, views: list[View], clustered: set[str],
             excluded: set[str] | None = None,
-            furniture: BBox2 | None = None) -> None:
+            furniture: BBox2 | None = None,
+            furniture_zones: list[BBox2] | None = None) -> None:
     """把未参与聚类的图元归属到视图。
 
     归类：轴线 / 填充本体 / 剖切线 → ``evidence``；文字 / 尺寸 → ``annotations``。
@@ -435,14 +505,19 @@ def _assign(d: Drawing, views: list[View], clustered: set[str],
     外框会以"离谁近算谁的"落到某个视图的 evidence 里，再次污染它的包围盒）。
     ``furniture`` 是外框矩形：**框外的文字与尺寸**（图幅分区字母、装订边
     标记的编号）同样不归属——它们不是任何视图的标注。
+    ``furniture_zones`` 是框内家具区（标题栏/明细表）：落在其中的文字与
+    尺寸（表格内容）同样不归属。
     """
     if not views:
         return
     excluded = excluded or set()
+    zones = furniture_zones or []
 
     def _is_furniture(x: float, y: float) -> bool:
-        return furniture is not None and _outside(
-            furniture, BBox2(x, y, x, y))
+        pt = BBox2(x, y, x, y)
+        if furniture is not None and _outside(furniture, pt):
+            return True
+        return any(_inside(z, pt) for z in zones)
 
     # ---- 轴线、填充本体、剖切线：属于某个视图的图元 ----
     # 它们不参与聚类（会撑大包围盒或跨视图），故按自身几何中心就近归属

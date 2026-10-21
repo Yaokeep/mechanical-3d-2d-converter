@@ -950,10 +950,18 @@ def decompose(d: "Drawing", corr: CorrespondenceResult, base: Feature,
         if b is not None:
             bands.append(b)
     if not bands:
-        return None                      # 没有剪影通道：静默退回（别的靶子如此）
+        have = sorted({f"{fr.view_id}(u={fr.u_axis},v={fr.v_axis})"
+                       for fr in corr.frames.values()})
+        rep.notes.append(
+            f"高度分解：没有 v_axis={dir_name} 且 u_axis={b1_axis} 的剪影视图"
+            f"（现有帧 {have or '无'}）⇒ 无法读抬升区，基体照旧一次拉伸")
+        return None
     band = merge_bands(bands)
     tops = band.tops_in(*r1)
     if not tops:
+        rep.notes.append(
+            f"高度分解：剪影视图在 {b1_axis} 向区间 {r1[0]:.2f}..{r1[1]:.2f} "
+            "里没有顶面读数 ⇒ 抬升区无从定出，基体照旧一次拉伸")
         return None
     if max(tops) - min(tops) <= UNIFORM_TOL:
         rep.notes.append(

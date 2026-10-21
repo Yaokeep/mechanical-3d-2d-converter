@@ -55,7 +55,8 @@ from ..model.geom2d import (
     Arc2, BBox2, Circle2, Line2, Point2, Polyline2, Profile2, ProfileSeg2,
 )
 
-__all__ = ["Ring", "RingResult", "RingSeg", "extract_ring"]
+__all__ = ["FaceRing", "Ring", "RingResult", "RingSeg",
+           "extract_faces", "extract_ring"]
 
 #: 参与环提取的角色。**只有可见轮廓** —— 与 view_detector 的口径
 #: （含 HIDDEN/HATCH_BOUNDARY，视图包围盒理应计入全部图元）有意分歧：
@@ -87,6 +88,12 @@ AREA_FLOOR = 10.0     # 候选环最小面积 mm²（旧 keep_all=False 口径�
 #: 焊接，v15 误焊教训），故胶合必须是**独立兜底**、不与成功的环竞逐。
 GLUE_CLOSE = 0.5      # 近邻顶点合并距离（含端点）
 GLUE_GAP = 1.5        # 悬空顶点吸附到最近非悬空顶点的距离上限
+#: 同一圆上弧端点的合并上限。弧是刚性几何：同一圆上两段弧的端点若相距
+#: 超过图纸量化精度，它们之间隔着一段**真实弧长**——合并等于把那段弧
+#: 塌掉，环会在该圆上折返（往返走出尖刺 ⇒ 自交，发射器 BRepCheck 判面
+#: 无效）。5×SNAP 取的是「图纸量化 + 端点吸附」的合计口径，与发射器
+#: ``ARC_END_SNAP`` 同量级。见 ``_glue`` 的 ``union``。
+GLUE_COCIRC = 0.05
 
 #: 置 RING_DBG=1 打印遍历决策 / =2 全步输出（排查用，对照旧管线 SLANT_DBG 先例）
 _DBG = int(os.environ.get("RING_DBG") or 0)
@@ -146,6 +153,7 @@ class _E:
     ea: float = 0.0              # 弧：CCW 终点角（弧度）
     sa_v: int = -1               # 弧：sa 端顶点（直线不用）
     ea_v: int = -1               # 弧：ea 端顶点
+    role: str = "visible"        # 来源证据角色（"visible"|"hidden"）
 
 
 @dataclass(frozen=True)
@@ -223,13 +231,16 @@ def _angle_in_arc(ang: float, sa: float, ea: float,
 _SPLIT_EPS = 1e-6
 
 
-def _split_primitives(prims: list) -> list:
+def _split_primitives(prims: list, with_src: bool = False) -> list:
     """在边-边交点处拆分图元（旧 :681 ``split_edges_at_intersections`` 语义）。
 
     三种情形全拆：线∩线（T 型 / X 型，内部侧拆）、弧∩弧（双圆求交）、
     线∩弧（弧侧必拆、线侧仅内部拆）。相切交点（disc≈0）也要拆——
     浮点误差可能让 disc 成微负（旧 v0.6.3 教训：法兰叶片角直线与 r=30
     圆相切漏拆 ⇒ 外环断链）。
+
+    ``with_src=True`` 时返回 ``(源图元下标, 拆分后图元)`` 二元组——
+    全角色边图需要把拆分结果归回原证据角色（隐藏/可见）。
     """
     n = len(prims)
     if n < 2:
@@ -321,10 +332,10 @@ def _split_primitives(prims: list) -> list:
     out: list = []
     for i, p in enumerate(prims):
         params = sorted(set(round(t, 9) for t in cuts[i]))
+        sub: list = []
         if not params:
-            out.append(p)
-            continue
-        if p[0] == "L":
+            sub.append(p)
+        elif p[0] == "L":
             x1, y1, x2, y2 = p[1:]
             pts = [(x1, y1)]
             for t in params:
@@ -332,7 +343,7 @@ def _split_primitives(prims: list) -> list:
             pts.append((x2, y2))
             for (ax, ay), (bx, by) in zip(pts, pts[1:]):
                 if math.hypot(bx - ax, by - ay) > 1e-9:
-                    out.append(("L", ax, ay, bx, by))
+                    sub.append(("L", ax, ay, bx, by))
         else:
             _c, cx, cy, r, sa, ea = p
             span = (ea - sa) % TAU
@@ -358,12 +369,23 @@ def _split_primitives(prims: list) -> list:
                 p1 = (cx + r * math.cos(a1), cy + r * math.sin(a1))
                 p2 = (cx + r * math.cos(a2), cy + r * math.sin(a2))
                 if math.hypot(p2[0] - p1[0], p2[1] - p1[1]) > 1e-9:
-                    out.append(("A", cx, cy, r, a1, a2))
+                    sub.append(("A", cx, cy, r, a1, a2))
+        if with_src:
+            out.extend((i, q) for q in sub)
+        else:
+            out.extend(sub)
     return out
 
 
-def _profile_edges(d: Drawing, v: View):
-    """视图轮廓类证据 → (edges: list[_E], vpos: dict[int, (x, y)])。"""
+def _profile_edges(d: Drawing, v: View, roles: set[str] | None = None):
+    """视图轮廓类证据 → (edges: list[_E], vpos: dict[int, (x, y)])。
+
+    ``roles`` 是**角色值**集合（``Role.value``），缺省只取可见轮廓
+    （``_PROFILE_ROLES``）。内环/内腔通道传 ``{"visible", "hidden"}``：
+    腔体边界在图纸上正是以隐藏线出现的（IMU 的两个角凹腔、D79307 的
+    钥匙孔轴段），只要外轮廓环仍走缺省口径即可，互不影响。
+    """
+    roles = {r.value for r in _PROFILE_ROLES} if roles is None else set(roles)
     by_h = {e.handle: e for e in d.evidence}
     vpos: dict[int, tuple[float, float]] = {}
     key2id: dict[tuple[float, float], int] = {}
@@ -385,20 +407,25 @@ def _profile_edges(d: Drawing, v: View):
     # 49.20 死端（8-07 实测：welded 遍断在 (21.90,140.33)）。
     ev_order = {ev.handle: i for i, ev in enumerate(d.evidence)}
     prims: list = []
+    roles_of: list[str] = []
     for h in sorted(v.evidence, key=lambda h: ev_order.get(h, 1 << 30)):
         ev = by_h.get(h)
-        if ev is None or ev.role.value not in _PROFILE_ROLES:
+        if ev is None or ev.role.value not in roles:
             continue
-        prims.extend(_prim_from_geom(ev.geom))
-    prims = _split_primitives(prims)
+        for p in _prim_from_geom(ev.geom):
+            prims.append(p)
+            roles_of.append(ev.role.value)
+    # 拆分保持来源角色（``with_src`` 返回 (src_index, prim)）
+    parts = _split_primitives(prims, with_src=True)
 
     edges: list[_E] = []
-    for p in prims:
+    for src, p in parts:
+        role = roles_of[src]
         if p[0] == "L":
             vs, ve = _vid(p[1], p[2]), _vid(p[3], p[4])
             if vs == ve:
                 continue                          # 吸附后退化，静默丢弃
-            edges.append(_E("L", vs, ve))
+            edges.append(_E("L", vs, ve, role=role))
         else:
             _c, cx, cy, r, sa, ea = p
             x1, y1 = cx + r * math.cos(sa), cy + r * math.sin(sa)
@@ -406,7 +433,7 @@ def _profile_edges(d: Drawing, v: View):
             vs, ve = _vid(x1, y1), _vid(x2, y2)
             if vs == ve:
                 continue
-            edges.append(_E("A", vs, ve, cx, cy, r, sa, ea, vs, ve))
+            edges.append(_E("A", vs, ve, cx, cy, r, sa, ea, vs, ve, role=role))
     return edges, vpos
 
 
@@ -573,7 +600,7 @@ def _weld(edges: list[_E], vpos):
     return vpos2, edges2
 
 
-def _glue(edges: list[_E], vpos):
+def _glue(edges: list[_E], vpos, *, cap: float | None = None):
     """顶点胶合第三遍（旧 :932/:979 两遍合并的移植）。返回 (vpos2, edges2)。
 
     与 ``_weld`` 的分工是**证据强度**：``_weld`` 只焊微边链自由端
@@ -582,10 +609,40 @@ def _glue(edges: list[_E], vpos):
     情形（D79307 V1 底脚链整条被度 1 修剪删掉即此）。因此胶合只作为
     raw/welded **都失败**时的兜底，不参与已成功视图的竞逐。
 
+    ``cap`` 非 None 时启用**簇直径上限**（``cap`` mm）：0.5mm 近邻合并
+    沿微线段链**传递**扩散，能把整段轮廓塌成一簇（簇代表位与链上真实
+    位置差数毫米，环被一条拉长边顶替）。实测 D79307：有界胶合使
+    V0 覆盖率 0.541×1.0 → 1.0×1.0、V1 环面积 270.1 → 262.0（金值
+    剖面 263.6），三视图全面优于无界版；无界版仍是兜底（YZYX 等
+    依赖链式合并救环的靶子只在有界版失败时才走它）。有界模式下
+    近邻合并**不再要求"任一端为自由端"**——直径上限已经从结构上
+    阻止了链式塌缩，无条件合并才能把两条微链之间的缝也合上。
+
     **边数/边序保持不变**：合并后退化成自环的边留在表里（``_one_pass``
     会跳过度 0 的边），这样 ``micro_len``（eid→链长）的下标依旧有效。
+
+    ⚠️ 但"退化成自环"不许是**胶合自己造出来的**，且只保护**圆弧**：弧是
+    刚性几何，两端点被并进同一簇等于整条弧抹掉（不是补缝）；直线微链的
+    传递合并正是这一遍要的（D79307 V1 底脚链靠它救回），不能拦。实测
+    D79307 V2 的 R1.75 圆头：两段圆弧的端点与微线段链落在同一片 0.5mm
+    邻域里被传递合并，圆弧塌成零长（raw 1.32mm → 0.00），缺口处的微边被
+    拉长 7.5mm 顶上，钥匙孔面于是沿对角线抄近路。故 union 带**弧禁并
+    约束**：任一弧边的两个端点簇不得合并（弧邻接表随 union 维护）。
     """
     parent = {v: v for v in vpos}
+    #: 弧的禁并邻接（根 → 因某条弧而不许合并的根）。只记弧边。
+    arc_nb: dict[int, set[int]] = defaultdict(set)
+    #: 每个顶点所属圆弧的「圆签名」（圆心+半径量化）——同一圆上**跨弧**
+    #: 端点的禁并依据（``arc_nb`` 只管同一条弧的两端）。
+    circ: dict[int, set[tuple[float, float, float]]] = defaultdict(set)
+    for e in edges:
+        if e.t == "A" and e.vs != e.ve:
+            arc_nb[e.vs].add(e.ve)
+            arc_nb[e.ve].add(e.vs)
+        if e.t == "A" and e.r > 0.0:
+            sig = (round(e.cx, 3), round(e.cy, 3), round(e.r, 3))
+            circ[e.vs].add(sig)
+            circ[e.ve].add(sig)
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -593,12 +650,58 @@ def _glue(edges: list[_E], vpos):
             x = parent[x]
         return x
 
-    def union(a: int, b: int) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
+    #: 簇成员（仅 ``cap`` 模式需要——用于判直径）；根 → 顶点集合
+    members: dict[int, set[int]] = {v: {v} for v in vpos} if cap is not None else {}
 
-    # 1) 近邻顶点合并（旧 :932，0.5mm 含端点）
+    def union(a: int, b: int) -> bool:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return True
+        if rb in arc_nb.get(ra, ()) or ra in arc_nb.get(rb, ()):
+            return False              # 合并会把一条弧抹成自环
+        if cap is not None:
+            pts = members[ra] | members[rb]
+            xs = [vpos[v][0] for v in pts]
+            ys = [vpos[v][1] for v in pts]
+            if max(xs) - min(xs) > cap or max(ys) - min(ys) > cap:
+                return False          # 簇直径超限：合并会拉长边
+            # 同一圆上的弧端点不许远距离合并（见 GLUE_COCIRC）：跨簇逐对查，
+            # 任一对同圆端点相距 > GLUE_COCIRC 即拒绝——粘上会把两段弧之间
+            # 的真实弧长塌成零，环在该圆上折返出尖刺。
+            common = ({s for x in members[ra] for s in circ.get(x, ())}
+                      & {s for y in members[rb] for s in circ.get(y, ())})
+            if common:
+                ma = [(x, [s for s in circ.get(x, ()) if s in common])
+                      for x in members[ra]]
+                mb = [(y, [s for s in circ.get(y, ()) if s in common])
+                      for y in members[rb]]
+                for x, sx in ma:
+                    if not sx:
+                        continue
+                    for y, sy in mb:
+                        if not sy or not set(sx) & set(sy):
+                            continue
+                        if math.hypot(vpos[x][0] - vpos[y][0],
+                                      vpos[x][1] - vpos[y][1]) > GLUE_COCIRC:
+                            return False
+            members[rb] = pts
+            del members[ra]
+        parent[ra] = rb
+        for x in tuple(arc_nb.pop(ra, ())):
+            arc_nb[x].discard(ra)
+            arc_nb[x].add(rb)
+            arc_nb[rb].add(x)
+        arc_nb[rb].discard(ra)
+        return True
+
+    # 1) 近邻顶点合并（旧 :932，0.5mm）。
+    #    0.5mm 比 PDF 矢量化微线段本身（~0.04mm）大一个量级：无差别合并会把
+    #    每条微边的两端并掉 ⇒ 整条链塌成一簇，簇代表位置（首见/弧端点）与
+    #    链上各段真实位置可差数毫米，环/面在簇边缘就被一条**拉长的边**顶替
+    #    （实测 D79307：V1 底脚 3.7mm 的斜线抄近路 +7.6mm²；V2 钥匙孔圆头
+    #    两段对角捷径 −26% 面积）。``cap`` 模式靠**簇直径上限**从结构上
+    #    拦住这类塌缩（链本身最长只有几 mm，不可能把整段轮廓并进一簇）；
+    #    无界模式（``cap=None``，v0.6.44 兜底）保留原有语义。
     ids = list(vpos)
     grid: dict[tuple[int, int], list[int]] = defaultdict(list)
     for v in ids:
@@ -1046,12 +1149,491 @@ def _to_ring(p: _Pass, edges: list[_E], vpos, rule: str,
     if view_bbox is not None:
         vw = view_bbox.width
         vh = view_bbox.height
-        rw = p.vbox[2] - p.vbox[0]
-        rh = p.vbox[3] - p.vbox[1]
+        # ⚠️ 必须用**含弧顶的几何 bbox**，不能只用顶点 bbox（p.vbox）：
+        # 外轮廓由大弧构成时，弧顶可能显著伸出两端顶点之外。20180425
+        # 气缸前盖的 φ155 双平边盘实测——两段 r77.5 弧的顶点落在 x
+        # 240.0/343.9，弧顶却鼓到 214.5/369.5，顶点 bbox 宽只有 103.9，
+        # 覆盖率算成 0.67 被门控误杀。旧管线用顶点 bbox 是因为它把弧
+        # 已离散成折线（顶点即极值点）；新框架保存真弧，口径要跟着换
+        gb = _geom_bbox(segs_t)
+        rw = gb.width
+        rh = gb.height
         if vw > 0 and vh > 0:
             cov = (rw / vw, rh / vh)
     return Ring(segs_t, p.area, _geom_bbox(segs_t), rule, cov,
                 n_edges, n_micro, p.n_comp)
+
+
+# ---------------------------------------------------------------------------
+# 内界面提取（全角色边图 → 所有有界面）
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FaceRing:
+    """视图边图中的一个**有界面**（闭合、简单、纸面 CCW 正面积）。
+
+    与外环 ``Ring`` 的分工：``Ring`` 回答"这个视图的零件外轮廓是什么"，
+    ``FaceRing`` 回答"这个视图把平面切成了哪些块"。图纸上的孔/槽/腔
+    边界（可见或隐藏）都会把视图平面切成至少两块——内腔通道消费除
+    **主体块**（覆盖率接近 1 的那块）以外的面，再用垂直视图的证据
+    裁决它是"切除"还是"凸出"。
+    """
+
+    segs: tuple[RingSeg, ...]
+    area: float
+    bbox: BBox2
+    coverage: tuple[float, float]
+    n_boundary: int                        # 边界段数（拆分后）
+    n_hidden: int                          # 其中来源角色为 hidden 的段数
+    n_visible: int
+    rule: str                              # "raw" | "glued"
+    #: 隐藏段**长度**占比（0..1）。内腔判据用它而不是段数占比：PDF
+    #: 矢量化图纸的腔体边界是碎段链，段数会被比例尺无关的短段放大。
+    hidden_frac: float = 0.0
+
+    def to_profile(self) -> Profile2:
+        return Profile2(self.segs)
+
+
+def _enum_faces(edges: list[_E], vpos, micro_len: dict[int, float]):
+    """枚举边图全部**有界面**（左面遍历 + 去重）。
+
+    返回 ``[(signed_area, ring, comp_index)]``，``ring`` 为
+    ``(eid, from_v, to_v)`` 序列。只保留**正面积**（CCW 简单环）：
+    左面遍历对无界面/外表面给出负面积或自交环，两者都不是"图纸上的
+    一块材料/空腔"。微边（PDF 矢量化碎段）必须全部参与——隐藏腔体的
+    边界正是碎段链（IMU V1 的角凹腔实测）。
+    """
+    adj: dict[int, list] = {v: [] for v in vpos}
+    for eid, e in enumerate(edges):
+        if e.vs == e.ve:
+            continue
+        adj[e.vs].append((eid, e.ve, _leave_angle(e, e.vs, vpos)))
+        adj[e.ve].append((eid, e.vs, _leave_angle(e, e.ve, vpos)))
+    for v in adj:
+        adj[v].sort(key=lambda x: x[2])
+
+    # 修剪度 1 悬边（同 ``_one_pass``）
+    changed = True
+    while changed:
+        changed = False
+        for v in [v for v in adj if len(adj.get(v, [])) == 1]:
+            if not adj.get(v):
+                continue
+            _eid, w, _ang = adj[v][0]
+            del adj[v]
+            adj[w] = [t for t in adj[w] if t[1] != v]
+            changed = True
+
+    # 往返副本签名（同 ``_one_pass``）
+    sig: dict[int, tuple] = {}
+    for eid, e in enumerate(edges):
+        if e.t == "A" and e.r > 0:
+            a1, a2 = round(math.degrees(e.sa), 1), round(math.degrees(e.ea), 1)
+            sig[eid] = ("A", round(e.cx, 2), round(e.cy, 2), round(e.r, 2),
+                        min(a1, a2), max(a1, a2))
+        else:
+            x1, y1 = vpos[e.vs]
+            x2, y2 = vpos[e.ve]
+            sig[eid] = ("L", round(min(x1, x2), 2), round(min(y1, y2), 2),
+                        round(max(x1, x2), 2), round(max(y1, y2), 2))
+
+    def _is_micro_edge(eid: int) -> bool:
+        e = edges[eid]
+        if not _is_microg(*vpos[e.vs], *vpos[e.ve]):
+            return False
+        return micro_len.get(eid, 0.0) < MICRO_CHAIN_MIN
+
+    def _arc_cont(prev_edge, incoming, eid, ang_out) -> int:
+        if prev_edge is None:
+            return 1
+        pe, ce = edges[prev_edge], edges[eid]
+        if pe.t != "A" or ce.t != "A":
+            return 1
+        if abs(pe.cx - ce.cx) > 0.1 or abs(pe.cy - ce.cy) > 0.1 \
+                or abs(pe.r - ce.r) > 0.1:
+            return 1
+        if _is_micro_edge(eid):
+            return 1
+        return 0 if abs(_norm(ang_out - incoming)) < math.pi / 2 else 1
+
+    def _advance(cur, incoming, used, used_sigs, prev_edge):
+        out_ref = incoming + math.pi
+        if out_ref > math.pi:
+            out_ref -= TAU
+        cands = []
+        for eid, other, ang in adj.get(cur, []):
+            if eid in used or sig[eid] in used_sigs:
+                continue
+            ccw = ang - out_ref
+            if ccw < -math.pi:
+                ccw += TAU
+            if ccw < 0:
+                ccw += TAU
+            if ccw < 0.1 or ccw > TAU - 0.1:
+                ccw = TAU
+            elif abs(ccw - math.pi) < 0.1:
+                ccw = math.pi
+            cands.append((ccw, eid, other, ang))
+        if not cands:
+            return None
+        big = [c for c in cands if not _is_micro_edge(c[1])]
+        if big:
+            cands = big
+        deg = len(adj.get(cur, []))
+        tie_arc_first = deg <= 2
+        cands.sort(key=lambda c: (
+            _arc_cont(prev_edge, incoming, c[1], c[3]) if deg <= 2 else 1,
+            -((c[0] + 1e-6) % TAU),
+            0 if (edges[c[1]].t == "A") == tie_arc_first else 1))
+        return cands[0]
+
+    # 连通分量（修剪后）
+    seen: set[int] = set()
+    comps: list[list[int]] = []
+    for v in vpos:
+        if v in seen or v not in adj:
+            continue
+        stack = [v]
+        seen.add(v)
+        vs = []
+        while stack:
+            u = stack.pop()
+            vs.append(u)
+            for _eid, w, _ang in adj.get(u, []):
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+        comps.append(vs)
+
+    def _signed(pts) -> float:
+        a = 0.0
+        n = len(pts)
+        for i in range(n):
+            x1, y1 = pts[i]
+            x2, y2 = pts[(i + 1) % n]
+            a += x1 * y2 - x2 * y1
+        return a / 2.0
+
+    faces = []
+    seen_faces: set[frozenset] = set()
+    for ci, vs in enumerate(comps):
+        if len(vs) < 3:
+            continue
+        vset = set(vs)
+        for v0 in vs:
+            for eid0, w0, ang0 in adj.get(v0, []):
+                if w0 not in vset:
+                    continue
+                ring = [(eid0, v0, w0)]
+                used = {eid0}
+                used_sigs = {sig[eid0]}
+                incoming = ang0
+                cur, prev = w0, eid0
+                closed = False
+                for _ in range(4000):
+                    step = _advance(cur, incoming, used, used_sigs, prev)
+                    if step is None:
+                        break
+                    _ccw, eid, nxt, ang = step
+                    ring.append((eid, cur, nxt))
+                    used.add(eid)
+                    used_sigs.add(sig[eid])
+                    incoming = _norm(ang + _sweep(edges[eid], cur, nxt, vpos))
+                    prev = eid
+                    cur = nxt
+                    if cur == v0:
+                        closed = True
+                        break
+                if not closed:
+                    continue
+                key = frozenset(e for e, _f, _t in ring)
+                if key in seen_faces:
+                    continue
+                pts = [vpos[f] for _e, f, _t in ring]
+                a = _signed(pts)
+                if a <= 0.0:
+                    continue                # 外表面/顺时针 = 不是有界面
+                # 简单性：顶点不得重复（绕孔全周的环面积虚高）
+                vc: set[int] = set()
+                dup = False
+                for _e, f, _t in ring:
+                    if f in vc:
+                        dup = True
+                        break
+                    vc.add(f)
+                if dup:
+                    continue
+                seen_faces.add(key)
+                faces.append((a, ring, ci, len(vs)))
+    return faces
+
+
+def _enum_faces_dcel(edges: list[_E], vpos, micro_len: dict[int, float]):
+    """DCEL 标准左面遍历 —— 切线折返处也能走，``_enum_faces`` 的补充。
+
+    ``_enum_faces`` 在顶点处把「与入边几乎共线」的候选归一成 TAU 并优先
+    直行；**腔口与轮廓相切**的地方因此走不进去（IMU V1 的 L 形角缺口：
+    缺口腔壁与外轮廓的 r2 圆角相切），整块腔体面丢失。这里改用 DCEL 的
+    定义——「从 twin（入边反向）起顺时针最近的出边」：候选按
+    ``(twin_eff − eff) mod TAU`` 排序，其中 ``eff = 角 + bend·ε``，
+    ``bend`` 取弧的弯曲方向（CCW +1 / CW −1 / 直线 0）。同角时由曲率
+    决定谁在谁的顺时针侧，切向折返成为合法选择而不是退化。
+
+    返回 ``[(signed_area, ring, 0)]``，``ring`` 为 ``(eid, from_v, to_v)``；
+    只保留正面积简单环（与 ``_enum_faces`` 同口径）。实测覆盖 IMU V1 的
+    两个角缺口腔 + 槽腔，``_enum_faces`` 只给出主体块。
+    """
+    ang_eps = 1e-7
+
+    def _bend(eid: int, dep: int) -> int:
+        e = edges[eid]
+        if e.t != "A":
+            return 0
+        return 1 if dep == e.sa_v else -1
+
+    adj: dict[int, list] = {v: [] for v in vpos}
+    for eid, e in enumerate(edges):
+        if e.vs == e.ve:
+            continue
+        adj[e.vs].append((eid, e.ve, _leave_angle(e, e.vs, vpos),
+                          _bend(eid, e.vs)))
+        adj[e.ve].append((eid, e.vs, _leave_angle(e, e.ve, vpos),
+                          _bend(eid, e.ve)))
+    for v in adj:
+        adj[v].sort(key=lambda x: (x[2], x[3]))
+
+    # 修剪度 1 悬边（同 ``_enum_faces``）
+    changed = True
+    while changed:
+        changed = False
+        for v in [v for v in adj if len(adj.get(v, [])) == 1]:
+            if not adj.get(v):
+                continue
+            _eid, w, _ang, _b = adj[v][0]
+            del adj[v]
+            adj[w] = [t for t in adj[w] if t[1] != v]
+            changed = True
+
+    # 往返副本签名（同 ``_enum_faces``）
+    sig: dict[int, tuple] = {}
+    for eid, e in enumerate(edges):
+        if e.t == "A" and e.r > 0:
+            a1, a2 = round(math.degrees(e.sa), 1), round(math.degrees(e.ea), 1)
+            sig[eid] = ("A", round(e.cx, 2), round(e.cy, 2), round(e.r, 2),
+                        min(a1, a2), max(a1, a2))
+        else:
+            x1, y1 = vpos[e.vs]
+            x2, y2 = vpos[e.ve]
+            sig[eid] = ("L", round(min(x1, x2), 2), round(min(y1, y2), 2),
+                        round(max(x1, x2), 2), round(max(y1, y2), 2))
+
+    def _is_micro_edge(eid: int) -> bool:
+        e = edges[eid]
+        if not _is_microg(*vpos[e.vs], *vpos[e.ve]):
+            return False
+        return micro_len.get(eid, 0.0) < MICRO_CHAIN_MIN
+
+    def _key(c, twin_ang: float, twin_bend: int):
+        """候选离「twin 顺时针方向」的距离键（带曲率扰动）。
+
+        δ = (twin_eff − eff) mod TAU，eff = ang + bend·ε：
+        b + bend < 0 ⇒ 紧贴 twin 顺时针侧（最小）；= 0 ⇒ 完全重合的
+        折返（退化，不可选）；> 0 ⇒ 逆时针侧（排在所有普通候选后）。
+        """
+        ang, bend = c[2], c[3]
+        raw = (twin_ang - ang) % TAU
+        s = twin_bend - bend
+        if raw < ang_eps:
+            if s == 0:
+                return None
+            return (0, s) if s > 0 else (2, s)
+        return (1, round(raw, 9), s)
+
+    def _advance(cur, incoming, twin_bend, used, used_sigs):
+        twin_ang = incoming + math.pi
+        cands = []
+        for eid, other, ang, bend in adj.get(cur, []):
+            if eid in used or sig[eid] in used_sigs:
+                continue
+            cands.append((eid, other, ang, bend))
+        if not cands:
+            return None
+        big = [c for c in cands if not _is_micro_edge(c[0])]
+        if big:
+            cands = big
+        best = None
+        for c in cands:
+            k = _key(c, twin_ang, twin_bend)
+            if k is None:
+                continue
+            if best is None or k < best[0]:
+                best = (k, c)
+        if best is None:
+            return None
+        return best[1]
+
+    # 连通分量（同 ``_enum_faces``）
+    seen: set[int] = set()
+    comps: list[list[int]] = []
+    for v in vpos:
+        if v in seen or v not in adj:
+            continue
+        stack = [v]
+        seen.add(v)
+        vs: list[int] = []
+        while stack:
+            u = stack.pop()
+            vs.append(u)
+            for _eid, w, _ang, _b in adj.get(u, []):
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+        comps.append(vs)
+
+    def _signed(pts) -> float:
+        a = 0.0
+        n = len(pts)
+        for i in range(n):
+            x1, y1 = pts[i]
+            x2, y2 = pts[(i + 1) % n]
+            a += x1 * y2 - x2 * y1
+        return a / 2.0
+
+    faces = []
+    seen_faces = set()
+    for ci, vs in enumerate(comps):
+        if len(vs) < 3:
+            continue
+        vset = set(vs)
+        for v0 in vs:
+            for eid0, w0, ang0, b0 in adj.get(v0, []):
+                if w0 not in vset:
+                    continue
+                ring = [(eid0, v0, w0)]
+                used = {eid0}
+                used_sigs = {sig[eid0]}
+                incoming = ang0
+                twin_bend = -b0
+                cur = w0
+                closed = False
+                for _ in range(8000):
+                    step = _advance(cur, incoming, twin_bend, used, used_sigs)
+                    if step is None:
+                        break
+                    eid, nxt, ang, bend = step
+                    ring.append((eid, cur, nxt))
+                    used.add(eid)
+                    used_sigs.add(sig[eid])
+                    incoming = _norm(ang + _sweep(edges[eid], cur, nxt, vpos))
+                    twin_bend = -bend
+                    cur = nxt
+                    if cur == v0:
+                        closed = True
+                        break
+                if not closed:
+                    continue
+                key = frozenset(e for e, _f, _t in ring)
+                if key in seen_faces:
+                    continue
+                pts = [vpos[f] for _e, f, _t in ring]
+                a = _signed(pts)
+                if a <= 0.0:
+                    continue
+                vc: set[int] = set()
+                dup = False
+                for _e, f, _t in ring:
+                    if f in vc:
+                        dup = True
+                        break
+                    vc.add(f)
+                if dup:
+                    continue
+                seen_faces.add(key)
+                faces.append((a, ring, ci, len(vs)))
+    return faces
+
+
+def extract_faces(d: Drawing, v: View,
+                  roles: set[str] | None = None,
+                  min_area: float = AREA_FLOOR) -> list[FaceRing]:
+    """提取视图的全部有界面（除主体块外的都是内环候选）。
+
+    ``roles`` 缺省为 ``{visible, hidden}``：内腔边界在图纸上是隐藏线。
+    返回按面积降序排列的 ``FaceRing``；剖视图不参与（剖面材料由
+    ``conventions.section`` 负责）。
+    """
+    if v.is_section:
+        return []
+    if roles is None:
+        roles = {"visible", "hidden"}
+    edges, vpos = _profile_edges(d, v, roles=roles)
+    if not edges:
+        return []
+    micro_len = _micro_chain_lengths(edges, vpos)
+    # 两种遍历都跑：``_enum_faces`` 是旧管线的规范化左转，``_enum_faces_dcel``
+    # 是 DCEL 标准顺时针后继——后者能走进前者在切向折返处走不进的腔体面
+    # （IMU V1 角缺口）。同一几何面两边可能各枚举一次（绕向/起点不同），
+    # 下面的 segs 键去重会合并。
+    passes = [("raw", edges, vpos,
+               _enum_faces(edges, vpos, micro_len)
+               + _enum_faces_dcel(edges, vpos, micro_len))]
+    # 顶点胶合兜底：PDF 矢量化图纸的端点常差 0.01~1.5mm，face 遍历对
+    # 断口比外环更敏感（内腔边界整条由短碎段组成）。raw 结果**原样保留**，
+    # 胶合结果按几何去重后追加——胶合若改变主体环，内环通道仍能工作。
+    gv, ge = _glue(edges, vpos)
+    passes.append(("glued", ge, gv,
+                   _enum_faces(ge, gv, micro_len)
+                   + _enum_faces_dcel(ge, gv, micro_len)))
+    out: list[FaceRing] = []
+    seen: set[tuple] = set()
+    for rule, es, vp, faces in passes:
+        for area, ring, _ci, _nv in faces:
+            segs = []
+            for eid, f, t in ring:
+                e = es[eid]
+                x1, y1 = vp[f]
+                x2, y2 = vp[t]
+                if e.t == "L":
+                    segs.append(RingSeg("line", Point2(x1, y1), Point2(x2, y2)))
+                else:
+                    if f == e.sa_v:
+                        sa, ea, ccw = e.sa, e.ea, True
+                    else:
+                        sa, ea, ccw = e.ea, e.sa, False
+                    segs.append(RingSeg("arc", Point2(x1, y1), Point2(x2, y2),
+                                        Point2(e.cx, e.cy), e.r, ccw, sa, ea))
+            segs_t = tuple(segs)
+            if _seg_signed_area(segs_t) < 0:
+                segs_t = _reverse_segs(segs_t)
+            key = tuple(sorted((round(s.p1.x, 3), round(s.p1.y, 3),
+                                round(s.p2.x, 3), round(s.p2.y, 3),
+                                s.kind, round(s.radius, 3))
+                               for s in segs_t))
+            if key in seen:
+                continue
+            geo_area = abs(Profile2(segs_t).signed_area())
+            if geo_area < min_area:
+                continue
+            seen.add(key)
+            bb = _geom_bbox(segs_t)
+            cov = (1.0, 1.0)
+            if v.bbox is not None and v.bbox.width > 0 and v.bbox.height > 0:
+                cov = (bb.width / v.bbox.width, bb.height / v.bbox.height)
+            n_h = sum(1 for eid, _f, _t in ring
+                      if es[eid].role == "hidden")
+
+            def _elen(eid, f, t) -> float:
+                return math.hypot(vp[f][0] - vp[t][0], vp[f][1] - vp[t][1])
+
+            hid_len = sum(_elen(eid, f, t) for eid, f, t in ring
+                          if es[eid].role == "hidden")
+            tot_len = sum(_elen(eid, f, t) for eid, f, t in ring)
+            hf = hid_len / tot_len if tot_len > 0.0 else 0.0
+            out.append(FaceRing(segs_t, geo_area, bb, cov,
+                                len(ring), n_h, len(ring) - n_h, rule, hf))
+    out.sort(key=lambda f: -f.area)
+    return out
 
 
 def extract_ring(d: Drawing, v: View) -> RingResult:
@@ -1098,13 +1680,24 @@ def extract_ring(d: Drawing, v: View) -> RingResult:
 
     # 第三遍：顶点胶合兜底（见 ``_glue``）。只在 raw/welded 都没给出
     # 过门环时跑——已成功的视图结果逐位不变（v15 误焊教训的边界）。
-    glued_vpos, glued_edges = _glue(edges, vpos)
+    # 先试**有界胶合**（簇直径 ≤ GLUE_CLOSE，防微链传递塌缩），不过门
+    # 再回落无界胶合（v0.6.44 语义，YZYX 等靠链式合并救环的靶子）。
+    glued_vpos, glued_edges = _glue(edges, vpos, cap=GLUE_CLOSE)
     glued = _one_pass(glued_edges, glued_vpos, micro_len)
     r_glued = _mk(glued, glued_edges, glued_vpos, "glued")
     if r_glued is not None:
         gw, gh = r_glued.coverage
         if gw >= COVER_MIN and gh >= COVER_MIN:
             return RingResult(r_glued, r_raw, r_welded, "", r_glued)
+    glued_vpos, glued_edges = _glue(edges, vpos)
+    glued = _one_pass(glued_edges, glued_vpos, micro_len)
+    r_glued2 = _mk(glued, glued_edges, glued_vpos, "glued")
+    if r_glued2 is not None:
+        gw, gh = r_glued2.coverage
+        if gw >= COVER_MIN and gh >= COVER_MIN:
+            return RingResult(r_glued2, r_raw, r_welded, "", r_glued2)
+    if r_glued2 is not None and (r_glued is None or r_glued2.area > r_glued.area):
+        r_glued = r_glued2
 
     if chosen is None:
         return RingResult(None, r_raw, r_welded, "no_ring_found", r_glued)

@@ -237,6 +237,11 @@ class CylinderHint:
     #: z120..145，只有 length 就只好按 0 起、横切法兰）。None = 没读到 ——
     #: 下游与 length=None 同等对待，不许拿 0 顶替。
     span: tuple[float, float] | None = None
+    #: 同一条轴在正交视图里读到的**全部**轮廓对区间（模型坐标，已排序、
+    #: 去重）。``span`` 只留最长的一对（长度口径）；``spans`` 让下游判
+    #: 贯通/盲孔：同一根孔轴在零件近壁与远壁各画一段轮廓对（D79307 钥匙孔
+    #: x=17.9..20.0 与 50.8..52.9），两段各自贴着基体材料区间的两端 ⇒ 通孔。
+    spans: tuple[tuple[float, float], ...] = ()
 
     @property
     def resolved(self) -> bool:
@@ -362,24 +367,34 @@ def solve_frames(d: Drawing, qs: QuestionList | None = None,
         ))
         return {v.id: frame}, questions
 
-    # 先定各视图的 u/v/p 轴
+    # 先定各视图的 u/v/p 轴。**两遍走**：正交视图先定向，剖视后定向——
+    # 剖面标题只写「A—A」时切平面位置读不出来（CutSpec.is_located=False），
+    # 但布局关系仍把轴说死了，而那条推断要参考已定向的正交视图。
     axis_of: dict[str, tuple[str, str]] = {}
     for v in typed:
         t = v.resolved_type
         assert t is not None
-        if t == ViewType.SECTION:
-            axes = _section_axes(v)
-            if axes is None:
-                questions.add(Question(
-                    OpenQuestion.MISSING_SECTION_POS,
-                    f"{v.id} 是剖视图但切平面位置未知，无法确定它的视图坐标轴",
-                    view=v.id, evidence=tuple(v.annotations[:1]),
-                ))
-                continue
-            axis_of[v.id] = axes
-        elif t in _AXES_OF_VIEW:
+        if t in _AXES_OF_VIEW:
             axis_of[v.id] = _AXES_OF_VIEW[t]
         # SIDE/UNKNOWN/AUXILIARY/DETAIL 不参与（它们的轴未知）
+    for v in typed:
+        if v.resolved_type != ViewType.SECTION:
+            continue
+        axes = _section_axes(v)
+        by_layout = ""
+        if axes is None:
+            got = _section_axes_by_layout(v, typed, axis_of)
+            if got is not None:
+                axes, by_layout = got
+        if axes is None:
+            questions.add(Question(
+                OpenQuestion.MISSING_SECTION_POS,
+                f"{v.id} 是剖视图但切平面位置未知，且与已定向视图没有"
+                "同行/同列关系，无法确定它的视图坐标轴",
+                view=v.id, evidence=tuple(v.annotations[:1]),
+            ))
+            continue
+        axis_of[v.id] = axes
 
     # 模型各轴的范围：谁给的最可信，按"该视图的主方向"优先
     span: dict[str, tuple[float, float]] = {}
@@ -584,6 +599,51 @@ def _section_axes(v: View) -> tuple[str, str] | None:
     return (rest[0], rest[1])
 
 
+def _section_axes_by_layout(
+        v: View, typed: list[View],
+        axis_of: dict[str, tuple[str, str]]
+) -> tuple[tuple[str, str], str] | None:
+    """剖视图的视图轴按**布局关系**推断 —— 返回 ((u, v), 锚视图 id)。
+
+    剖面标题只写「A—A」、不写切平面位置时（20180425 气缸前盖实测），
+    切平面法向读不出来，但**制图布局**仍把视图轴说死了：竖剖视图与主视图
+    **高平齐**（同一水平带、纵向区间重合）⇒ 它的纵向就是主视图的纵向、
+    横向是主视图的**深度轴**（零件厚度方向 p）、剖切面法向是主视图的横向；
+    与俯视图**长对正**（同一竖直带）⇒ 与俯视图同一组轴（水平剖视图看的是
+    俯视平面本身）。
+
+    **只认另一维完全重合**（``AGREE_TOL``）：剖视是派生视图，位置由人摆，
+    不像正交视图只求"大致对齐"。锚视图必须是已定向的**非剖视**视图——
+    拿另一个未定向的剖视当锚只会把错误传递下去。
+
+    ⚠️ 这条推断只给**视图坐标系**，不给切平面位置：剖切面在法向上的
+    坐标仍是未知（``MISSING_SECTION_POS`` 那条非拦路疑问保留）。
+    """
+    assert v.bbox is not None
+    for w in typed:
+        if w.id == v.id or w.id not in axis_of or w.bbox is None:
+            continue
+        if w.resolved_type == ViewType.SECTION:
+            continue
+        ua, va = axis_of[w.id]
+        pa = _other((ua, va))
+        # 高平齐（同行）：纵向区间重合 ⇒ 竖剖，横向换成锚视图的深度轴
+        if (abs(v.bbox.ymin - w.bbox.ymin) <= AGREE_TOL
+                and abs(v.bbox.ymax - w.bbox.ymax) <= AGREE_TOL):
+            cand = (pa, va)
+            if len(set(cand)) == 2:
+                return cand, w.id
+        # 长对正（同列）：横向区间重合。**只有锚是俯/仰视图时才敢读**——
+        # 水平剖视图看的就是俯视平面本身，轴与俯视图相同；而同列于主视图
+        # 的剖视既可能是仰视位置的竖剖（轴同主视图）也可能是俯视剖，两种
+        # 候选读法都自洽，不猜（§3 原则二）。
+        if (w.resolved_type in (ViewType.TOP, ViewType.BOTTOM)
+                and abs(v.bbox.xmin - w.bbox.xmin) <= AGREE_TOL
+                and abs(v.bbox.xmax - w.bbox.xmax) <= AGREE_TOL):
+            return (ua, va), w.id
+    return None
+
+
 # ---- 2) 剖面标题 ⇒ 3D 轴线 ----
 
 def _section_extent(frames: dict[str, ViewFrame], axis: str) -> tuple[float, float] | None:
@@ -724,6 +784,17 @@ def axes_from_sections(d: Drawing, frames: dict[str, ViewFrame],
                 candidates=tuple(in_plane),
             ))
             continue
+        # 判据二（沿轴跨度≈零件总跨度）在**整幅横截面**上是恒真的：一个
+        # 40×20 的箱体横截面，x/y 两个方向都铺满零件总跨度，谁都得分 0
+        # （IMU B—B：真轴沿 y，截面 40×20 让 x 以更小的判据一误差抢先）。
+        # 此时问几何：标题说"穿 r 孔轴"，那个 r 圆的轴方向必然有视图把它
+        # **画成圆**（p_axis = 轴方向，见 _cut_pos_candidates）。按这条
+        # 收窄候选，才能把中心/配准都落到有圆证明的那条轴上。
+        if len(cand) > 1:
+            proven = [a for a in cand
+                      if _cut_pos_candidates(d, idx, frames, v, cut, a, r)]
+            if proven:
+                cand = proven
         cand.sort(key=lambda a: scores[a])
         axis_dir = cand[0]
         perp = next(a for a in in_plane if a != axis_dir)
@@ -739,6 +810,21 @@ def axes_from_sections(d: Drawing, frames: dict[str, ViewFrame],
             centers[a] = (lo + hi) / 2.0
 
         cands = _cut_pos_candidates(d, idx, frames, v, cut, axis_dir, r)
+        if not cands and rule == "convention:section_extent":
+            # 退到判据二还没有配准圆：方向与中心都只是从"截面铺满全幅"
+            # 推的（整幅横截面恒真），没有任何半径 r 的圆证明这条轴存在。
+            # 按标题凭空建一根通孔轴会把"图上没画的东西"切出来（IMU C—C
+            # 的 r2 实为缺口圆角、不是孔，按标题建孔多切 π·2²×全厚）。
+            # §3 原则二：证据不足就不建，疑问留给报告。
+            qs.add(Question(
+                OpenQuestion.MISSING_SECTION_POS,
+                f"{cut.label}：标题写切平面 {n}={cut.cut_pos:g}、半径 {r:g}，"
+                "但图纸里既没有 2R 跨度的截面判据、也没有半径 R 的圆可用于"
+                "配准/定向 —— 轴的位置无从谈起，不建特征",
+                view=v.id, evidence=tuple(v.annotations[:1]),
+                candidates=tuple(in_plane),
+            ))
+            continue
         if not cands:
             qs.add(Question(
                 OpenQuestion.MISSING_SECTION_POS,
@@ -795,6 +881,12 @@ def axes_from_sections(d: Drawing, frames: dict[str, ViewFrame],
     return out
 
 
+#: 剖面标题半径 ↔ 配准圆的容差（mm）。标题是标注数（1~2 位小数），
+#: 圆是精确几何，只容忍量化误差；与圆柱配对的 MATCH_TOL 分开（见
+#: ``_cut_pos_candidates`` 的注）。
+_SECTION_R_TOL = 0.1
+
+
 def _cut_pos_candidates(d: Drawing, idx: dict[str, Evidence],
                         frames: dict[str, ViewFrame], v: View, cut: CutSpec,
                         axis_dir: str, r: float
@@ -808,6 +900,12 @@ def _cut_pos_candidates(d: Drawing, idx: dict[str, Evidence],
     配准只能靠几何：切平面法向 n、半径 r 的孔，必然在"投影方向 = 孔轴方向"
     的那个视图里留下一个**半径 r 的圆**；这些圆沿 n 的坐标就是切平面在模型系
     里的位置。
+
+    ⚠️ 半径匹配必须**紧**（``_SECTION_R_TOL``），不能用圆柱配对的
+    ``MATCH_TOL``（0.6mm）—— 0.6mm 会把标题的 r2.0 匹配到 r1.65 的孔上，
+    于是"这个剖面有配准圆"的假证据让一根不存在的 r2 轴拿到位置与方向
+    （IMU C—C 的 r2 实为缺口圆角；配准候选混入 r1.65 孔后，两个剖面的
+    平移关系互不相容，切平面位置全错，凭空切出两个通孔）。
     """
     n = cut.cut_axis
     out: list[tuple[float, EvidenceRef, str]] = []
@@ -818,7 +916,7 @@ def _cut_pos_candidates(d: Drawing, idx: dict[str, Evidence],
         if wf.p_axis != axis_dir:
             continue          # 该视图看不出来"孔轴方向"这一维 ⇒ 圆不成圆
         for h, p, cr in _circles_of(d, idx, w):
-            if abs(cr - r) > MATCH_TOL:
+            if abs(cr - r) > _SECTION_R_TOL:
                 continue
             if wf.u_axis == n:
                 pos = wf.u_to_model(p.x)
@@ -1211,6 +1309,20 @@ def _profile_arc(cx: float, cy: float, r: float,
     return outside >= PROFILE_ARC_OUT_FRAC * len(miss)
 
 
+#: 圆心离视图 bbox 多远以内仍算该视图的几何（mm）。真实特征圆的圆心必在
+#: 视图轮廓之内；超出的只可能是图面符号/家具被并进了视图证据表。
+VIEW_BBOX_TOL = 0.5
+
+
+def _center_in_view(c: Point2, bbox: BBox2 | None,
+                    tol: float = VIEW_BBOX_TOL) -> bool:
+    """圆心是否落在视图 bbox 内（含容差）——视图之外的圆不是该视图的几何。"""
+    if bbox is None:
+        return True
+    return (bbox.xmin - tol <= c.x <= bbox.xmax + tol
+            and bbox.ymin - tol <= c.y <= bbox.ymax + tol)
+
+
 def _circle_edges_of(d: Drawing, idx: dict[str, Evidence], v: View
                      ) -> tuple[list[tuple[EvidenceRef, Point3, float]],
                                 list[tuple[EvidenceRef, float]]]:
@@ -1224,6 +1336,10 @@ def _circle_edges_of(d: Drawing, idx: dict[str, Evidence], v: View
     返回给调用方记账（``cylinders_from_circles`` 报"轮廓弧未识别"疑问）。
     拦它不是保守默认：它作为圆**已证伪**（圆没画完的那截在视图轮廓之外，
     不可能是被遮挡），详见 ``_profile_arc``。
+
+    **圆心必须在视图 bbox 内**（容差 ``VIEW_BBOX_TOL``）：视图证据表里会混进
+    图面符号（实测 20180425：右下角表面粗糙度符号里的 r1.68 圆被并进 V1，
+    圆柱通道把它读成一个贯穿小孔）。视图 bbox 之外的圆，不可能是该视图的几何。
     """
     out: list[tuple[EvidenceRef, Point3, float]] = []
     rejected: list[tuple[EvidenceRef, float]] = []
@@ -1234,10 +1350,14 @@ def _circle_edges_of(d: Drawing, idx: dict[str, Evidence], v: View
             continue
         g = e.geom
         if isinstance(g, Circle2):
+            if not _center_in_view(g.center, v.bbox):
+                continue
             out.append((e.handle, Point3(g.center.x, g.center.y, 0.0), g.radius))
         elif isinstance(g, Arc2):
             span = (g.end_angle - g.start_angle) % (2 * math.pi)
             if span > 2 * math.pi - 0.02:
+                if not _center_in_view(g.center, v.bbox):
+                    continue
                 out.append((e.handle, Point3(g.center.x, g.center.y, 0.0), g.radius))
             else:
                 key = (round(g.center.x / MATCH_TOL), round(g.center.y / MATCH_TOL),
@@ -1250,6 +1370,8 @@ def _circle_edges_of(d: Drawing, idx: dict[str, Evidence], v: View
         if _arc_cover(spans) < ARC_COVER_MIN:
             continue
         c, r = items[0][1].center, items[0][1].radius
+        if not _center_in_view(c, v.bbox):
+            continue
         if _profile_arc(c.x, c.y, r, spans, v.bbox):
             rejected.extend((handle, r) for handle, _ in items)
             continue
@@ -1283,6 +1405,77 @@ class _Pair:
     #: 哪儿"，缺了它发射器只能按 0 起（YZYX 的 4×Ø10 深25 在 z120..145，
     #: 按 0 起会横切法兰）。默认 (0,0) = 没读到（老调用方不受影响）。
     span: tuple[float, float] = (0.0, 0.0)
+    #: 这条逻辑线由图纸上的多段共线碎线拼成时（``_merge_collinear``），
+    #: h1/h2 只是各族的**代表**（最长段），这里补上其余段的 handle 作证据。
+    extra: tuple[str, ...] = ()
+
+
+#: 共线判定：法向坐标差 ≤ 此值（mm）的两段直线算同一条轮廓线。
+#: 图纸量化 ~0.01mm，取两倍；再大就会把两条相邻的真棱并成一条。
+_COLLINEAR_TOL = 0.02
+#: 并线的沿线间隙上限（mm）——与并集量尺同口径（见 ``_MERGE_GAP``）。
+_COLLINEAR_GAP = 0.1
+
+
+def _merge_collinear(items: list[tuple[EvidenceRef, float, float, bool,
+                                       tuple[float, float]]]
+                     ) -> list[tuple[EvidenceRef, float, float, bool,
+                                    tuple[float, float], tuple[str, ...]]]:
+    """把同角色、共线、首尾相接的直线段并成"逻辑线"。
+
+    为什么必须并：PDF 矢量化的图纸常把**一条轮廓线拆成多段**（IMU：键槽的
+    隐藏轮廓在 y=112.5 断开、Ø3.3 孔的轮廓在 y=102.5 断开——两段几何上完全
+    连续）。逐段配对挑"最长的一对"只会挑到其中一段，``_Pair.span`` 记的
+    轴向跨度就被截短（IMU r4 槽读成 104..112.5、实际 104..121；r1.65 孔读成
+    深 1.5、实际 3）。并线后长度与跨度都按整条逻辑线算。
+
+    只并**同角色**（可见/隐藏不混——重合的实/虚两条线是不同证据）、法向
+    坐标差 ≤ ``_COLLINEAR_TOL``、沿线间隙 ≤ ``_COLLINEAR_GAP`` 的段；
+    间隙更大的是两条真棱，不许连。返回项的末位是全部被并入的 handle
+    （配对时一并记进证据）。
+    """
+    if not items:
+        return []
+    out: list[tuple[EvidenceRef, float, float, bool, tuple[float, float],
+                    tuple[str, ...]]] = []
+    # 先按角色分、再按法向坐标聚类：不许用网格 round——坐标恰好压在
+    # 网格边界两侧的两段会被拆进不同桶（与 MATCH_TOL 分桶同一类坑）。
+    by_role: dict[bool, list] = {}
+    for it in items:
+        by_role.setdefault(it[3], []).append(it)
+    for vis, grp in by_role.items():
+        grp.sort(key=lambda t: t[1])
+        i = 0
+        while i < len(grp):
+            j = i + 1
+            while j < len(grp) and grp[j][1] - grp[i][1] <= _COLLINEAR_TOL:
+                j += 1
+            # 这一族共线（法向差 ≤ tol）：按沿线区间并段
+            fam = sorted(grp[i:j], key=lambda t: t[4][0])
+            cur = [fam[0]]
+            hi = fam[0][4][1]
+            for nxt in fam[1:]:
+                if nxt[4][0] <= hi + _COLLINEAR_GAP:
+                    cur.append(nxt)
+                    hi = max(hi, nxt[4][1])
+                else:
+                    out.append(_logical_line(cur))
+                    cur, hi = [nxt], nxt[4][1]
+            out.append(_logical_line(cur))
+            i = j
+    return out
+
+
+def _logical_line(parts: list) -> tuple[EvidenceRef, float, float, bool,
+                                        tuple[float, float], tuple[str, ...]]:
+    """一族共线段 →（代表 handle=最长段, 法向坐标均值, 长度, 角色, 区间,
+    全部 handle）。"""
+    rep = max(parts, key=lambda t: t[2])
+    lo = min(t[4][0] for t in parts)
+    hi = max(t[4][1] for t in parts)
+    perp = sum(t[1] for t in parts) / len(parts)
+    return (rep[0], perp, hi - lo, parts[0][3], (lo, hi),
+            tuple(t[0] for t in parts))
 
 
 def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
@@ -1294,10 +1487,10 @@ def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
 
     实现要点：**不做两两配对**。2711+3821 条边的图纸上 O(n²) 是分钟级
     （实测卡死），改为按垂直坐标分桶，只查 ±want_sep 那几个桶 —— O(n)。
+    进桶前先过 ``_merge_collinear``：一条轮廓线被图纸拆成多段时按整条算。
     """
     horizontal = along == "h"
-    bucketed: dict[int, list[tuple[EvidenceRef, float, float, bool,
-                                   tuple[float, float]]]] = {}
+    raw: list[tuple[EvidenceRef, float, float, bool, tuple[float, float]]] = []
     for h in v.evidence:
         e = idx.get(h)
         if e is None or e.kind != Kind.EDGE or not isinstance(e.geom, Line2):
@@ -1323,17 +1516,20 @@ def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
         a0, a1 = ((g.start.x, g.end.x) if horizontal
                   else (g.start.y, g.end.y))
         along_span = (min(a0, a1), max(a0, a1))
-        bucketed.setdefault(round(perp / MATCH_TOL),
-                            []).append((h, perp, line_len,
-                                        e.role.value == Role.VISIBLE,
-                                        along_span))
+        raw.append((h, perp, line_len, e.role.value == Role.VISIBLE,
+                    along_span))
+
+    bucketed: dict[int, list[tuple[EvidenceRef, float, float, bool,
+                                   tuple[float, float], tuple[str, ...]]]] = {}
+    for it in _merge_collinear(raw):
+        bucketed.setdefault(round(it[1] / MATCH_TOL), []).append(it)
 
     out: list[_Pair] = []
     span = round(want_sep / MATCH_TOL)
     for b, items in bucketed.items():
-        for h1, p1, len1, vis1, sp1 in items:
+        for h1, p1, len1, vis1, sp1, hs1 in items:
             for nb in range(b + span - 1, b + span + 2):
-                for h2, p2, len2, vis2, sp2 in bucketed.get(nb, []):
+                for h2, p2, len2, vis2, sp2, hs2 in bucketed.get(nb, []):
                     if h1 == h2 or vis1 != vis2:
                         continue
                     if nb == b and h1 > h2:
@@ -1353,7 +1549,8 @@ def _parallel_line_pairs(idx: dict[str, Evidence], v: View, along: str,
                     # 和"从 z=0 到 z=145"这对矛盾数据会一起流下去）
                     out.append(_Pair(h1, h2, sep, (p1 + p2) / 2.0,
                                      min(len1, len2), vis1,
-                                     sp1 if len1 <= len2 else sp2))
+                                     sp1 if len1 <= len2 else sp2,
+                                     extra=tuple(dict.fromkeys(hs1 + hs2))))
     return out
 
 
@@ -1526,6 +1723,14 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
     best: tuple[_Pair, str, float] | None = None
     best_vis: _Pair | None = None
     best_hid: _Pair | None = None
+    #: 每个正交视图里匹配半径的**最长**轮廓对（含 along）——最佳对只说明
+    #: 长度/轴向，混合壁检查必须逐视图看：一个视图的成对长度短于另一视图
+    #: 时不影响它自己壁带里的实/虚构成（bracket r25.5：V1 左壁只画了
+    #: 上段 25mm，V2 两壁都是 44mm 整段 ⇒ 全局最佳对换到 V2 后，V1 壁带
+    #: 里"基体圆角轮廓与孔壁虚线重叠"的真实歧义就被跳过了）。
+    per_view: list[tuple[_Pair, View, str]] = []
+    #: 全部匹配轮廓对的 (模型区间, 可见) —— 见 ``CylinderHint.spans``
+    span_pairs: list[tuple[tuple[float, float], bool]] = []
     for w in d.views:
         if w.id == v.id or w.id not in frames or w.bbox is None:
             continue
@@ -1539,22 +1744,33 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
         else:
             continue
         want = {"x": origin.x, "y": origin.y, "z": origin.z}[perp_axis]
+        vbest: _Pair | None = None
         for pr in _parallel_line_pairs(idx, w, along, 2 * r):
             got = (wf.u_to_model(pr.perp_mid) if perp_axis == wf.u_axis
                    else wf.v_to_model(pr.perp_mid))
             if abs(got - want) > MATCH_TOL:
                 continue
+            if pr.span[1] > pr.span[0]:
+                conv_w = wf.u_to_model if along == "h" else wf.v_to_model
+                s0, s1 = conv_w(pr.span[0]), conv_w(pr.span[1])
+                span_pairs.append(((min(s0, s1), max(s0, s1)), pr.visible))
             if best is None or pr.length > best[0].length:
                 best = (pr, w, got)
+            if vbest is None or pr.length > vbest.length:
+                vbest = pr
             if pr.visible:
                 if best_vis is None or pr.length > best_vis.length:
                     best_vis = pr
             elif best_hid is None or pr.length > best_hid.length:
                 best_hid = pr
+        if vbest is not None:
+            per_view.append((vbest, w, along))
     if best is not None:
         pr, w, _ = best
         wid = w.id
         refs += [(wid, pr.h1), (wid, pr.h2)]
+        refs += [(wid, x) for x in pr.extra
+                 if x not in (pr.h1, pr.h2)]
         solid: bool | None = pr.visible
         # 轴向跨度：轮廓对的沿线区间经**该视图自己的 frame** 换算到模型系。
         # ⚠️ 不能复用循环里的 `along`——best 是历遍所有 w 后的最优，along 却
@@ -1606,26 +1822,41 @@ def _circle_to_cylinder(d: Drawing, idx, v: View, f: ViewFrame, frames: dict,
             # 判不出。实线轮廓仍是直接证据（solid 不动），这里只**报疑**
             # （§3 原则二），交 _resolve_questions 按分区/特征剪影裁决；
             # 纯 boss 两壁全实、纯孔两壁全虚都不报。
-            lo_v, lo_h, hi_v, hi_h = _band_totals(idx, w, along,
-                                                  pr.perp_mid, r)
-            for wv, wh, wl in ((lo_v, lo_h, "下"), (hi_v, hi_h, "上")):
-                if (wv >= 0.5 and wh >= 0.5
-                        and min(wv, wh) >= 0.5 * max(wv, wh)):
-                    qs.add(Question(
-                        OpenQuestion.AMBIGUOUS_FEATURE,
-                        f"{v.id} 的 r{r:g} 圆在正交视图里{wl}壁母线带内"
-                        f"实/虚轮廓并存且量级相当（实 {wv:.2f} vs 虚 "
-                        f"{wh:.2f}）—— 可能是半圆柱面，也可能是孔壁虚线"
-                        "被可见优先去重消影、只剩异源可见棱；暂按实线轮廓"
-                        "读，存疑待裁决",
-                        view=v.id,
-                        evidence=(handle, pr.h1, pr.h2),
-                        candidates=("hole", "boss"),
-                    ))
-                    break      # 一壁报一条就够了
+            reported = False
+            for pw, pv, palong in per_view:
+                lo_v, lo_h, hi_v, hi_h = _band_totals(idx, pv, palong,
+                                                      pw.perp_mid, r)
+                for wv, wh, wl in ((lo_v, lo_h, "下"), (hi_v, hi_h, "上")):
+                    if (wv >= 0.5 and wh >= 0.5
+                            and min(wv, wh) >= 0.5 * max(wv, wh)):
+                        qs.add(Question(
+                            OpenQuestion.AMBIGUOUS_FEATURE,
+                            f"{v.id} 的 r{r:g} 圆在正交视图里{wl}壁母线带内"
+                            f"实/虚轮廓并存且量级相当（实 {wv:.2f} vs 虚 "
+                            f"{wh:.2f}）—— 可能是半圆柱面，也可能是孔壁虚线"
+                            "被可见优先去重消影、只剩异源可见棱；暂按实线轮廓"
+                            "读，存疑待裁决",
+                            view=v.id,
+                            evidence=(handle, pw.h1, pw.h2),
+                            candidates=("hole", "boss"),
+                        ))
+                        reported = True
+                        break      # 一壁报一条就够了
+                if reported:
+                    break          # 一根圆柱报一条就够了（跨视图不重复）
+        # 全部轮廓对区间：按已裁决的 solid 筛（孔只看虚线对、凸台只看实线对；
+        # solid 未定时全收），0.05mm 内视为同一段（同一壁的重复/合并残片）。
+        use = [sp for sp, vis in span_pairs if solid is None or vis == solid]
+        spans: list[tuple[float, float]] = []
+        for lo, hi in sorted(use):
+            if spans and lo - spans[-1][1] <= 0.05:
+                spans[-1] = (spans[-1][0], max(spans[-1][1], hi))
+            else:
+                spans.append((lo, hi))
         hint = CylinderHint(hint.axis, r, length=pr.length, solid=solid,
                             radius_method=marker, profile_method=f"outline:{wid}",
-                            evidence=tuple(h for _, h in refs), span=span)
+                            evidence=tuple(h for _, h in refs), span=span,
+                            spans=tuple(spans))
         return Correspondence(
             CorrKind.FEATURE, tuple(refs),
             Claim(hint, f"corr:circle+outline({v.id}+{wid})", Tier.PROJECTION,

@@ -1509,14 +1509,18 @@ def test_features() -> None:
     # 可见优先去重消影"在图上同形）—— 逐段配对判据抓不到（最长隐藏对仅
     # 0.37），并集量尺报疑；分区/特征剪影裁决回 boss、与特征现值一致 ⇒
     # 只记账不改写（体积零漂移由验收表逐位保证）。r25.5 塔柱带内基体
-    # 圆角轮廓的实虚重叠同样报疑、同样被分区裁决。
+    # 圆角轮廓、r20 下壁的实虚重叠同样报疑、同样被分区裁决。
+    # 混合壁检查按**每个正交视图自己的最长轮廓对**看，不再只绑定全局最长
+    # 对所在的那个视图——否则共线合并后 V2 读满 44mm，V1 壁带里的歧义就
+    # 被跳过了（V1 左壁只画了 25mm 上段，它仍是最直接的图面证据）。
     occl = [a for a in rep_b.questions.resolved if "消影" in a.question.detail]
-    check("消影之疑报出并全部裁决（r12 叉尖 + r25.5 塔柱带异源重叠）",
-          len(occl) == 2
+    check("消影之疑报出并全部裁决（r12 叉尖 + r25.5 塔柱带 + r20 异源重叠）",
+          len(occl) == 3
           and all(a.by == "recognize:hlr_occlude"
                   and "boss" in str(a.answer) for a in occl)
           and any("r12" in a.question.detail for a in occl)
-          and any("r25.5" in a.question.detail for a in occl),
+          and any("r25.5" in a.question.detail for a in occl)
+          and any("r20" in a.question.detail for a in occl),
           str([str(a)[:70] for a in occl]))
     check("r12 特征仍为 boss/PROJECTION（裁决一致 ⇒ 不改写、tier 不降）",
           any(f.type.value == "boss"
@@ -1527,16 +1531,18 @@ def test_features() -> None:
                if "radius" in f.params
                and abs(f.params["radius"].value - 12.0) < 1e-9]))
 
-    # ---- H5d PF60K：r8.5 凹槽的实/虚并存按回转母线证据覆盖裁决 ----
-    # r8.5 的侧视图壁带内实 5.90 / 虚 5.00 并存 —— 若是独立圆柱这是
-    # "半圆柱/消影孔"之疑；但圆边已被回转基体吸收（凹槽/台阶是母线自身的
-    # 图面），按证据覆盖裁决，不阻塞。
+    # ---- H5d PF60K：r25/r8.5 凹槽的实/虚并存按回转母线证据覆盖裁决 ----
+    # r8.5 的侧视图壁带内实 5.90 / 虚 5.00、r25 下壁实 8.00 / 虚 5.00
+    # 并存 —— 若是独立圆柱这是"半圆柱/消影孔"之疑；但圆边已被回转基体
+    # 吸收（凹槽/台阶是母线自身的图面），按证据覆盖裁决，不阻塞。
     _, _, _, rep_p = _recognized(_PF60K)
     occl_p = [a for a in rep_p.questions.resolved
               if "消影" in a.question.detail]
-    check("PF60K r8.5 实/虚并存按回转母线证据覆盖裁决（凹槽图面非消影孔）",
-          len(occl_p) == 1 and occl_p[0].by == "revolve:profile_absorbed"
-          and "r8.5" in occl_p[0].question.detail,
+    check("PF60K r25/r8.5 实/虚并存按回转母线证据覆盖裁决（凹槽图面非消影孔）",
+          len(occl_p) == 2
+          and all(a.by == "revolve:profile_absorbed" for a in occl_p)
+          and any("r8.5" in a.question.detail for a in occl_p)
+          and any("r25 " in a.question.detail for a in occl_p),
           str([str(a)[:70] for a in occl_p]))
 
     # ---- H6 PF60K：阵列挂到正确的孔上（判据是"在分布圆上"，不是"在圆心上"） ----
@@ -2047,6 +2053,77 @@ def test_features() -> None:
           f"{None if base13b is None else base13b.params['dir']} "
           f"view={None if base13b is None else base13b.source_view}")
 
+    # ---- H14 轮廓环基体的自轮廓排除（20180425 气缸前盖）----
+    # 轮廓环基体的 φ155 由两段 r77.5 圆弧拼成（合计 191.6° ≥ 180°），
+    # correspondence 会把它们聚成一个同轴圆柱 hint。若不排除，基体自己的
+    # 轮廓线会变成一条 GUESS 孔 —— force 发射时布尔把基体切空（"特征 #6
+    # 建完后没有实体"）。判据 = 弧心 + 半径都对上轮廓环上的弧；只对上
+    # 半径不算（真孔可能与轮廓弧同半径但不同心）。
+    from src.rebuild.features.recognizer import _base_outline as _base_outline14
+    from src.rebuild.model.geom2d import (
+        Point2 as _P2_14, Profile2 as _Prof14, ProfileSeg2 as _Seg14)
+    from src.rebuild.views.correspondence import CylinderHint as _Hint14
+
+    _b1_14, _b2_14 = profile_plane("z")
+    _o14 = Point3(10.0, 20.0, 30.0)
+    _base14 = Feature(
+        id=FeatureId(0),
+        type=Claim(FeatureType.BASE, "t", Tier.PROJECTION, ev12),
+        params={
+            "dir": Claim("z", "t", Tier.PROJECTION, ev12),
+            "length": Claim(33.0, "t", Tier.PROJECTION, ev12),
+            "profile": Claim(_Prof14(segments=(
+                _Seg14(kind="arc", p1=_P2_14(0.0, 0.0), p2=_P2_14(1.0, 0.0),
+                       center=_P2_14(5.0, -7.0), radius=77.5),
+                _Seg14(kind="line", p1=_P2_14(1.0, 0.0), p2=_P2_14(0.0, 0.0)),
+            )), "t", Tier.PROJECTION, ev12),
+            "origin": Claim(_o14, "t", Tier.PROJECTION, ev12),
+        },
+    )
+    _skip14 = _base_outline14(_base14)
+
+    def _hint14(cx: float, cy: float, r: float):
+        # hint 轴 = 轮廓平面上过 (cx, cy) 的竖直线（沿 z；沿 z 的位置无关）
+        _o = _o14 + _b1_14 * cx + _b2_14 * cy + Vector3(0.0, 0.0, 60.0)
+        return _Hint14(axis=Axis3(_o, Vector3(0.0, 0.0, 1.0)), radius=r)
+
+    check("轮廓环上的弧（圆心+半径都对上）⇒ 排除，不变成 GUESS 孔",
+          _skip14 is not None and _skip14(_hint14(5.0, -7.0, 77.5)) is True,
+          str(_skip14 and _skip14(_hint14(5.0, -7.0, 77.5))))
+    check("同半径不同心 / 同心不同半径 ⇒ 不排除（真孔保留）",
+          _skip14(_hint14(5.0, 0.0, 77.5)) is False
+          and _skip14(_hint14(5.0, -7.0, 70.0)) is False,
+          f"{_skip14(_hint14(5.0, 0.0, 77.5))} "
+          f"{_skip14(_hint14(5.0, -7.0, 70.0))}")
+
+    # ---- H15 图面符号圆不进化：圆心必须在视图 bbox 内（20180425）----
+    # 图纸右下角的表面粗糙度符号里有一个 r1.684 圆，视图检测器把它并进了
+    # V1 的证据表（但不在 V1 的 bbox 里），圆柱通道据此建了一个贯穿小孔。
+    # 判据只用视图自己的 bbox：特征圆的圆心必在视图轮廓之内。
+    from src.rebuild.evidence.model import (
+        Evidence as _Ev15, Kind as _Kind15)
+    from src.rebuild.model.geom2d import (
+        Point2 as _P2_15, Circle2 as _C15, BBox2 as _B15)
+    from src.rebuild.views.correspondence import (
+        _center_in_view as _civ15, _circle_edges_of as _ceo15)
+
+    _v15 = View(id="V1", evidence=["c1", "c2"],
+                bbox=_B15(0.0, 0.0, 100.0, 100.0))
+    _idx15 = {
+        "c1": _Ev15(handle="c1", kind=_Kind15.EDGE,
+                    geom=_C15(_P2_15(50.0, 50.0), 10.0),
+                    role=Claim(Role.VISIBLE, "t", Tier.GUESS)),
+        "c2": _Ev15(handle="c2", kind=_Kind15.EDGE,
+                    geom=_C15(_P2_15(150.0, 50.0), 1.684),
+                    role=Claim(Role.VISIBLE, "t", Tier.GUESS)),
+    }
+    _edges15, _ = _ceo15(None, _idx15, _v15)
+    check("视图 bbox 内的圆照常进通道；bbox 外的符号圆（r1.684）被挡下",
+          [h for h, _, _ in _edges15] == ["c1"]
+          and _civ15(_P2_15(100.5, 50.0), _v15.bbox)
+          and not _civ15(_P2_15(150.0, 50.0), _v15.bbox),
+          str(_edges15))
+
 
 # ---- 阶段 4：汇流（理解层；发射层要 OCC/SW，见 emit 自己的 --demo） ----
 
@@ -2471,21 +2548,54 @@ def test_ring() -> None:
     detect_views(d79)
     type_views(d79)
     r79 = {v.id: extract_ring(d79, v) for v in d79.views}
-    check("D79307 V1 raw/welded 都无环 ⇒ 胶合救回 270.50",
+    # v0.6.45：胶合先跑**有界**版（簇直径 ≤ GLUE_CLOSE），数值随之更新——
+    # 无界版靠 0.5mm 传递合并救环，簇可跨数毫米，代表位拉长边（V1 底脚
+    # 3.7mm 斜线抄近路即此）。有界版 V1 262.00（金值剖面 263.58）、V0 697.55。
+    # 再加 GLUE_COCIRC 后 V1 261.94：r1.4 角部两端点（相距 0.25mm）不再
+    # 被并，环不再沿同一圆折返出 7.85° 尖刺（自交 ⇒ 发射器判面无效）。
+    check("D79307 V1 raw/welded 都无环 ⇒ 有界胶合救回 261.94",
           r79["V1"].raw is None and r79["V1"].welded is None
           and r79["V1"].ring is not None
           and r79["V1"].ring.rule == "glued"
-          and abs(r79["V1"].ring.area - 270.4968) < 0.01,
+          and abs(r79["V1"].ring.area - 261.93785) < 0.01,
           f"{r79['V1'].note} "
           f"{None if r79['V1'].ring is None else r79['V1'].ring.area}")
-    check("D79307 V0 raw 环 356.8 覆盖率不足 ⇒ 胶合救回 685.80",
+    check("D79307 V0 raw 环 356.8 覆盖率不足 ⇒ 有界胶合救回 697.55",
           r79["V0"].raw is not None
           and abs(r79["V0"].raw.area - 356.8) < 0.1
           and r79["V0"].ring is not None
           and r79["V0"].ring.rule == "glued"
-          and abs(r79["V0"].ring.area - 685.7969) < 0.01,
+          and abs(r79["V0"].ring.area - 697.5506) < 0.01,
           f"raw={None if r79['V0'].raw is None else r79['V0'].raw.area} "
           f"ring={None if r79['V0'].ring is None else r79['V0'].ring.area}")
+    # 有界胶合的破坏性证明：0/1 相距 0.4、1/2 相距 0.4（A—C 0.8 > cap）。
+    # 无界模式把三个顶点并进同一簇（A、C 代表位相同）；有界模式拒绝
+    # "合并后直径超过 GLUE_CLOSE"的第二跳，A 与 C 保持分离。
+    vpc = {0: (0.0, 0.0), 1: (0.4, 0.0), 2: (0.8, 0.0)}
+    esc = [_rg._E("L", 0, 1), _rg._E("L", 1, 2)]
+    gv_all, _ = _rg._glue(esc, vpc)
+    gv_cap, _ = _rg._glue(esc, vpc, cap=_rg.GLUE_CLOSE)
+    check("有界胶合：链式合并不得越过簇直径上限（0.4+0.4 > 0.5）",
+          gv_all[0] == gv_all[2] and gv_cap[0] != gv_cap[2],
+          f"all 同簇={gv_all[0] == gv_all[2]} cap 同簇={gv_cap[0] == gv_cap[2]}")
+    # 同一圆上跨弧端点禁并（GLUE_COCIRC）：把同一圆上相距 0.25mm 的
+    # 两个弧端点并成一簇 = 塌掉其间真实弧长，环会在该圆上折返出尖刺。
+    # 对照组：不同圆上的端点相距同样 0.25mm 照常合并（禁并只针对同圆）。
+    th = 0.18
+    qp = {0: (1.4, 0.0),
+          1: (1.4 * math.cos(th), 1.4 * math.sin(th)),
+          2: (0.0, 1.4),
+          3: (1.4 * math.cos(1.0), 1.4 * math.sin(1.0)),
+          4: (1.65, 0.0),
+          5: (1.65, 1.0)}
+    ep = [_rg._E("A", 0, 2, cx=0.0, cy=0.0, r=1.4),
+          _rg._E("A", 1, 3, cx=0.0, cy=0.0, r=1.4),
+          _rg._E("A", 4, 5, cx=0.25, cy=0.0, r=1.4)]
+    gvp, _ = _rg._glue(ep, qp, cap=_rg.GLUE_CLOSE)
+    check("有界胶合：同一圆（r1.4）上相距 0.25mm 的两弧端点不得合并",
+          gvp[0] != gvp[1], f"0/1 同簇={gvp[0] == gvp[1]}")
+    check("有界胶合：不同圆上的端点仍按距离合并（禁并只针对同圆）",
+          gvp[0] == gvp[4], f"0/4 同簇={gvp[0] == gvp[4]}")
     check("D79307 V2 raw 已过门 ⇒ 胶合不跑（glued 诊断恒 None）",
           r79["V2"].ring is not None and r79["V2"].ring.rule == "raw"
           and r79["V2"].glued is None,
@@ -2554,6 +2664,122 @@ def test_ring() -> None:
           prof79 is not None and tiny == 4, str(tiny))
 
 
+# ============ K. 剖视图语义（20180425 气缸前盖三刀） ============
+
+def test_section_semantics() -> None:
+    """剖视图的三条语义（v0.6.45，20180425 气缸前盖）：
+
+    ① **定性**：剖视图按 HATCH 计数定性，不按「X—X」标题（标题可能只绑到
+       剖切线端点的俯视图上——bracket 剖面图实测 V0=top 带 A—A）；
+    ② **定轴**：切平面没标位置时按同行/同列布局推断 u/v/p 轴；
+    ③ **材料反证**：剖视图里可见轮廓全是实线，"实线对 ⇒ 凸台"不成立；
+       剖面线（HATCH）说空就是孔/腔。只做 True→False 单向修正。
+    """
+    section("K. 剖视图语义（定性 / 定轴 / 材料反证）")
+    from src.rebuild.evidence.model import Drawing, Evidence, Kind
+    from src.rebuild.features.recognizer import _rebut_by_section
+    from src.rebuild.model.geom2d import Line2, Point2
+    from src.rebuild.views.correspondence import (
+        CylinderHint,
+        ViewFrame,
+        _section_axes_by_layout,
+    )
+    from src.rebuild.views.view_typer import _extent_score, _hatched_views
+
+    def ev(h: str, role: Role) -> Evidence:
+        return Evidence(handle=h, kind=Kind.EDGE, layer="0",
+                        geom=Line2(Point2(0.0, 0.0), Point2(1.0, 0.0)),
+                        role=Claim(role, "test", Tier.GUESS))
+
+    def bbox(x0: float, x1: float, y0: float, y1: float) -> BBox2:
+        return BBox2.of_points([Point2(x0, y0), Point2(x1, y1)])
+
+    # ---- K1 HATCH 计数是剖视定性判据 ----
+    d = Drawing(path="test")
+    d.evidence = [
+        ev("h1", Role.HATCH_BOUNDARY), ev("h2", Role.HATCH_BOUNDARY),
+        ev("h3", Role.HATCH_BOUNDARY), ev("l1", Role.VISIBLE),
+    ]
+    v0 = View(id="V0", evidence=["h1", "h2", "h3", "l1"])
+    v1 = View(id="V1", evidence=[])
+    d.views = [v0, v1]
+    check("K1 剖面线 ≥3 ⇒ 判剖视图",
+          _hatched_views(d, d.views) == {"V0"}, str(_hatched_views(d, d.views)))
+    d.evidence = d.evidence[:2]          # 只有 2 条 → 不是剖面线
+    check("K1 剖面线 <3 ⇒ 不判剖视图（局部剖/零散填充不误判）",
+          _hatched_views(d, d.views) == set())
+
+    # ---- K2 剖视伙伴跳过等长判定 ----
+    # 剖视按剖切位置配置，本不与父视图等长：带 sections 时宽不等只记 0 分，
+    # 不带时记 −1（曾把主视图候选扣成 0 分、全部 UNKNOWN）。
+    a = View(id="A", bbox=bbox(0, 155, 0, 115))
+    b = View(id="B", bbox=bbox(0, 33, 0, 115))     # 同行、宽不等
+    cols = {"A": [b], "B": [a]}
+    rows: dict[str, list[View]] = {"A": [], "B": []}
+    check("K2 不等宽的剖视伙伴不扣分（记 0）",
+          _extent_score(a, cols, rows, {"B"}) == 0
+          and _extent_score(a, cols, rows) == -1,
+          f"with={_extent_score(a, cols, rows, {'B'})}"
+          f" without={_extent_score(a, cols, rows)}")
+
+    # ---- K3 切平面未标注时按布局定轴 ----
+    typed = [a, b]
+    a.type = Claim(ViewType.FRONT, "test", Tier.GUESS)
+    b.type = Claim(ViewType.SECTION, "test", Tier.GUESS)
+    got = _section_axes_by_layout(b, typed, {"A": ("x", "z")})
+    check("K3 剖视与主视图同行 ⇒ u=主视图 p(y)、v=主视图 v(z)",
+          got == (("y", "z"), "A"), str(got))
+    c = View(id="C", bbox=bbox(0, 33, 0, 115))
+    c.type = Claim(ViewType.SECTION, "test", Tier.GUESS)
+    check("K3 剖视只与另一个剖视同行 ⇒ 不互相锚定（返回 None）",
+          _section_axes_by_layout(c, [b, c], {}) is None)
+
+    # ---- K4 剖面材料反证（True→False 单向） ----
+    fr = ViewFrame(view_id="V0", view_type=ViewType.SECTION,
+                   u_axis="y", v_axis="z", p_axis="x",
+                   u_span=(0.0, 33.0), v_span=(-50.0, 50.0))
+
+    def hint(solid: bool | None = True, **kw: Any) -> Any:
+        kw.setdefault("profile_method", "outline:V0")
+        return CylinderHint(axis=Axis3(Point3(0.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)),
+                            radius=10.0, length=33.0, solid=solid,
+                            span=(0.0, 33.0), **kw)
+
+    def mats(mm: Any, frame: ViewFrame = fr) -> dict:
+        return {"V0": (frame, mm, None)}
+
+    def empty_mid(pt: Point2) -> bool:
+        return not (-10.0 <= pt.y <= 10.0)      # 圆区间整段空
+
+    def full(pt: Point2) -> bool:
+        return True
+
+    def blind(pt: Point2) -> bool:
+        # 圆区间里 y∈[24,33]（a1 端）一段空 ⇒ 自 a1 端钻入、深 9 的盲孔
+        if -10.0 <= pt.y <= 10.0:
+            return pt.x < 24.0
+        return True
+    check("K4 圆区间整段无剖面线 ⇒ 判孔，span 取剖视全跨度（通孔）",
+          _rebut_by_section(hint(), mats(empty_mid)) == (False, (0.0, 33.0)),
+          str(_rebut_by_section(hint(), mats(empty_mid))))
+    check("K4 圆区间有材料 ⇒ 不翻（凸台判定保留）",
+          _rebut_by_section(hint(), mats(full)) == (True, None))
+    check("K4 贴一端无料 ⇒ 判盲孔/腔，span 不改（深度仍以轮廓对为准）",
+          _rebut_by_section(hint(), mats(blind)) == (False, None),
+          str(_rebut_by_section(hint(), mats(blind))))
+    check("K4 solid=None 不参与反证（False/None→True 永远不做）",
+          _rebut_by_section(hint(solid=None), mats(empty_mid)) == (None, None))
+    check("K4 圆轴不在剖视帧轴内 ⇒ 跳过（剖切面没穿过它）",
+          _rebut_by_section(
+              hint(),
+              mats(full, ViewFrame(view_id="V0", view_type=ViewType.SECTION,
+                                   u_axis="x", v_axis="z", p_axis="y",
+                                   u_span=(0.0, 33.0), v_span=(-50.0, 50.0)))
+          ) == (True, None))
+    check("K4 非轮廓对来源（callout/无 profile）⇒ 不参与反证",
+          _rebut_by_section(hint(profile_method=""), mats(empty_mid)) == (True, None))
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -2570,6 +2796,7 @@ def main() -> int:
     test_features()
     test_pipeline()
     test_ring()
+    test_section_semantics()
 
     print("\n" + "=" * 72)
     if _failed:

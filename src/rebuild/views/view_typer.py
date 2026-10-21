@@ -85,29 +85,71 @@ def _partners(views: list[View]) -> tuple[dict[str, list[View]], dict[str, list[
     return cols, rows
 
 
+#: 视图中 HATCH_BOUNDARY 图元数 ≥ 此值 ⇒ 剖视图（图上有剖面材料）
+SECTION_HATCH_MIN = 3
+
+
+def _section_marker_of(d: Drawing, v: View):
+    """视图标注里的「X—X」剖视标记（剖视图上方的标题/剖切线端点文字）。"""
+    for h in v.annotations:
+        t = d.text_by_handle(h)
+        if t is not None and t.kind == TextKind.SECTION_MARKER:
+            return t
+    return None
+
+
+def _hatched_views(d: Drawing, views: list[View]) -> set[str]:
+    """含剖面线边界的视图 id 集合 —— 它们是剖视图。
+
+    剖视图与父视图是**剖切对应**，不遵循三等定律的等长关系（剖切面转 90°
+    后展开，宽高本来就不等）。它们仍可作主视图（YZYX 的 A—A 全剖就是），
+    故不排除出候选，只在**评分**时跳过等长判定。
+    """
+    by_handle = {e.handle: e for e in d.evidence}
+    out: set[str] = set()
+    for v in views:
+        n = sum(1 for h in v.evidence
+                if h in by_handle and by_handle[h].role.value == "hatch_boundary")
+        if n >= SECTION_HATCH_MIN:
+            out.add(v.id)
+    return out
+
+
 def _extent_score(v: View, cols: dict[str, list[View]],
-                  rows: dict[str, list[View]]) -> int:
+                  rows: dict[str, list[View]],
+                  sections: set[str] | None = None) -> int:
     """候选主视图的"三等定律"得分：满足的伙伴数 − 违背的伙伴数。
 
     列伙伴在共享轴（图纸横向）上应等宽（长对正），行伙伴应等高（高平齐）。
     违背的伙伴说明它不是标准三视图的那一对 —— 局部视图/辅助视图只画零件的
     一部分，本来就不与主视图等长，故天然被这条排除。
+
+    ``sections`` 里的剖视伙伴**跳过**等长判定（既不加也不减）：剖视图按
+    剖切位置配置，不与父视图等长（实测 20180425 气缸前盖：B—B 剖视宽
+    86.67 与主视图 39.69 不等，把主视图候选扣成 0 分、与右视图打平 ⇒
+    全部 UNKNOWN）。
     """
     assert v.bbox is not None
+    sections = sections or set()
     w = v.bbox.xmax - v.bbox.xmin
     h = v.bbox.ymax - v.bbox.ymin
     score = 0
     for p in cols[v.id]:
+        if p.id in sections:
+            continue
         assert p.bbox is not None
         score += 1 if _same_extent(w, p.bbox.xmax - p.bbox.xmin) else -1
     for p in rows[v.id]:
+        if p.id in sections:
+            continue
         assert p.bbox is not None
         score += 1 if _same_extent(h, p.bbox.ymax - p.bbox.ymin) else -1
     return score
 
 
 def _pick_front_by_extent(cands: list[View], cols: dict[str, list[View]],
-                          rows: dict[str, list[View]]) -> View | None:
+                          rows: dict[str, list[View]],
+                          sections: set[str] | None = None) -> View | None:
     """多候选时用**三等定律**裁决主视图（长对正/高平齐）。
 
     为什么需要（2026-10-12，YZYX 齿箱上盖）：判据"恰好一个视图同时有行、列
@@ -131,9 +173,10 @@ def _pick_front_by_extent(cands: list[View], cols: dict[str, list[View]],
     """
     if len(cands) < 2:
         return None
-    scored = sorted(cands, key=lambda v: -_extent_score(v, cols, rows))
-    best = _extent_score(scored[0], cols, rows)
-    if best <= 0 or _extent_score(scored[1], cols, rows) == best:
+    scored = sorted(cands,
+                    key=lambda v: -_extent_score(v, cols, rows, sections))
+    best = _extent_score(scored[0], cols, rows, sections)
+    if best <= 0 or _extent_score(scored[1], cols, rows, sections) == best:
         return None
     return scored[0]
 
@@ -305,9 +348,29 @@ def _type_by_layout(d: Drawing, qs: QuestionList,
         return
 
     cols, rows = _partners(views)
+    sections = _hatched_views(d, views)
 
     # 主视图：优先用已定性的；否则用"同时有列伙伴和行伙伴"者
     front = next((v for v in views if v.resolved_type == ViewType.FRONT), None)
+    if front is None:
+        # 全图恰好一个非剖视视图、且剖视视图与它同行/同列 ⇒ 它是主视图。
+        # 剖视是**派生视图**，不能反过来当锚：实测 20180425 气缸前盖——
+        # A—A 剖视（33×115、64 条剖面线边界）与圆盘主视图（155×115）同高，
+        # 不带这条时剖视靠"与非剖视视图高平齐"在主视图竞争里拿 +1 胜出，
+        # 主视图被降成左视图；随后剖切面上的**可见腔壁**又被当成凸台轮廓
+        # （可见线 ⇒ solid=True ⇒ BOSS），φ115 内腔被填成实心。
+        # 判据只认投影证据（剖面材料边界），不认「X—X」标题——标题可能
+        # 只绑到剖切线端点的俯视图上（bracket 剖面图实测 V0=top 带 A—A）。
+        plain = [v for v in untyped if v.id not in sections
+                 and _section_marker_of(d, v) is None]
+        if len(plain) == 1:
+            pv = plain[0]
+            if any(pv in cols[s.id] or pv in rows[s.id]
+                   for s in views if s.id in sections):
+                front = pv
+                front.type = Claim(ViewType.FRONT, "layout:sole_plain_view",
+                                   Tier.CONVENTION,
+                                   evidence=tuple(front.evidence[:1]))
     if front is None:
         cands = [v for v in untyped if cols[v.id] and rows[v.id]]
         if len(cands) == 1:
@@ -317,7 +380,7 @@ def _type_by_layout(d: Drawing, qs: QuestionList,
                                evidence=tuple(front.evidence[:1]))
         elif len(cands) > 1:
             # 多候选（2×2 以上的网格布局）：用三等定律裁决，裁不出就照旧报疑
-            front = _pick_front_by_extent(cands, cols, rows)
+            front = _pick_front_by_extent(cands, cols, rows, sections)
             if front is not None:
                 front.type = Claim(ViewType.FRONT, "layout:equal_extent",
                                    Tier.CONVENTION,
@@ -336,6 +399,35 @@ def _type_by_layout(d: Drawing, qs: QuestionList,
         side_label = _side_label_of(d, v)
         if side_label is not None:
             ref = (side_label.handle,)
+
+        # 带剖面材料边界的视图**就是**剖视图（投影证据，比标题硬：标题可能
+        # 只绑到剖切线端点的俯视图上——bracket 剖面图实测 V0=top 带 A—A、
+        # 本体不是剖视）。剖视是派生视图，不参与布局定性，否则它的剖切面
+        # 可见线会被下游当成"正交视图可见轮廓对"（solid=True ⇒ 凸台）。
+        # 被选为 front 的视图不受影响（YZYX 的 A—A 全剖就是主视图）。
+        if v.id in sections:
+            v.type = Claim(ViewType.SECTION, "projection:hatch_material",
+                           Tier.PROJECTION, ref)
+            continue
+
+        # 「X—X」剖视标记 + 与主视图**不满足三等** ⇒ 独立剖视图。
+        # 剖视图按剖切位置配置，与父视图不对齐（实测 20180425 气缸前盖：
+        # B—B 画在主视图正下方但与主视图不等宽、C—C 既不同列也不同行）；
+        # 若按布局把它们当俯/侧视图，跨度读数会两路矛盾，孔也配不上轮廓对。
+        # 原位剖视（主视图位置的局部剖）仍由主视图竞争选中，不受影响。
+        marker = _section_marker_of(d, v)
+        if marker is not None:
+            ok = False
+            if v in cols[front.id]:
+                ok = _same_extent(v.bbox.xmax - v.bbox.xmin,
+                                  front.bbox.xmax - front.bbox.xmin)
+            elif v in rows[front.id]:
+                ok = _same_extent(v.bbox.ymax - v.bbox.ymin,
+                                  front.bbox.ymax - front.bbox.ymin)
+            if not ok:
+                v.type = Claim(ViewType.SECTION, "note:section_marker",
+                               Tier.CONVENTION, (marker.handle,))
+                continue
 
         if v in cols[front.id]:
             # 列伙伴 = 俯/仰视图。上下由投影制决定：第一角俯在下、第三角俯在上。
