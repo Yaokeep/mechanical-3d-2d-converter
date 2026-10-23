@@ -882,6 +882,12 @@ def _build_hole(driver: Any, f: Feature) -> str:
     through = bool(_param(f, "through"))
     if radius <= 0.0:
         raise SwBuildError(f"特征 #{f.id}（hole）半径必须为正，实得 {radius}")
+    r_top = _opt(f, "radius_top", None)
+    if r_top is not None and abs(float(r_top) - radius) > 1e-9:
+        # 锥孔要靠 FeatureCut3 的拔模角，SW 侧尚未验证（静默按直孔建 = 少料）
+        raise SwBuildError(
+            f"特征 #{f.id}（hole）是锥孔（Ø{2 * radius:g}→Ø{2 * float(r_top):g}）："
+            f"SW 发射器尚未支持锥形切除，拒绝按直孔静默发射")
     count = int(_opt(f, "count", 0) or 0)
     if count > 1:
         # 契约只说"同一轴上的孔数"，没给分布（间距/阵列）—— 按 1 个孔建就是**少建**，

@@ -2931,6 +2931,52 @@ def test_section_bore() -> None:
     check("L7 0.04mm 内的重复线去重后仍是唯一候选",
           _cut_plane_pos(d, corr, v0, fr) == ("x", 50.0))
 
+    # ---- L8 孔口：剖面线只画到端面，基体却按视图 bbox 拉满 ⇒ 段端点要
+    #      延伸到边界外切穿，否则端面留一层薄材料膜把孔口封死（实测 0.15~1.6mm）
+    from src.rebuild.features.section_bore import _open_ends
+
+    bb = BBox2.of_points([Point2(0.0, 0.0), Point2(40.0, 40.0)])
+    slot = _Cand("u", 20.0, 5.0, 2.0, 38.0)          # 沿 u，两端各距边界 2mm
+    empty = lambda p: abs(p.y - 20.0) > 5.0           # noqa: E731 整条槽无材料
+    lo, hi = _open_ends(fr, empty, bb, slot)
+    check("L8 端点距边界 ≤ OPEN_MAX_GAP 且一路无材料 ⇒ 延伸到边界外（孔口）",
+          lo == -0.05 and hi == 40.05, f"{lo},{hi}")
+    blocked = lambda p: p.x < 3.0 or abs(p.y - 20.0) > 5.0  # noqa: E731
+    lo, hi = _open_ends(fr, blocked, bb, slot)
+    check("L8 路径上遇到材料 ⇒ 该端不延伸（那是孔底/隔壁材料）",
+          lo == 2.0 and hi == 40.05, f"{lo},{hi}")
+    far = _Cand("u", 20.0, 5.0, 10.0, 30.0)
+    lo, hi = _open_ends(fr, empty, bb, far)
+    check("L8 端点距边界 > OPEN_MAX_GAP ⇒ 不延伸"
+          "（路过的空腔属于别的孔，延伸会切掉两者之间的真材料）",
+          lo == 10.0 and hi == 30.0, f"{lo},{hi}")
+
+    # ---- L9 锥孔：桶聚类的段只有平均半宽，回栅格重采样 + 端点细化扫描 ----
+    from src.rebuild.features.section_bore import _taper_of
+
+    us2 = [i * 0.5 for i in range(81)]
+    vs2 = [j * 0.5 for j in range(81)]
+
+    def h_of(v: float) -> float:                      # 锥：半宽 3 → 5
+        return 3.0 + 2.0 * v / 40.0
+
+    mat2 = [[abs(u - 20.0) >= h_of(v) for v in vs2] for u in us2]
+    mm2 = lambda p: abs(p.x - 20.0) >= h_of(p.y)      # noqa: E731 x=u, y=v
+    tp = _taper_of(_Cand("v", 20.0, 4.0, 0.5, 39.5), us2, vs2, mat2, fr, mm2)
+    check("L9 半宽沿轴单调渐变（3→5）⇒ 认锥段，端点值外推到位",
+          tp is not None and abs(tp[0] - 3.0) < 0.2
+          and abs(tp[1] - 5.0) < 0.2, str(tp))
+    mat3 = [[abs(u - 20.0) >= 5.0 for _ in vs2] for u in us2]
+    check("L9 直孔（半宽恒定）⇒ 不认锥",
+          _taper_of(_Cand("v", 20.0, 5.0, 0.5, 39.5), us2, vs2, mat3, fr,
+                    lambda p: abs(p.x - 20.0) >= 5.0) is None)
+    mat4 = [[abs(u - 20.0) >= (3.0 if v < 20.0 else 5.0) for v in vs2]
+            for u in us2]
+    check("L9 阶梯（半宽突变、非单调）⇒ 不认锥",
+          _taper_of(_Cand("v", 20.0, 4.0, 0.5, 39.5), us2, vs2, mat4, fr,
+                    lambda p: abs(p.x - 20.0) >= (3.0 if p.y < 20.0 else 5.0))
+          is None)
+
 
 # ============ 主入口 ============
 

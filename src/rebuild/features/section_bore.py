@@ -47,6 +47,24 @@
 （`cylinder_features` 按轮廓对猜的，如 #8 r19 通孔 / #9 r18 通孔）由
 `replace_coaxial` 摘掉 —— 剖面材料是直接证据，压过投影猜测；带
 `annotation:` 方法的（孔标注绑定）不动。
+
+## 孔口（`_open_ends`）
+
+剖面线只画到端面，而发射端的基体按视图 bbox 拉满 ⇒ 孔若严格按剖面读数
+切，端面会留一层薄材料膜把孔口封死（20180425 实测：中心阶梯孔左端 1.6 /
+右端 0.7mm、顶部竖孔 0.15mm——模型外表面一个孔口都看不见）。判据：端点
+到边界 ≤ `OPEN_MAX_GAP` 且沿段轴线向外一路无材料 ⇒ 延伸到边界外
+`OPEN_MARGIN`。
+
+## 锥孔（`_taper_of` + `radius_top`）
+
+桶聚类的段只保证半宽在 `SPREAD_TOL` 内，锥孔会被读成一条**平均半宽**的
+直段（20180425 顶部锥孔 Ø11.6→Ø12.5 被读成 Ø11.83 直孔）。回到栅格沿轴
+重采样 + 两端**细化扫描**（步 `GRID/6`——栅格半宽是 0.3 的整数倍，宽端会
+被量化吃掉最多 0.15，实测 0.45 的锥度差读成 0.30）：两端差 ∈ [TAPER_MIN,
+TAPER_MAX]、沿轴单调、无单步跳变（台阶不是锥）⇒ 记 `taper`，发射成
+`radius`（起始端）+ `radius_top`（远端）两参数；OCC 用 MakeCone，SW 发射器
+尚未支持、明确拒绝（不静默按直孔建）。
 """
 from __future__ import annotations
 
@@ -98,6 +116,22 @@ GAP_FILL = 0.5
 SNAP_TOL = 0.6
 #: 剖切线候选去重容差
 CUT_TOL = 0.05
+#: 孔口判据：段端点到视图边界的最大距离。剖面线只画到端面，发射端的基体
+#: 却按视图 bbox 拉满 ⇒ 孔按剖面读数切会在端面外留一层薄材料膜把孔口封死
+#: （实测中心阶梯孔左端 1.6mm / 右端 0.7mm、顶部竖孔 0.15mm——模型外表面
+#: 一个孔口都看不见）。超过这个距离的端点不判开口：中间的空腔可能属于别的
+#: 孔，延伸会切掉两者之间的真材料（Ø7 横孔左端到左端面 20mm，路过的全是
+#: 别条孔的空腔，但中间夹着 1.3mm 真材料）。
+OPEN_MAX_GAP = 3.0
+#: 开口路径上的材料率上限（全空才判开口）
+OPEN_FRAC = 0.1
+#: 开口端向外多切的余量（切穿表面，不正好贴面）
+OPEN_MARGIN = 0.05
+#: 锥孔判据：段两端的半宽差下限（细化扫描仍有 GRID/6 步长噪声，留余量）。
+#: 实测 A—A 顶部锥孔 Ø11.6（锥底，深 15）→ Ø12.5（顶面），半宽差 0.45
+TAPER_MIN = 0.35
+#: 锥孔两端半宽差上限（更大的是喇叭口/异形腔，不是直锥）
+TAPER_MAX = 3.0
 
 _DIRS = {"x": Vector3(1.0, 0.0, 0.0),
          "y": Vector3(0.0, 1.0, 0.0),
@@ -115,6 +149,9 @@ class _Cand:
     hi: float
     proof: str = ""    # 圆柱性证据（"dim:42" / "coaxial:…"）
     tier: Tier = Tier.GUESS
+    # 锥段：沿轴两端的实测半宽 (lo 端, hi 端)；直段为 None。
+    # ``half`` 此时 = 小端（用于与直径标注对账：图纸标锥底直径）。
+    taper: tuple[float, float] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +179,12 @@ def section_bores(d, corr, conv, rep, mats: dict | None = None) -> list[Feature]
         keep = [c for c in cands
                 if _wall_ok(fr, mm, c)
                 and c.half < MAX_HALF_FRAC * _span_of(c.axis, us, vs)]
-        picked = _prove(keep, _dims_geom(d, conv, view, fr), fr)
+        tapered: list[_Cand] = []
+        for c in keep:
+            tp = _taper_of(c, us, vs, mat, fr, mm)
+            tapered.append(c if tp is None else _Cand(
+                c.axis, c.center, min(tp), c.lo, c.hi, c.proof, c.tier, tp))
+        picked = _prove(tapered, _dims_geom(d, conv, view, fr), fr)
         if not picked:
             if keep:
                 rep.notes.append(
@@ -150,7 +192,8 @@ def section_bores(d, corr, conv, rep, mats: dict | None = None) -> list[Feature]
                     f"或同轴证据 ⇒ 不建（原则二）")
             continue
         for c in picked:
-            out.append(_make_hole(d, view, fr, c, p_axis, p_pos))
+            out.append(_make_hole(d, view, fr, c, p_axis, p_pos,
+                                  mm=mm, bbox=view.bbox))
         rep.notes.append(
             f"剖面孔：{vid} 从剖面线读出 {len(picked)} 段阶梯孔/通道"
             f"（恒定空腔 + 两侧材料 + 直径标注/同轴；剖切面 {p_axis}={p_pos:.3f}）")
@@ -475,19 +518,112 @@ def _dim_proof(c: _Cand, dims, fr) -> float | None:
     return None
 
 
+def _half_at(c: _Cand, t: float, us, vs, mat) -> float | None:
+    """栅格在沿轴位置 t 处、覆盖段轴线（center）的空腔半宽。"""
+    ts, ps = (us, vs) if c.axis == "u" else (vs, us)
+    k = min(range(len(ts)), key=lambda q: abs(ts[q] - t))
+    if c.axis == "u":
+        col = [mat[k][j] for j in range(len(vs))]
+    else:
+        col = [mat[i][k] for i in range(len(us))]
+    for a, b in _runs(col):
+        p_lo, p_hi = ps[a], ps[b]
+        if p_lo - BUCK_TOL <= c.center <= p_hi + BUCK_TOL:
+            return (p_hi - p_lo) / 2.0
+    return None
+
+
+def _half_at_fine(c: _Cand, t: float, fr, mm) -> float | None:
+    """沿垂直轴**细化扫描**（步 GRID/6）从段中心向两侧找材料边界。
+
+    栅格半宽是 0.3 的整数倍，锥孔宽端会被量化吃掉最多 0.15——两端各吃一点
+    就足以让锥度差掉到判据以下（实测 0.45 读成 0.30）。端点判锥用这条。
+    """
+    step = GRID / 6.0
+    limit = MAX_HALF_FRAC * 120.0      # 扫描上限（视图跨度级）
+
+    def is_mat(p: float) -> bool:
+        u, v = (t, p) if c.axis == "u" else (p, t)
+        return mm(Point2(fr.u_to_model(u), fr.v_to_model(v)))
+
+    if is_mat(c.center):
+        return None
+    lo = hi = c.center
+    while abs(lo - c.center) < limit:
+        if is_mat(lo - step):
+            break
+        lo -= step
+    while abs(hi - c.center) < limit:
+        if is_mat(hi + step):
+            break
+        hi += step
+    return (hi - lo) / 2.0
+
+
+def _taper_of(c: _Cand, us, vs, mat, fr=None, mm=None) -> tuple[float, float] | None:
+    """段两端实测半宽：单调渐变且差值够大 ⇒ 锥段 (half_at_lo, half_at_hi)。
+
+    桶聚类的段只保证"半宽在 SPREAD_TOL 内"，锥孔会被读成一条平均半宽的
+    直段（实测顶部锥孔 Ø11.6→Ø12.5 被读成 Ø11.83 的直孔）。判据：两端
+    **细化扫描**的半宽差 ≥ TAPER_MIN，且栅格沿轴的采样单调（容 GRID 噪声）。
+    端点值按缩进实测线性外推到段端点。
+    """
+    span = c.hi - c.lo
+    if span < 4.0 * GRID or fr is None or mm is None:
+        return None
+    inset = 1.5 * GRID
+    h_lo = _half_at_fine(c, c.lo + inset, fr, mm)
+    h_hi = _half_at_fine(c, c.hi - inset, fr, mm)
+    if h_lo is None or h_hi is None:
+        return None
+    if not (TAPER_MIN <= abs(h_hi - h_lo) <= TAPER_MAX):
+        return None
+    n = 9
+    t0, t1 = c.lo + GRID, c.hi - GRID
+    hs: list[float] = []
+    for k in range(n):
+        h = _half_at(c, t0 + (t1 - t0) * k / (n - 1), us, vs, mat)
+        if h is not None:
+            hs.append(h)
+    if len(hs) < 5:
+        return None
+    lo_h, hi_h = min(h_lo, h_hi), max(h_lo, h_hi)
+    # 栅格半宽按 (末格−首格)×步长 计，系统性偏小最多一整格 ⇒ 容差取 2×GRID
+    if any(h < lo_h - 2.0 * GRID or h > hi_h + 2.0 * GRID for h in hs):
+        return None                    # 非单调 —— 台阶/异形，不是直锥
+    jumps = [abs(b - a) for a, b in zip(hs, hs[1:])]
+    if max(jumps) > max(TAPER_MIN, 0.4 * abs(h_hi - h_lo)):
+        return None                    # 单步跳变 —— 是台阶不是锥面
+    slope = (h_hi - h_lo) / (span - 2.0 * inset)
+    return h_lo - slope * inset, h_hi + slope * inset
+
+
 def _prove(cands: list[_Cand], dims, fr) -> list[_Cand]:
     """直径标注 → 同轴链扩散 → 拿到证据的段。
 
     标注段用**标注值**当半径（栅格化读出的半宽有 ±GRID/2 的量化误差，
     实测 Ø7 读成 6.88/6.58；图上写死的数才是真值）；同轴段沿用实测半宽。
+    锥段用**小端**对账标注（图纸标的是锥底直径），``taper`` 原样传下去。
     """
     confirmed: list[_Cand] = []
     rest: list[_Cand] = []
     for c in cands:
-        v = _dim_proof(c, dims, fr)
+        for_proof = c
+        if c.taper is not None:
+            small = min(c.taper)
+            for_proof = _Cand(c.axis, c.center, small, c.lo, c.hi,
+                              c.proof, c.tier, c.taper)
+        v = _dim_proof(for_proof, dims, fr)
         if v is not None:
+            taper = c.taper
+            if taper is not None:
+                # 标注值只钉小端；大端按实测的**半径差**跟着平移
+                a, b = taper
+                delta = abs(b - a)
+                taper = ((v / 2.0, v / 2.0 + delta) if a <= b
+                         else (v / 2.0 + delta, v / 2.0))
             confirmed.append(_Cand(c.axis, c.center, v / 2.0, c.lo, c.hi,
-                                   f"dim:{v:g}", Tier.ANNOTATED))
+                                   f"dim:{v:g}", Tier.ANNOTATED, taper))
         else:
             rest.append(c)
     changed = True
@@ -500,7 +636,8 @@ def _prove(cands: list[_Cand], dims, fr) -> list[_Cand]:
                          and abs(k.center - c.center) <= AXIS_TOL), None)
             if mate is not None:
                 confirmed.append(_Cand(c.axis, c.center, c.half, c.lo, c.hi,
-                                       f"coaxial:{mate.proof}", Tier.PROJECTION))
+                                       f"coaxial:{mate.proof}", Tier.PROJECTION,
+                                       c.taper))
                 changed = True
             else:
                 still.append(c)
@@ -512,8 +649,47 @@ def _prove(cands: list[_Cand], dims, fr) -> list[_Cand]:
 # 发射
 # ---------------------------------------------------------------------------
 
+def _open_ends(fr, mm, bbox, c: _Cand) -> tuple[float, float]:
+    """段两端是否通到视图边界（⇒ 孔口，需要切穿端面），返回延伸后的范围。
+
+    剖面线只覆盖到端面；基体按视图 bbox 拉伸，孔若严格按剖面读数切，
+    端面会留一层薄材料膜把孔口封死（实测 0.15~1.6mm）。判据两条同时满足：
+    端点到边界 ≤ ``OPEN_MAX_GAP``，且沿段轴线（固定垂直坐标 = 段中心）向外
+    一路无材料 —— 中途遇到材料就说明路径被真材料隔断，延伸会切掉它。
+    """
+    lo, hi = c.lo, c.hi
+    for to_hi in (False, True):
+        end = hi if to_hi else lo
+        if c.axis == "u":
+            lim = bbox.xmax if to_hi else bbox.xmin
+        else:
+            lim = bbox.ymax if to_hi else bbox.ymin
+        dist = abs(lim - end)
+        if dist > OPEN_MAX_GAP:
+            continue
+        n = max(int(math.ceil(dist / GRID)), 1)
+        solid = 0
+        for k in range(n + 1):
+            t = end + (lim - end) * k / n
+            if c.axis == "u":
+                p = Point2(fr.u_to_model(t), fr.v_to_model(c.center))
+            else:
+                p = Point2(fr.u_to_model(c.center), fr.v_to_model(t))
+            solid += 1 if mm(p) else 0
+        if solid > OPEN_FRAC * (n + 1):
+            continue
+        if to_hi:
+            hi = lim + OPEN_MARGIN
+        else:
+            lo = lim - OPEN_MARGIN
+    return lo, hi
+
+
 def _make_hole(d, view, fr, c: _Cand, p_axis: str,
-               p_pos: float) -> Feature:
+               p_pos: float, mm=None, bbox=None) -> Feature:
+    if mm is not None and bbox is not None:
+        c = _Cand(c.axis, c.center, c.half, *_open_ends(fr, mm, bbox, c),
+                  c.proof, c.tier, c.taper)
     dir_name = fr.u_axis if c.axis == "u" else fr.v_axis
     perp = fr.v_axis if c.axis == "u" else fr.u_axis
     # 垂直方向（视图系 center）→ 模型系
@@ -530,15 +706,24 @@ def _make_hole(d, view, fr, c: _Cand, p_axis: str,
     origin = Point3(o["x"], o["y"], o["z"])
     ev = _segment_evidence(d, view, c)
     meth = "section:material_profile+" + c.proof.split(":", 1)[0]
+    params = {
+        "radius": Claim(c.half, meth, c.tier, ev),
+        "depth": Claim(hi - lo, f"{meth}_span", c.tier, ev),
+        # HOLE 契约：axial_at = 孔口，轴向 = 钻入方向
+        "axial_at": Claim(lo, f"{meth}_span", c.tier, ev),
+    }
+    if c.taper is not None:
+        # 锥孔：radius = 起始端（模型系 lo 端）；radius_top = 远端（lo+depth 处）。
+        # 视图系 lo/hi 经 u_to_model/v_to_model 后可能翻转，按实际端点对齐。
+        r_view_lo, r_view_hi = c.taper
+        r_lo, r_hi = (r_view_lo, r_view_hi) if a0 <= a1 \
+            else (r_view_hi, r_view_lo)
+        params["radius"] = Claim(r_lo, meth + "_taper", c.tier, ev)
+        params["radius_top"] = Claim(r_hi, meth + "_taper", c.tier, ev)
     return Feature(
         id=FeatureId(-1),
         type=Claim(FeatureType.HOLE, meth, c.tier, ev),
-        params={
-            "radius": Claim(c.half, meth, c.tier, ev),
-            "depth": Claim(hi - lo, f"{meth}_span", c.tier, ev),
-            # HOLE 契约：axial_at = 孔口，轴向 = 钻入方向
-            "axial_at": Claim(lo, f"{meth}_span", c.tier, ev),
-        },
+        params=params,
         axis=Claim(Axis3(origin, _DIRS[dir_name], None), meth, c.tier, ev),
         placement=Claim(origin, meth, c.tier, ev),
         source_view=view.id, evidence=list(ev),

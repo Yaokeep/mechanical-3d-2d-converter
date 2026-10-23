@@ -95,8 +95,8 @@ from OCC.Core.BRepFilletAPI import BRepFilletAPI_MakeChamfer, BRepFilletAPI_Make
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_ThruSections
 from OCC.Core.BRepTools import breptools
-from OCC.Core.BRepPrimAPI import (BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakePrism,
-                                  BRepPrimAPI_MakeRevol)
+from OCC.Core.BRepPrimAPI import (BRepPrimAPI_MakeCone, BRepPrimAPI_MakeCylinder,
+                                  BRepPrimAPI_MakePrism, BRepPrimAPI_MakeRevol)
 from OCC.Core.GC import GC_MakeArcOfCircle
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.Geom import Geom_Circle
@@ -579,6 +579,24 @@ def _cylinder(f: Feature, r: float, t_lo: float, t_hi: float, what: str):
     base = o + d * t_lo
     return _built(BRepPrimAPI_MakeCylinder(
         gp_Ax2(_pnt(base), gp_Dir(d.x, d.y, d.z)), r, t_hi - t_lo), f, what)
+
+
+def _cone(f: Feature, r1: float, r2: float, t_lo: float, t_hi: float, what: str):
+    """沿特征轴、从 t_lo 到 t_hi 的圆锥（r1 在 t_lo 端，r2 在 t_hi 端）。"""
+    for r in (r1, r2):
+        if r <= 0.0:
+            raise OccBuildError(
+                f"特征 #{f.id}（{f.type.value}）{what}：锥半径必须为正，实得 {r}")
+    if abs(r1 - r2) < 1e-9:
+        raise OccBuildError(
+            f"特征 #{f.id}（{f.type.value}）{what}：锥的两端半径相同（{r1:g}）")
+    if t_hi - t_lo <= 0.0:
+        raise OccBuildError(
+            f"特征 #{f.id}（{f.type.value}）{what}：轴向区间为空（{t_lo:g}→{t_hi:g}）")
+    o, d = _axis_of(f)
+    base = o + d * t_lo
+    return _built(BRepPrimAPI_MakeCone(
+        gp_Ax2(_pnt(base), gp_Dir(d.x, d.y, d.z)), r1, r2, t_hi - t_lo), f, what)
 
 
 # ---------------------------------------------------------------------------
@@ -1525,6 +1543,11 @@ def _build_hole(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
         depth = float(_param(f, "depth"))           # 契约：through=True 时忽略 depth
         t_lo, t_hi = t0, t0 + depth
         how = f"盲孔深{depth:g}（自 {t0:g} 朝 +轴向）"
+    r_top = _opt(f, "radius_top", None)             # 锥孔：radius=起始端，radius_top=远端
+    if r_top is not None and abs(float(r_top) - r) > 1e-9:
+        tool = _cone(f, r, float(r_top), t_lo, t_hi, how)
+        return _cut(shape, tool, f, validate), \
+            f"cut 锥孔 Ø{2 * r:g}→Ø{2 * float(r_top):g} {how}"
     tool = _cylinder(f, r, t_lo, t_hi, how)
     return _cut(shape, tool, f, validate), f"cut Ø{2 * r:g} {how}"
 
