@@ -18,7 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `src/core/reconstruction/` 已判定过时，**不要填它的 TODO**。
 - **生产可用 = 根目录独立脚本**（`dxf_to_3d_general.py` / `dxf_to_sw_features.py` / `model_to_drawing.py` 等）。
   `src/gui` 与 `src/core/`（除 `sw_automation`）是 GUI 骨架，且三个环境均无 PyQt6，`python main.py` 起不来。
-- **改动后必跑**：`python -m src.rebuild.selftest`（477 项）→ `$PY run_rebuild_acceptance.py`（OCC 表 9 绿）
+- **改动后必跑**：`python -m src.rebuild.selftest`（517 项）→ `$PY run_rebuild_acceptance.py`（OCC 表 9 绿）
   → 涉 SW 发射再加 `--sw` 表；无基准靶子跑 `$PY yz_accept.py`。`$PY` 定义见下方命令区。
 - **当前主线**：内部结构通道已落地（v0.6.45 剖视三刀 + v0.6.46 剖面材料通道——20180425
   气缸前盖 A—A 读出 10 段阶梯孔/交叉孔，截面 IoU 0.657→0.878）；下一步是
@@ -358,7 +358,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 99.5%+ 时局部可见缺陷仍零命中（bracket 三缺陷、YZYX 五处标记全靠目视）——
 历史缺陷已转成自动断言，**每次修复的例行检查序列**：
 
-1. `python -m src.rebuild.selftest` — 477 项
+1. `python -m src.rebuild.selftest` — 517 项
 2. `PYTHONIOENCODING=utf-8 $PY run_rebuild_acceptance.py` — 9 绿 + 体积/bbox
    阈值判红（0.5%/1mm，仅 expect=="ok"）+ bracket 缺陷盒·点断言（PROBES 表：
    三缺陷盒 + 凸台右弧两盒 + 3 点分类；gold/shift 2026-10-11 定标实测，
@@ -804,7 +804,7 @@ step=|sldprt=|sw=|force=)`；v0.6.41 起含**发射后自检** `extent_questions
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 477 项自检（2026-10-18 P1-D 后实测），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 517 项自检（2026-10-23 v0.6.46 后实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
