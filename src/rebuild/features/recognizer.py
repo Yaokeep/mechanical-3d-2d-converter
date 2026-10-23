@@ -2120,6 +2120,19 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
                                draws_hidden=draws_hidden, bindings=binds,
                                mats=mats):
         part.add(f)
+    # 剖面材料通道：只有**剖切面穿过内部**才看得见的孔，在任何正交视图里都
+    # 不成圆 —— `cylinder_features` 的入口是圆柱提示，一条也读不到（实测
+    # 20180425 气缸前盖的中心阶梯孔/Ø7 横孔）。剖面图的地面真值在 HATCH：
+    # 沿剖面内两轴扫掠空腔 → 恒定区间段 → 直径标注/同轴链给圆柱性证据。
+    # 剖面材料是**直接证据**，压过投影猜测：与剖面段同轴的旧 HOLE（按轮廓对
+    # 猜的通孔）由 `replace_coaxial` 摘掉；孔标注绑定不动（图上明写更强）。
+    from .section_bore import replace_coaxial, section_bores
+    sec_feats = section_bores(d, corr, conv, rep, mats=mats)
+    if sec_feats:
+        replace_coaxial(part, sec_feats, rep)
+        for f in sec_feats:
+            f.id = part.next_id()
+            part.add(f)
     # 塔腔（YZYX 式）：搭在圆柱塔上的「冠—拱壳」腔——剖面帧里冠线两端各接
     # 「同心弧对」（小弧 = 冠角、大弧 = 塔端部外形圆角、弧顶 = 塔顶母线，
     # 两弧同心是因为腔冠与塔顶壳等厚），自小弧自由端起链式追踪端点/切向

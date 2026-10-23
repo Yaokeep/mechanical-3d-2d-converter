@@ -2780,6 +2780,158 @@ def test_section_semantics() -> None:
           _rebut_by_section(hint(profile_method=""), mats(empty_mid)) == (True, None))
 
 
+# ============ L. 剖面材料通道（section_bore） ============
+
+def test_section_bore() -> None:
+    """剖面 HATCH 空腔 ⇒ 孔（v0.6.45，20180425 气缸前盖）。
+
+    判据的四块地基，各自单独钉住：
+    ① 直径标注要**几何**成立（间距=值、中点落在段轴、值的 2 倍=段宽）——
+       只按数值配对会把图上「32 深」「15 螺纹深」当直径，凭空造出 Ø32 孔；
+    ② 同轴更宽的空腔是**半径台阶**，不是横穿断口；
+    ③ 段外至少一侧有材料（排除零件外的空气带），2/5 而非 4/5；
+    ④ 剖面取代同轴旧 HOLE，但图上明写的孔标注（annotation:）不动。
+    """
+    section("L. 剖面材料通道（标注几何 / 台阶 / 壁面 / 取代）")
+    from types import SimpleNamespace
+
+    from src.rebuild.evidence.model import Drawing, Evidence, Kind
+    from src.rebuild.features.section_bore import (
+        _Cand,
+        _candidates,
+        _cut_plane_pos,
+        _dim_proof,
+        _gap_covered,
+        _prove,
+        _wall_ok,
+        replace_coaxial,
+    )
+    from src.rebuild.model.geom2d import Line2, Point2
+    from src.rebuild.views.correspondence import ViewFrame
+
+    fr = ViewFrame(view_id="V0", view_type=ViewType.SECTION,
+                   u_axis="y", v_axis="z", p_axis="x",
+                   u_span=(0.0, 40.0), v_span=(0.0, 40.0))
+
+    # ---- L1 直径标注的三点几何判据 ----
+    seg = _Cand("u", 30.0, 5.0, 10.0, 20.0)
+    good = [(10.0, (12.0, 25.0), (12.0, 35.0))]
+    check("L1 垂直间距=值、中点落在段轴上 ⇒ 采用标注值",
+          _dim_proof(seg, good, fr) == 10.0, str(_dim_proof(seg, good, fr)))
+    check("L1 两点沿轴方向（那是深度/宽度标注）不构成直径",
+          _dim_proof(seg, [(10.0, (10.0, 30.0), (20.0, 30.0))], fr) is None)
+    check("L1 标注值 ≠ 2×段半宽（深度「32」误配半宽 5 的段）⇒ 不采用",
+          _dim_proof(seg, [(32.0, (12.0, 14.0), (12.0, 46.0))], fr) is None)
+    check("L1 中点偏离段轴 > 0.5 ⇒ 不采用",
+          _dim_proof(seg, [(10.0, (12.0, 18.0), (12.0, 28.0))], fr) is None)
+    check("L1 标注中点沿轴超出段跨度 > 1 ⇒ 不采用",
+          _dim_proof(seg, [(10.0, (30.0, 25.0), (30.0, 35.0))], fr) is None)
+    segv = _Cand("v", 30.0, 5.0, 10.0, 20.0)
+    check("L1 沿 v 的段：垂直方向取 u（x）间距",
+          _dim_proof(segv, [(10.0, (25.0, 12.0), (35.0, 12.0))], fr) == 10.0)
+
+    # ---- L2 同轴链：无标注段沿用实测半宽 ----
+    got = _prove([_Cand("u", 30.0, 4.8, 10.0, 20.0),
+                  _Cand("u", 30.0, 3.0, 24.0, 40.0),
+                  _Cand("u", 36.0, 4.0, 24.0, 40.0)], good, fr)
+    check("L2 标注段用标注值当半径（4.8 → 5.0），同轴段记 coaxial",
+          len(got) == 2 and got[0].half == 5.0
+          and got[1].proof == "coaxial:dim:10"
+          and got[1].tier == Tier.PROJECTION and got[1].half == 3.0,
+          str([(c.half, c.proof) for c in got]))
+    check("L2 无标注且不同轴 ⇒ 不建（原则二），_prove 不返回",
+          all(c.center == 30.0 for c in got), str([c.center for c in got]))
+
+    # ---- L3 断口：同轴更宽 = 台阶；异轴横穿 = 打断 ----
+    step = [[(30.0, 5.0)], [(30.0, 12.0)], [(30.0, 5.0)]]
+    check("L3 同轴更宽的空腔是半径台阶，不算横穿（段在此终止）",
+          _gap_covered(step, 0, 2, 30.0, 5.0) is False)
+    cross = [[(30.0, 5.0)], [(31.0, 8.0)], [(30.0, 5.0)]]
+    check("L3 异轴空腔覆盖 ≥ 半段宽 ⇒ 断口不终止该段",
+          _gap_covered(cross, 0, 2, 30.0, 5.0) is True)
+    narrow = [[(30.0, 5.0)], [(34.0, 1.0)], [(30.0, 5.0)]]
+    check("L3 异轴但覆盖不足半段宽（擦边）⇒ 不算横穿",
+          _gap_covered(narrow, 0, 2, 30.0, 5.0) is False)
+
+    # ---- L4 壁面：至少一侧有材料，2/5 采样 ----
+    hole = _Cand("u", 0.0, 5.0, 0.0, 10.0)
+    check("L4 段外侧有材料 ⇒ 保留",
+          _wall_ok(fr, lambda p: abs(p.y) > 5.05, hole) is True)
+    check("L4 只有一侧有材料也保留（孔常通到零件外表面）",
+          _wall_ok(fr, lambda p: p.y > 5.05, hole) is True)
+    check("L4 两侧 6mm 内都搜不到材料 ⇒ 零件外的空气带、丢弃",
+          _wall_ok(fr, lambda p: False, hole) is False)
+    check("L4 5 点只有段两端 2 点搜到材料 ⇒ 仍保留（WALL_FRAC=2/5，"
+          "4/5 会丢掉被横孔穿通的 Ø40 段）",
+          _wall_ok(fr, lambda p: abs(p.y) > 5.05
+                   and (p.x < 2.5 or p.x > 7.5), hole) is True)
+
+    # ---- L5 扫掠：恒定空腔段 ----
+    us = [float(i) for i in range(11)]
+    vs = [float(i) for i in range(11)]
+    mat = [[not (3 <= j <= 7) for j in range(11)] for i in range(11)]
+    cs = _candidates(us, vs, mat)
+    real = next(c for c in cs if c.axis == "u")
+    check("L5 沿 u 的空腔带 ⇒ 段 axis=u、center/half 与跨度正确",
+          real.center == 5.0 and real.half == 2.0
+          and real.lo == 0.0 and real.hi == 10.0, str(real))
+    wide = next((c for c in cs if c.axis == "v"), None)
+    check("L5 异轴伪段照样产出、由 MAX_HALF_FRAC 在上层挡掉（不在扫掠里猜）",
+          wide is not None and wide.half == 5.0
+          and wide.half > 0.35 * (us[-1] - us[0]), str(wide))
+
+    # ---- L6 取代：剖面压过投影猜测，但孔标注不动 ----
+    def feat(fid: int, ftype: FeatureType, meth: str, z0: float = 0.0) -> Feature:
+        ax = Axis3(Point3(0.0, 0.0, z0), Vector3(0.0, 1.0, 0.0))
+        return Feature(id=FeatureId(fid),
+                       type=Claim(ftype, meth, Tier.PROJECTION, ("h1",)),
+                       axis=Claim(ax, meth, Tier.PROJECTION, ("h1",)))
+
+    part = SimpleNamespace(features=[
+        feat(1, FeatureType.HOLE, "outline:V1"),
+        feat(2, FeatureType.HOLE, "annotation:hole_callout"),
+        feat(3, FeatureType.BOSS, "outline:V2"),
+        feat(4, FeatureType.HOLE, "outline:V1", 50.0),
+    ])
+    rep = SimpleNamespace(notes=[])
+    new = feat(90, FeatureType.HOLE, "section:material_profile+dim")
+    n = replace_coaxial(part, [new], rep)
+    check("L6 同轴旧 HOLE 被摘掉，孔标注/BOSS/异轴 HOLE 保留",
+          n == 1 and [f.id for f in part.features] == [2, 3, 4],
+          f"n={n} ids={[f.id for f in part.features]}")
+    check("L6 摘除记进 notes（可追溯）",
+          any("#1（outline:V1）" in s for s in rep.notes), str(rep.notes))
+    check("L6 无新段时不动特征树", replace_coaxial(part, [], rep) == 0)
+
+    # ---- L7 剖切面位置：唯一候选才采用 ----
+    def axis_line(h: str, x: float) -> Evidence:
+        return Evidence(handle=h, kind=Kind.EDGE, layer="0",
+                        geom=Line2(Point2(x, 0.0), Point2(x, 100.0)),
+                        role=Claim(Role.AXIS, "test", Tier.GUESS))
+
+    d = Drawing(path="test")
+    v0 = View(id="V0", type=Claim(ViewType.SECTION, "test", Tier.GUESS),
+              bbox=BBox2.of_points([Point2(0.0, 0.0), Point2(40.0, 100.0)]))
+    v1 = View(id="V1", type=Claim(ViewType.FRONT, "test", Tier.GUESS),
+              evidence=["a1"], bbox=BBox2.of_points([Point2(0.0, 0.0),
+                                                     Point2(200.0, 100.0)]))
+    d.views = [v0, v1]
+    corr = SimpleNamespace(frames={
+        "V1": ViewFrame(view_id="V1", view_type=ViewType.FRONT,
+                        u_axis="x", v_axis="z", p_axis="y")})
+    d.evidence = [axis_line("a1", 50.0)]
+    check("L7 剖切面法向=p_axis，位置从其它视图的点画线读（唯一候选）",
+          _cut_plane_pos(d, corr, v0, fr) == ("x", 50.0),
+          str(_cut_plane_pos(d, corr, v0, fr)))
+    d.evidence.append(axis_line("a2", 60.0))
+    v1.evidence.append("a2")
+    check("L7 两条不同位置的剖切线 ⇒ 整剖面放弃（不猜）",
+          _cut_plane_pos(d, corr, v0, fr) is None)
+    d.evidence = [axis_line("a1", 50.0), axis_line("a2", 50.04)]
+    check("L7 0.04mm 内的重复线去重后仍是唯一候选",
+          _cut_plane_pos(d, corr, v0, fr) == ("x", 50.0))
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -2797,6 +2949,7 @@ def main() -> int:
     test_pipeline()
     test_ring()
     test_section_semantics()
+    test_section_bore()
 
     print("\n" + "=" * 72)
     if _failed:

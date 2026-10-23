@@ -20,9 +20,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `src/gui` 与 `src/core/`（除 `sw_automation`）是 GUI 骨架，且三个环境均无 PyQt6，`python main.py` 起不来。
 - **改动后必跑**：`python -m src.rebuild.selftest`（477 项）→ `$PY run_rebuild_acceptance.py`（OCC 表 9 绿）
   → 涉 SW 发射再加 `--sw` 表；无基准靶子跑 `$PY yz_accept.py`。`$PY` 定义见下方命令区。
-- **当前主线**：P1-D 已收口（v0.6.44）；下一步是**特征角色裁决（槽 vs 凸台）+ 内部结构识别**
-  （吃掉剩余两个静默错误 D79307 +20.71% / IMU +8.63%）。优先级以 `docs/GENERALIZATION_20261017.md`
-  为准，不以 YZYX 的 HLR 分数为准。
+- **当前主线**：内部结构通道已落地（v0.6.45 剖视三刀 + v0.6.46 剖面材料通道——20180425
+  气缸前盖 A—A 读出 10 段阶梯孔/交叉孔，截面 IoU 0.657→0.878）；下一步是
+  **特征角色裁决（基体深度 / 端面凸台 / 槽 vs 凸台）**——20180425 剩余 394 格多料
+  有 87% 就是这个（基体按并集 bbox 33 拉满，剖切面处真实材料 31），加上剩余两个
+  静默错误 D79307 +20.71% / IMU +8.63% 属同类"尺寸对、内容错"。优先级以
+  `docs/GENERALIZATION_20261017.md` 为准，不以 YZYX 的 HLR 分数为准。
 - **验收判据**：体积吻合不算过——必须实际生成模型，并用视觉链（`_render_dxf.py` / `_make_viewer.py` /
   截面叠加）复核结构；图纸没携带的信息不可"修"（见"信息论局限"表）。
 
@@ -758,8 +761,13 @@ B-rep，体积偏仍是"尺寸对、内容错"。回归：OCC 表 9 绿逐位不
 评分逐位不变：TL 97/缺56多63、BL 160/缺150多116、TR 179/缺47多64）、
 selftest 472→**477**（J8 五条：合成跨缝弧的 ea≥sa 契约与跨度上限、
 D79307-剖面基体无伪弧 + 4 条 <0.1mm 微弧仍在）。
-**下一堵墙 = 特征角色裁决（槽 vs 凸台）+ 内部结构识别**（吃掉剩余两个
-静默错误；P1-D 已收口）。
+**内部结构识别的第一刀已落地（v0.6.45 剖视三刀 + v0.6.46 剖面材料通道
+`features/section_bore.py`）**：剖面 HATCH 空腔 → 恒定区间段 → 直径标注三点几何/
+同轴链证据 → HOLE；20180425 A—A 读出 10 段，截面 IoU 0.657→0.878、少料 56→2。
+**下一堵墙 = 特征角色裁决（基体深度 / 端面凸台 / 槽 vs 凸台）**——20180425 剩余
+394 格多料 87% 是基体按并集 bbox 33 拉满（剖切面处真实材料 31，69.83/102.83 是
+剖切面后方的端面凸起）；D79307 +20.71% / IMU +8.63% 两个静默错误同属"尺寸对、
+内容错"。
 ✅ 无基准三件套（`yz_accept.py`：27
 材料点 + 五视图 HLR 评分）建在 **v15a 零件系**上（探针点、`yz_hlr.SPLIT_X=−96.5`
 都是零件系常量），新框架模型在**图纸坐标系**——2026-10-13 **零件系变换已落地**
@@ -786,7 +794,7 @@ linetype 断裂/虚线/**细实线**、section 剖切种类/材料（v0.6.31 起
 （「c 向」标题 + 剖面线覆盖比 <0.9 ⇒ local）、细实线=被盖轮廓（Role.THIN，
 环提取只认 VISIBLE 自动排除）、DIMENSION「数值↔几何锚点」配对（tier=ANNOTATED），
 实测 YZYX C—C 定性 section/scope=local、52 条尺寸 45 锚上、20/3/120 逐位吻合）、
-`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **material** HATCH 材料判据工具箱 + **`recognizer.bind_axial_positions` 轴向起点收口**（v0.6.39 P1-A：span→axial_at / 通孔按基体材料端 / 盲孔无依据拦路 / 回转体轴向平移）+ **`_choose_extrude_dir` 基体拉伸视图选择**（v0.6.40 P1-B：最薄视图的环是纯矩形时改取非矩形度最大的视图）+ **`_outline_ring_profile` 弧旋向按映射行列式定号**（v0.6.44 P1-D：吸附顶点让微弧的弦叉积变噪声——0.013° 曾被翻成 359.987° 近整圆））、`verify/`（compare/coverage/
+`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **inner_profiles 内腔面 / openings 异形开口**（v0.6.45）+ **section_bore 剖面材料通道**（v0.6.46：剖面 HATCH 空腔 → 阶梯孔/交叉孔，标注三点几何 + 同轴链；`replace_coaxial` 取代投影猜测，`annotation:` 不动）+ **material** HATCH 材料判据工具箱 + **`recognizer.bind_axial_positions` 轴向起点收口**（v0.6.39 P1-A：span→axial_at / 通孔按基体材料端 / 盲孔无依据拦路 / 回转体轴向平移）+ **`_choose_extrude_dir` 基体拉伸视图选择**（v0.6.40 P1-B：最薄视图的环是纯矩形时改取非矩形度最大的视图）+ **`_outline_ring_profile` 弧旋向按映射行列式定号**（v0.6.44 P1-D：吸附顶点让微弧的弦叉积变噪声——0.013° 曾被翻成 359.987° 近整圆））、`verify/`（compare/coverage/
 gate/step_probe/box_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
 step=|sldprt=|sw=|force=)`；v0.6.41 起含**发射后自检** `extent_questions` /
