@@ -78,6 +78,32 @@ def pt_in_poly(poly: list[tuple[float, float]], p: Point2) -> bool:
     return cnt
 
 
+def hatch_lines(d: "Drawing", fr: "ViewFrame", view_bbox) -> list[Line2]:
+    """本视图 HATCH 边界里的**直线段**（已映射到 model 系）。
+
+    用途：栅格采样只能给出量化后的面位（GRID=0.3 ⇒ ±0.3 的错位），而端面
+    台阶的精确高度就在 HATCH 边界线上。消费方按「线段方向垂直于某轴」取该
+    轴的精确坐标（如 y=69.83 / 70.83），把采样值吸附回图纸真值。
+    """
+    from ..evidence.model import Role
+    out: list[Line2] = []
+    for ev in d.evidence:
+        if ev.role.value is not Role.HATCH_BOUNDARY:
+            continue
+        g = ev.geom
+        if not isinstance(g, Line2):
+            continue
+        xs = [g.start.x, g.end.x]
+        ys = [g.start.y, g.end.y]
+        if (max(xs) < view_bbox.xmin or min(xs) > view_bbox.xmax
+                or max(ys) < view_bbox.ymin or min(ys) > view_bbox.ymax):
+            continue
+        out.append(Line2(
+            Point2(fr.u_to_model(g.start.x), fr.v_to_model(g.start.y)),
+            Point2(fr.u_to_model(g.end.x), fr.v_to_model(g.end.y))))
+    return out
+
+
 def material_map(d: "Drawing", fr: "ViewFrame", view_bbox):
     """本视图 HATCH 填充的材料判据（点取 model 系的 Point2 → bool）。
 

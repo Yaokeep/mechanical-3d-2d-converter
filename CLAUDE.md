@@ -2,11 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-<!-- 最后同步：2026-10-18 事实复核（正文已含 v0.6.26~v0.6.44 内容；tag 仍 v0.6.25，
-     HEAD 落后 tag 的提交数见"版本号同步"节、流水见 CHANGELOG「发版簿记」）。本轮复核：selftest 实测
-     477 项、ruff 基线实测 158 告警、根目录 `_*.py` 计数 550→567（`_*.log` 仍 22）、
-     CHANGELOG 覆盖范围已到 v0.6.44、环境表/PyQt6 缺失/tests 空/CAD 24+27 个 .bas
-     逐项实测无误。OCC 验收表 v0.6.44 已重跑（9 绿逐位不变，PF60K 261,943.9） -->
+<!-- 最后同步：2026-10-26 事实复核（正文已含 v0.6.26~v0.6.48 内容；tag 仍 v0.6.25，
+     HEAD 落后 tag 的提交数见"版本号同步"节、流水见 CHANGELOG「发版簿记」）。本轮复核：
+     selftest 实测 534 项、OCC 验收表 9 绿逐位不变（bracket 三视图 191,978.6 /
+     剖面图 192,198.9 / PF60K 261,940.5）、YZYX 8,544,416.18、盲测 D79307/IMU 命中；
+     CHANGELOG 覆盖范围已到 v0.6.48。其余事实复核项（ruff 158 告警、根目录 `_*.py`
+     567、环境表/PyQt6 缺失/tests 空/CAD 24+27 个 .bas）沿用 2026-10-18 实测。 -->
 
 ## 项目概述
 
@@ -18,15 +19,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `src/core/reconstruction/` 已判定过时，**不要填它的 TODO**。
 - **生产可用 = 根目录独立脚本**（`dxf_to_3d_general.py` / `dxf_to_sw_features.py` / `model_to_drawing.py` 等）。
   `src/gui` 与 `src/core/`（除 `sw_automation`）是 GUI 骨架，且三个环境均无 PyQt6，`python main.py` 起不来。
-- **改动后必跑**：`python -m src.rebuild.selftest`（523 项）→ `$PY run_rebuild_acceptance.py`（OCC 表 9 绿）
+- **改动后必跑**：`python -m src.rebuild.selftest`（534 项）→ `$PY run_rebuild_acceptance.py`（OCC 表 9 绿）
   → 涉 SW 发射再加 `--sw` 表；无基准靶子跑 `$PY yz_accept.py`。`$PY` 定义见下方命令区。
 - **当前主线**：内部结构通道已落地（v0.6.45 剖视三刀 + v0.6.46 剖面材料通道——20180425
-  气缸前盖 A—A 读出 10 段阶梯孔/交叉孔，截面 IoU 0.657→0.878）；v0.6.47 补上
-  **孔口切穿**（`_open_ends`，此前孔全被端面薄膜封死）与**锥孔**（`_taper_of`
-  + MakeCone，顶部锥孔 Ø11.6→Ø12.5），IoU → 0.9237；下一步是
-  **特征角色裁决（基体深度 / 端面凸台 / 槽 vs 凸台）**——20180425 剩余 394 格多料
-  有 87% 就是这个（基体按并集 bbox 33 拉满，剖切面处真实材料 31），加上剩余两个
-  静默错误 D79307 +20.71% / IMU +8.63% 属同类"尺寸对、内容错"。优先级以
+  气缸前盖 A—A 读出 10 段阶梯孔/交叉孔）；v0.6.47 补上**孔口切穿**（`_open_ends`）
+  与**锥孔**（`_taper_of` + MakeCone）；v0.6.48 **端面台阶裁决**（`features/face_steps.py`：
+  基体深度由剖面材料定 33→32、Ø70×1 沉台 / Ø75×1 凸台），A—A 多料 521→221（99×172）、
+  IoU **0.9694**；同刀修掉一类发射器**静默错误**——近共面 Fuse 静默丢整块材料
+  （`_fuse` 体积护栏 + fuzzy 复算）。下一步：20180425 残余多料里**无圆边界作证**的
+  端面凹面（图纸底部左侧 1mm 深），以及特征角色剩余项（槽 vs 凸台）。优先级以
   `docs/GENERALIZATION_20261017.md` 为准，不以 YZYX 的 HLR 分数为准。
 - **验收判据**：体积吻合不算过——必须实际生成模型，并用视觉链（`_render_dxf.py` / `_make_viewer.py` /
   截面叠加）复核结构；图纸没携带的信息不可"修"（见"信息论局限"表）。
@@ -83,9 +84,11 @@ PYTHONIOENCODING=utf-8 python run_rebuild_acceptance.py --sw [靶子...] # SW �
 # 通用性盲测表（P0 **诊断仪**，不判红绿）：held-out 件 → 特征树 → STEP，
 # 回答"框架是否只会做已参与开发的靶子"。2026-10-17 首跑 7 用例 **0 命中**、
 # 4 个 gate 放行的**静默错误**；P1-A/B/C 后静默错误剩 2（D79307 +20.71% /
-# IMU +8.63%，均为"尺寸对、内容错"）。P1-C 起 gate 包含**发射后自检**
-# （模型 bbox vs 图纸视图跨度，INCONSISTENT_EXTENT），第 1 遍真的发射一次。
-# 结论与逐靶子根因见 docs/GENERALIZATION_20261017.md
+# IMU +8.63%）。**2026-10-26 v0.6.48 复核：3/7 命中**（D79307 −0.01% / IMU
+# +0.45% / IMU-剖面 +0.45%），4 个 blocked（D79307-剖面、轴测量两版、spoon）。
+# P1-C 起 gate 包含
+# **发射后自检**（模型 bbox vs 图纸视图跨度，INCONSISTENT_EXTENT），第 1 遍
+# 真的发射一次。结论与逐靶子根因见 docs/GENERALIZATION_20261017.md
 PYTHONIOENCODING=utf-8 $PY run_generalization_benchmark.py [--sections] [靶子...]
 
 # YZYX 齿箱上盖无基准定量验收三件套（27 点材料探针 + 五视图 HLR 投影评分，
@@ -360,7 +363,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 99.5%+ 时局部可见缺陷仍零命中（bracket 三缺陷、YZYX 五处标记全靠目视）——
 历史缺陷已转成自动断言，**每次修复的例行检查序列**：
 
-1. `python -m src.rebuild.selftest` — 523 项
+1. `python -m src.rebuild.selftest` — 534 项
 2. `PYTHONIOENCODING=utf-8 $PY run_rebuild_acceptance.py` — 9 绿 + 体积/bbox
    阈值判红（0.5%/1mm，仅 expect=="ok"）+ bracket 缺陷盒·点断言（PROBES 表：
    三缺陷盒 + 凸台右弧两盒 + 3 点分类；gold/shift 2026-10-11 定标实测，
@@ -399,17 +402,20 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.25（git tag 为准；**正文内容已写到 v0.6.44 但未收口**——tag 落后的
+版本 v0.6.25（git tag 为准；**正文内容已写到 v0.6.48 但未收口**——tag 落后的
 提交数以 `git rev-list --count v0.6.25..HEAD` 为准，见"版本号同步"节）。
 版本字面量共 9 处（`src/app.py:15` / `src/gui/main_window.py:28` / 同文件 `:535` /
 `dxf_to_3d_general.py:2,9789` / `dxf_to_sw_features.py:2,965,1032` / `README.md:89`），
 均仍为 0.6.25。
-**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.44）——
+**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.48）——
 本节只留仍在影响决策的部分。
 
-**通用性现状（P0，2026-10-17）**：held-out 盲测 7 用例 **0/7 命中**——4 个被
+**通用性现状（P0，2026-10-17 首跑）**：held-out 盲测 7 用例 **0/7 命中**——4 个被
 gate 拒绝（其中 D79307-剖面叠加发射器 B-rep 失败）、3 个是 `gate=pass` 但
 体积大偏的**静默错误**（IMU +10.05%、轴测量 +166.96%、轴测量-剖面 +29.54%）。
+**2026-10-26 复核（v0.6.48）**：**3/7 命中**（D79307 −0.01%、IMU +0.45%、
+IMU-剖面 +0.45%，`bbox 差 0.00`），4 个 blocked（D79307-剖面 = R4.1/R4 歧义
+拦路 + pocket #2 布尔失败；轴测量两版；spoon）；下段是首跑根因记录，保留作历史。
 视图分离抽检无误；根因集中在**轴向位置绑定缺失**（`axial_at` 7/7 缺省按 0 起）、
 **基体轮廓选错视图/环提取失败**（轴测量取俯视图 V0 当基体、D79307
 `no_ring_found`、spoon 覆盖率 0.27×0.50）、**gate 不识别"读错视图"**。
@@ -763,13 +769,19 @@ B-rep，体积偏仍是"尺寸对、内容错"。回归：OCC 表 9 绿逐位不
 评分逐位不变：TL 97/缺56多63、BL 160/缺150多116、TR 179/缺47多64）、
 selftest 472→**477**（J8 五条：合成跨缝弧的 ea≥sa 契约与跨度上限、
 D79307-剖面基体无伪弧 + 4 条 <0.1mm 微弧仍在）。
-**内部结构识别的第一刀已落地（v0.6.45 剖视三刀 + v0.6.46 剖面材料通道
-`features/section_bore.py`）**：剖面 HATCH 空腔 → 恒定区间段 → 直径标注三点几何/
-同轴链证据 → HOLE；20180425 A—A 读出 10 段，截面 IoU 0.657→0.878、少料 56→2。
-**下一堵墙 = 特征角色裁决（基体深度 / 端面凸台 / 槽 vs 凸台）**——20180425 剩余
-394 格多料 87% 是基体按并集 bbox 33 拉满（剖切面处真实材料 31，69.83/102.83 是
-剖切面后方的端面凸起）；D79307 +20.71% / IMU +8.63% 两个静默错误同属"尺寸对、
-内容错"。
+**内部结构识别（v0.6.45~v0.6.48）**：v0.6.45 剖视三刀 + v0.6.46 剖面材料通道
+`features/section_bore.py`（剖面 HATCH 空腔 → 恒定区间段 → 直径标注三点几何/
+同轴链证据 → HOLE，20180425 A—A 读出 10 段）；v0.6.47 孔口切穿 `_open_ends` +
+锥孔 `_taper_of`；**v0.6.48 端面台阶裁决 `features/face_steps.py`**（基体深度由
+剖面材料定 33→32、Ø70×1 沉台 / Ø75×1 凸台），A—A 多料 521→221（99×172）、
+IoU 0.9323→**0.9694**，体积 419,736.59→407,323.90。同刀修掉发射器**近共面 Fuse
+静默丢整块材料**（`_fuse` 体积护栏 + fuzzy 1e-6/1e-5 复算）。
+**下一堵墙 = 无圆边界作证的端面结构**——20180425 残余 221 格多料里约一半是
+图纸底部左侧 y≈70..71 的 1mm 凹面（剖面材料有、无半径候选 ⇒ 按 §3 原则二不建），
+其余是孔口边界量化与角部小数格；特征角色剩余项"槽 vs 凸台"未动。
+D79307 / IMU 两个静默错误已在 HEAD 转命中（盲测现为 **3/7 命中**：D79307 −0.01% /
+IMU +0.45% / IMU-剖面 +0.45%），剩余 4 个 blocked = D79307-剖面（R4.1 歧义 +
+pocket #2 布尔失败）、轴测量两版、spoon。
 ✅ 无基准三件套（`yz_accept.py`：27
 材料点 + 五视图 HLR 评分）建在 **v15a 零件系**上（探针点、`yz_hlr.SPLIT_X=−96.5`
 都是零件系常量），新框架模型在**图纸坐标系**——2026-10-13 **零件系变换已落地**
@@ -796,8 +808,9 @@ linetype 断裂/虚线/**细实线**、section 剖切种类/材料（v0.6.31 起
 （「c 向」标题 + 剖面线覆盖比 <0.9 ⇒ local）、细实线=被盖轮廓（Role.THIN，
 环提取只认 VISIBLE 自动排除）、DIMENSION「数值↔几何锚点」配对（tier=ANNOTATED），
 实测 YZYX C—C 定性 section/scope=local、52 条尺寸 45 锚上、20/3/120 逐位吻合）、
-`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **inner_profiles 内腔面 / openings 异形开口**（v0.6.45）+ **section_bore 剖面材料通道**（v0.6.46：剖面 HATCH 空腔 → 阶梯孔/交叉孔，标注三点几何 + 同轴链；`replace_coaxial` 取代投影猜测，`annotation:` 不动）+ **material** HATCH 材料判据工具箱 + **`recognizer.bind_axial_positions` 轴向起点收口**（v0.6.39 P1-A：span→axial_at / 通孔按基体材料端 / 盲孔无依据拦路 / 回转体轴向平移）+ **`_choose_extrude_dir` 基体拉伸视图选择**（v0.6.40 P1-B：最薄视图的环是纯矩形时改取非矩形度最大的视图）+ **`_outline_ring_profile` 弧旋向按映射行列式定号**（v0.6.44 P1-D：吸附顶点让微弧的弦叉积变噪声——0.013° 曾被翻成 359.987° 近整圆））、`verify/`（compare/coverage/
-gate/step_probe/box_probe）、`emit/`（occ_builder + sw_builder）、`report.py`、`inspect.py`、
+`features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **inner_profiles 内腔面 / openings 异形开口**（v0.6.45）+ **section_bore 剖面材料通道**（v0.6.46：剖面 HATCH 空腔 → 阶梯孔/交叉孔，标注三点几何 + 同轴链；`replace_coaxial` 取代投影猜测，`annotation:` 不动）+ **face_steps 端面台阶裁决**（v0.6.48：圆边界内外对账 + HATCH 精确层位吸附；基体深度改到主面、正跃变=沉台 HOLE、负跃变=凸台 BOSS；高度分解已降高的基体按设计跳过）+ **material** HATCH 材料判据工具箱（v0.6.48 起含 `hatch_lines` 精确层位） + **`recognizer.bind_axial_positions` 轴向起点收口**（v0.6.39 P1-A：span→axial_at / 通孔按基体材料端 / 盲孔无依据拦路 / 回转体轴向平移）+ **`_choose_extrude_dir` 基体拉伸视图选择**（v0.6.40 P1-B：最薄视图的环是纯矩形时改取非矩形度最大的视图）+ **`_outline_ring_profile` 弧旋向按映射行列式定号**（v0.6.44 P1-D：吸附顶点让微弧的弦叉积变噪声——0.013° 曾被翻成 359.987° 近整圆））、`verify/`（compare/coverage/
+gate/step_probe/box_probe）、`emit/`（occ_builder〔v0.6.48 起 `_fuse` 带**体积护栏**：
+近共面 Fuse 静默丢材料 ⇒ fuzzy 1e-6/1e-5 复算，仍败抛 `OccBuildError`〕 + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
 step=|sldprt=|sw=|force=)`；v0.6.41 起含**发射后自检** `extent_questions` /
 `_extent_selfcheck`——模型 bbox 尺寸 vs 图纸跨度并集，超回转体包络即
@@ -806,13 +819,13 @@ step=|sldprt=|sw=|force=)`；v0.6.41 起含**发射后自检** `extent_questions
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 523 项自检（2026-10-23 v0.6.47 后实测），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 534 项自检（2026-10-26 v0.6.48 后实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
 ```
 阶段 4 实测（2026-09-28）→ 阶段 5 表（2026-10-07）→ 阶段 6 表（2026-10-09）→
-**当前表（v0.6.25 全量定标、9 靶子两表全绿；v0.6.26~v0.6.44 各版记录 OCC 表
+**当前表（v0.6.25 全量定标、9 靶子两表全绿；v0.6.26~v0.6.48 各版记录 OCC 表
 逐位不变；2026-10-11 验证制度化起 OCC 表加体积/bbox 阈值判红 0.5%/1mm +
 bracket 缺陷盒·点断言）**：
 6 个简单靶子**全部体积逐位吻合**（block_3view / plate_100x60 / flange_d80 /
@@ -840,8 +853,9 @@ revolve 证据覆盖裁决；9 绿逐位不变，自检 336 项）。
 `run_rebuild_acceptance.py` 顶部注释。反向同样成立：阶段 7 把 SW 的 top_round
 圆角推迟发射后体积 +0.48%→+0.54%（更远离金值），但圆角面从过延伸 578.59
 收敛到 453.14 ≈ OCC 453.10——**为结构忠实宁可数值倒退**。
-SW 表（最近一次全量复核 2026-10-12 v0.6.25）：**9 绿**（v0.6.26~v0.6.44 的
-识别侧改动未重跑 SW 表；`sw_builder` 未改按惯例跳过）。PF60K 转绿靠发射器三修——
+SW 表（最近一次全量复核 2026-10-12 v0.6.25）：**9 绿**（v0.6.26~v0.6.48 的
+识别侧改动未重跑 SW 表；`sw_builder` 未改按惯例跳过；v0.6.48 只动
+`occ_builder`）。PF60K 转绿靠发射器三修——
 `emit/sw_builder.py` 的「切除类草图一律 `SetAddToDB` 关推理捕捉」（#9 键槽
 角点被吸到 r8.5 圆，0.45mm 畸变致切除相切失败；吸附与否随视图缩放变）+
 「零宽缝环带剥缝 + 整圆改画原生圆实体」（#16 环带补偿切；自重合轮廓 SW
@@ -961,9 +975,9 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   惯例：内容按 `v0.6.x:` 前缀提交即可，**tag 只在发版收口时打**——发版 =
   bump 上述全部字符串 + tag 打在收口提交上（2026-10-02 曾"先提交、后收口"致
   tag 落后 HEAD 16 个提交，此后 v0.6.21~v0.6.25 各清一次账）。
-  **当前欠账（截至 13d109f / v0.6.41，2026-10-18 核对）**：tag 仍 `v0.6.25`，
-  HEAD 已含 v0.6.26~v0.6.42 内容，9 处字面量仍 0.6.25；**实时提交数以
-  `git rev-list --count v0.6.25..HEAD` 输出为准**（核实时为 22）。
+  **当前欠账（截至 v0.6.48，2026-10-26 核对）**：tag 仍 `v0.6.25`，
+  HEAD 已含 v0.6.26~v0.6.48 内容，9 处字面量仍 0.6.25；**实时提交数以
+  `git rev-list --count v0.6.25..HEAD` 输出为准**（v0.6.48 提交后为 30）。
   逐版本内容见 `docs/CHANGELOG.md` 各节；**收口流水账已移至该文件「发版簿记」节，
   本文件不再逐条记录**——此前逐日追加的写法是文档漂移的主要来源。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。

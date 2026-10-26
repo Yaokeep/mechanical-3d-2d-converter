@@ -204,7 +204,9 @@ def replace_coaxial(part, feats: list[Feature], rep) -> int:
     """摘掉与剖面段同轴的旧 HOLE —— 剖面材料压过投影猜测。
 
     只摘 ``type`` 为 HOLE 且方法**不是** ``annotation:`` 的（孔标注是图上
-    明写，比剖面更强）；BOSS 不动。返回摘掉的条数。
+    明写，比剖面更强）；BOSS 不动。``section:face_step_*`` 也豁免 —— 端面
+    沉台与中心孔同轴是常态（20180425 的 Ø70×1 沉台包着 Ø36 阶梯孔），
+    按共线摘掉会把"端面少 1mm"变成"整个中心钻穿"。返回摘掉的条数。
     """
     if not feats:
         return 0
@@ -213,6 +215,7 @@ def replace_coaxial(part, feats: list[Feature], rep) -> int:
     for f in part.features:
         if (f.type.value == FeatureType.HOLE.value
                 and not f.type.method.startswith("annotation:")
+                and not f.type.method.startswith("section:face_step")
                 and any(_collinear(f, nf) for nf in feats)):
             gone.append(f)
         else:
@@ -457,21 +460,23 @@ def _wall_ok(fr, mm, c: _Cand) -> bool:
 # 圆柱性证据
 # ---------------------------------------------------------------------------
 
-def _dims_geom(d, conv, view, fr) -> list[tuple[float, tuple[float, float],
-                                                tuple[float, float]]]:
-    """该视图的尺寸：``(值, 点1, 点2)``，点已换到模型系。
+def dims_geom(d, conv, view, fr) -> list[tuple[float, tuple[float, float],
+                                              tuple[float, float], str]]:
+    """该视图的尺寸：``(值, 点1, 点2, 尺寸实体 handle)``，点已换到模型系。
 
     点之所以要留着，是因为**光看数值会把半径标注当成直径**：A—A 的 15 条
     全是 linear（图上 Ø 以线性距离量出），其中「32」是顶上通道的深度、
     「15」是螺纹深、「17」是某条宽度 —— 只按数值配对会让"Ø32 的孔"
     （实测半宽 16.20 的伪段）凭空冒出来。几何关系（两点在**垂直于段轴**
     方向的间距 = 值、且中点落在段轴上）才是"这是一个直径"的证据。
+
+    handle 给下游当特征证据（``face_steps`` 的端面圆盘/直径对账）。
     """
     if conv is None:
         return []
     from ..conventions.registry import ConvKind
     raw = {x.handle: x for x in d.dimensions}
-    out: list[tuple[float, tuple[float, float], tuple[float, float]]] = []
+    out: list[tuple[float, tuple[float, float], tuple[float, float], str]] = []
     for c in conv.of_kind(ConvKind.DIMENSION):
         if c.view != view.id:
             continue
@@ -483,8 +488,15 @@ def _dims_geom(d, conv, view, fr) -> list[tuple[float, tuple[float, float],
             continue
         out.append((float(dc.value),
                     (fr.u_to_model(r.p1.x), fr.v_to_model(r.p1.y)),
-                    (fr.u_to_model(r.p2.x), fr.v_to_model(r.p2.y))))
+                    (fr.u_to_model(r.p2.x), fr.v_to_model(r.p2.y)),
+                    dc.dim_ref))
     return out
+
+
+def _dims_geom(d, conv, view, fr) -> list[tuple[float, tuple[float, float],
+                                                tuple[float, float]]]:
+    """``dims_geom`` 去掉 handle（``_prove`` 只要几何）。"""
+    return [(v, p1, p2) for v, p1, p2, _h in dims_geom(d, conv, view, fr)]
 
 
 def _dim_proof(c: _Cand, dims, fr) -> float | None:

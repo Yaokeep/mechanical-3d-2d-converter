@@ -2115,6 +2115,25 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
     draws_hidden = any(e.role.value == Role.HIDDEN for e in d.evidence)
     no_feature: list[CylinderHint] = []
     mats = _section_materials(d, corr)
+    # 端面台阶裁决：剖面线给出端面沿拉伸轴的位置**随另一轴的变化** ——
+    # 主面 / 端面凸台 / 沉台是材料读数，不是猜测。基体长度取自视图跨度并集
+    # （只保证包住零件），凸台与沉台都被拉满在里面：20180425 气缸前盖
+    # 33 → 32，右端 Ø75×1 凸台、左端 Ø70×1 沉台（A—A 截面剩余多料的 87%）。
+    # 必须在 cylinder_features 之前：被剖面说死的圆边（r35 是沉台的边，
+    # 不是凸台）要并入 skip —— 同一张圆边不能两种解释都建。
+    from .face_steps import face_steps
+    step_feats, step_used = face_steps(d, corr, part, rep, mats, conv=conv)
+    for f in step_feats:
+        f.id = FeatureId(next_id)
+        part.add(f)
+        next_id += 1
+    if step_used:
+        prev_step = skip
+        used_ids = {id(h) for h in step_used}
+
+        def skip(hint: CylinderHint) -> bool:
+            return ((prev_step is not None and prev_step(hint))
+                    or id(hint) in used_ids)
     for f in cylinder_features(corr, rep, next_id=next_id, skip=skip,
                                no_feature=no_feature,
                                draws_hidden=draws_hidden, bindings=binds,

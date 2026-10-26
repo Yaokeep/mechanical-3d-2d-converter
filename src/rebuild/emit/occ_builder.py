@@ -669,8 +669,49 @@ def _boolean(op: Any, f: Feature, what: str, validate: bool) -> Any:
     return shape
 
 
+#: 近共面 Fuse 的复算容差（依次尝试）。图纸坐标存 6 位小数，同一张面被两个
+#: 读数分别量到时只差 ~1e-6mm —— 比 OCC 默认容差（1e-7）大、比图纸精度
+#: （0.01mm）小三个数量级，正是"同一张面"而不是两个结构。
+FUSE_FUZZY = (1e-6, 1e-5)
+
+
 def _fuse(shape: Any, tool: Any, f: Feature, validate: bool) -> Any:
-    return _boolean(BRepAlgoAPI_Fuse(shape, tool), f, "Fuse（加材料）", validate)
+    """加材料 = Fuse，并核对**体积没有变小**。
+
+    ⚠️ OCC 的精确布尔在近共面/相切时会**静默丢材料**（`IsDone()`=True、
+    `BRepCheck` 也判有效，只是结果少一块）：实测 20180425 的基体
+    （透镜轮廓 155×115×32，512,553mm³）与同深的 Ø115×32 凸台（完全含在
+    基体内，332,380mm³）Fuse，默认精度返回**只剩凸台**（体积、bbox 都是
+    凸台的）——整块基体蒸发，模型体积 512,553 → 336,798。两者的端面差
+    1e-6mm：基体端面来自 HATCH 精确层位（6 位小数），凸台的 `axial_at`
+    来自轮廓对 span（`(lo+hi)/2`，多带了小数），物理上是同一张面。
+    加 fuzzy 到 1e-6 即正确复算（1e-5 更稳），故按体积判据自动重试，
+    两次都失败才报错——**不留"图纸说没有这块材料"的模型**（同
+    `pipeline._extent_selfcheck` 的原则）。
+    """
+    out = _boolean(BRepAlgoAPI_Fuse(shape, tool), f, "Fuse（加材料）", validate)
+    v_need = max(volume_of(shape), volume_of(tool))
+    tol = max(1e-6, 1e-9 * v_need)
+    if volume_of(out) >= v_need - tol:
+        return out
+    v_bad = volume_of(out)
+    for fz in FUSE_FUZZY:
+        op = BRepAlgoAPI_Fuse(shape, tool)
+        op.SetFuzzyValue(fz)
+        op.Build()
+        try:
+            cand = _boolean(op, f, f"Fuse（加材料，fuzzy={fz:g}）", validate)
+        except OccBuildError:
+            continue
+        if volume_of(cand) >= v_need - tol:
+            print(f"[emit] 特征 #{f.id}（{f.type.value}）近共面 Fuse：默认精度"
+                  f"静默丢材料（{v_bad:.1f} < {v_need:.1f}mm³）⇒ "
+                  f"fuzzy={fz:g} 复算通过（{volume_of(cand):.1f}）")
+            return cand
+    raise OccBuildError(
+        f"特征 #{f.id}（{f.type.value}）Fuse 静默丢材料：结果 {v_bad:.1f}mm³ < "
+        f"操作数 {v_need:.1f}mm³（近共面/相切面），fuzzy "
+        f"{'/'.join(f'{v:g}' for v in FUSE_FUZZY)} 均未修复")
 
 
 def _cut(shape: Any, tool: Any, f: Feature, validate: bool) -> Any:

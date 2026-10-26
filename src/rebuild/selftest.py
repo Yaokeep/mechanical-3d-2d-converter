@@ -2978,6 +2978,110 @@ def test_section_bore() -> None:
           is None)
 
 
+# ============ M. 端面台阶裁决（face_steps） ============
+
+def test_face_steps() -> None:
+    """剖面材料 ⇒ 基体深度 / 端面凸台 / 沉台（v0.6.48，20180425 气缸前盖）。
+
+    钉住三件事：
+    ① 台阶只认**落在圆边界上**的层位跃变 —— 小孔窗里扫到大圆的台阶时，
+       跃变位置离孔半径 0.5mm，该孔不作证（否则 r3.5 孔会顶替 r35 沉台，
+       r35 圆边被同时建成"凸台"和"沉台"）；
+    ② 采样层位必须吸附到 HATCH 精确层位（栅格 GRID=0.3 只给量化值，
+       端面台阶只有 1mm 高，量化误差会吃掉一半）；
+    ③ 方向约定：正 = 沉台（凹入主面）、负 = 凸台（凸出主面）；lo 侧
+       朝 +dir 是"朝材料内"（凸台朝外即 −dir），hi 侧反之。
+    """
+    section("M. 端面台阶（圆边界跃变 / 层位吸附 / 沉台凸台方向）")
+    from types import SimpleNamespace
+
+    from src.rebuild.features.face_steps import (_Sample, _Witness, _apply,
+                                                 _snap, _transition)
+
+    levels = [69.83, 70.83]
+
+    def rows_at(c: float, r_step: float, inner: float, outer: float,
+                one_side: bool = False) -> list:
+        """t 0..90 逐 0.3 的材料外包行；|t−c| ≤ r_step 的层位是 inner。
+
+        ``one_side=True`` 只在 t > c 一侧放台阶（模拟台阶只在一侧可见）。
+        """
+        out = []
+        for k in range(301):
+            t = k * 0.3
+            inside = abs(t - c) <= r_step
+            if one_side and t < c:
+                inside = False
+            v = inner if inside else outer
+            out.append(_Sample(t, v, v + 100.0))
+        return out
+
+    # ---- M1 圆边界上的跃变 = 台阶；反向扫描一致才算读到 ----
+    rows = rows_at(45.0, 35.0, 70.83, 69.83)
+    got = _transition(rows, "lo", 45.0, 35.0, +1.0, levels)
+    check("M1 lo 侧圆内层位 70.83、圆外 69.83 ⇒ 读到沉台（内 − 外 = +1）",
+          got == (70.83, 69.83), str(got))
+    one = rows_at(45.0, 35.0, 70.83, 69.83, one_side=True)
+    check("M1 台阶只出现在一侧 ⇒ 反向扫描读不到（两个方向须一致，"
+          "单侧读数不作证）",
+          _transition(one, "lo", 45.0, 35.0, -1.0, levels) is None)
+
+    # ---- M2 跃变位置必须落在候选圆边界上 ----
+    small = rows_at(45.0, 3.0, 70.83, 69.83)      # 台阶在 |t−c|=3.0
+    check("M2 r3.5 候选：窗里的台阶在 3.0（差 0.5 > TRANS_TOL）⇒ 不作证"
+          "（防小孔顶替大圆台阶）",
+          _transition(small, "lo", 45.0, 3.5, +1.0, levels) is None)
+    check("M2 r3.0 候选：跃变正落在自己边界上 ⇒ 作证",
+          _transition(small, "lo", 45.0, 3.0, +1.0, levels) == (70.83, 69.83))
+
+    # ---- M3 采样层位吸附到 HATCH 精确层位 ----
+    check("M3 量化值 70.6 吸附到精确层位 70.83（差 0.23 ≤ SNAP_TOL）",
+          _snap(70.6, levels) == 70.83, str(_snap(70.6, levels)))
+    check("M3 差 0.63mm ⇒ 吸附不到、该侧放弃（不猜层位）",
+          _snap(69.2, levels) is None, str(_snap(69.2, levels)))
+
+    # ---- M4 沉台/凸台的方向约定 ----
+    def fresh_base():
+        return Feature(
+            id=FeatureId(0),
+            type=Claim(FeatureType.BASE, "test", Tier.PROJECTION, ("h1",)),
+            params={"dir": Claim("y", "test", Tier.PROJECTION, ("h1",)),
+                    "origin": Claim(Point3(0.0, 69.83, 0.0), "test",
+                                    Tier.PROJECTION, ("h1",)),
+                    "length": Claim(33.0, "test", Tier.PROJECTION, ("h1",))})
+
+    def witness(side: str, step: float) -> "_Witness":
+        return _Witness(side=side, center_t=100.0, radius=35.0,
+                        main=69.83 if side == "lo" else 101.83, step=step,
+                        proof="test", evidence=("h1",),
+                        axis_origin=Point3(0.0, 0.0, 100.0))
+
+    for side, step, want_type, want_dir in (
+            ("lo", +1.0, "hole", +1.0),   # 沉台：自 lo 面朝材料内（+y）
+            ("hi", +1.0, "hole", -1.0),   # 沉台：自 hi 面朝材料内（−y）
+            ("lo", -1.0, "boss", -1.0),   # 凸台：自 lo 面朝外（−y）
+            ("hi", -1.0, "boss", +1.0)):  # 凸台：自 hi 面朝外（+y）
+        b = fresh_base()
+        out, _used = _apply([witness(side, step)], (69.83, 101.83), b,
+                            69.83, 102.83, "y", SimpleNamespace(notes=[]))
+        f = out[0] if out else None
+        check(f"M4 {side} 侧{'沉台' if step > 0 else '凸台'} ⇒ "
+              f"{want_type} 沿 {want_dir:+g}y 开料",
+              f is not None and f.type.value == want_type
+              and abs(f.axis.value.direction.y - want_dir) < 1e-9,
+              "" if f is None else f"{f.type.value} dir={f.axis.value.direction}")
+
+    # ---- M5 基体两端改到主面 ----
+    b = fresh_base()
+    _apply([witness("lo", +1.0)], (69.83, 101.83), b, 69.83, 102.83, "y",
+           SimpleNamespace(notes=[]))
+    check("M5 基体长度由并集 bbox 33 改为剖面主面跨度 32（origin/length 同步）",
+          abs(b.params["length"].value - 32.0) < 1e-9
+          and abs(b.params["origin"].value.y - 69.83) < 1e-9
+          and abs(b.placement.value.y - 69.83) < 1e-9,
+          f"len={b.params['length'].value} o={b.params['origin'].value}")
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -2996,6 +3100,7 @@ def main() -> int:
     test_ring()
     test_section_semantics()
     test_section_bore()
+    test_face_steps()
 
     print("\n" + "=" * 72)
     if _failed:
