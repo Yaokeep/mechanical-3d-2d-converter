@@ -3082,6 +3082,104 @@ def test_face_steps() -> None:
           f"len={b.params['length'].value} o={b.params['origin'].value}")
 
 
+# ============ N. 展开剖孔深（bind_section_depths） ============
+
+def test_section_depth() -> None:
+    """无定位剖面的孔深绑定（v0.6.49，20180425 六孔「Ø14 深 9 + Ø9 通」）。
+
+    展开剖（沿弯折剖切线展开的 B—B/C—C）水平轴是展开长度、不是模型轴 ⇒
+    `section_bores` 整条跳过，孔被投影读成通孔（Ø14 钻穿零件，肉眼一眼可见）。
+    钉住四件事：
+    ① 基体跨度要含**同轴凸台**（32 → 33）—— 孔深跟它比才判得出通/盲；
+    ② 方向（v 与模型轴同向/反向）由「段近端到孔口面」的距离投票，同向胜出
+       后**逐段**算「孔口面 → 该段远端」：Ø14 段 9 ⇒ 盲孔，Ø9 段 33 ⇒ 通孔
+       （不是 23！阶梯孔的第二段要量到孔口面，不是量自己那段）；
+    ③ 两种方向误差相近（对称件）⇒ 不绑（原则二）；
+    ④ 只改 `through=True` 的孔，别处已定的盲孔不覆盖。
+    """
+    section("N. 展开剖孔深（深度通道 / 方向投票 / 拒绝）")
+    from types import SimpleNamespace
+
+    from src.rebuild.features.section_bore import _Cand, _bind_axis, axial_extent
+
+    def axis_y():
+        return Claim(Axis3(Point3(0.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)),
+                     "t", Tier.PROJECTION, ("h0",))
+
+    def base_feature(length=32.0, y0=69.83):
+        return Feature(
+            id=FeatureId(0),
+            type=Claim(FeatureType.BASE, "t", Tier.PROJECTION, ("h0",)),
+            params={"dir": Claim("y", "t", Tier.PROJECTION, ("h0",)),
+                    "length": Claim(length, "t", Tier.PROJECTION, ("h0",)),
+                    "origin": Claim(Point3(0.0, y0, 0.0), "t",
+                                    Tier.PROJECTION, ("h0",))})
+
+    def boss_feature(h, at):
+        return Feature(
+            id=FeatureId(1),
+            type=Claim(FeatureType.BOSS, "t", Tier.PROJECTION, ("h1",)),
+            params={"radius": Claim(37.5, "t", Tier.PROJECTION, ("h1",)),
+                    "height": Claim(h, "t", Tier.PROJECTION, ("h1",)),
+                    "axial_at": Claim(at, "t", Tier.PROJECTION, ("h1",))},
+            axis=axis_y())
+
+    def hole(fid, r, at=69.83, through=True):
+        ev = (f"h{fid}",)
+        return Feature(
+            id=FeatureId(fid),
+            type=Claim(FeatureType.HOLE, "t", Tier.PROJECTION, ev),
+            params={"radius": Claim(r, "t", Tier.PROJECTION, ev),
+                    "through": Claim(through, "t", Tier.PROJECTION, ev),
+                    "axial_at": Claim(at, "t", Tier.PROJECTION, ev)},
+            axis=axis_y(), evidence=[f"h{fid}"])
+
+    # ---- N1 基体跨度含同轴凸台 ----
+    ext = axial_extent(Part(features=[base_feature(), boss_feature(1.0, 101.83)]))
+    check("N1 基体跨度含同轴凸台：69.83..102.83（32 → 33）",
+          ext == ("y", 69.83, 102.83), str(ext))
+
+    # ---- N2 20180425 形态：Ø14 深 9 + Ø9 通 ----
+    segs = [_Cand("v", 62.37, 7.0, 57.87, 66.87, "dim:14", Tier.ANNOTATED),
+            _Cand("v", 78.37, 4.5, 66.87, 89.87, "dim:9", Tier.ANNOTATED)]
+    d = SimpleNamespace(evidence=[])
+    notes: list[str] = []
+    h7, h45 = hole(11, 7.0), hole(12, 4.5)
+    n = _bind_axis(d, SimpleNamespace(id="V2"), SimpleNamespace(notes=notes),
+                   segs, 57.87, 90.57, "y", 69.83, 102.83, [h7, h45])
+    check("N2 同向映射（近端 0.001 vs 23.7）⇒ Ø14 段绑成盲孔深 9",
+          n == 1 and h7.params["through"].value is False
+          and abs(h7.params["depth"].value - 9.0) < 0.05,
+          f"n={n} through={h7.params['through'].value} "
+          f"depth={h7.params.get('depth')}")
+    check("N2 Ø9 段量到孔口面是整幅 33（不是自己那段 23）⇒ 保持通孔",
+          h45.params["through"].value is True and "depth" not in h45.params,
+          str(h45.params))
+
+    # ---- N3 方向歧义（对称件）⇒ 不绑 ----
+    h_sym = hole(21, 7.0, at=15.0)
+    n = _bind_axis(d, SimpleNamespace(id="V9"), SimpleNamespace(notes=[]),
+                   [_Cand("v", 15.0, 7.0, 13.5, 16.5)], 0.0, 30.0,
+                   "y", 0.0, 30.0, [h_sym])
+    check("N3 同向/反向误差相同（对称件）⇒ 不绑（原则二）",
+          n == 0 and h_sym.params["through"].value is True, f"n={n}")
+
+    # ---- N4 已是盲孔的（别处定过）不覆盖 ----
+    h_done = hole(31, 7.0, through=False)
+    n = _bind_axis(d, SimpleNamespace(id="V2"), SimpleNamespace(notes=[]),
+                   segs[:1], 57.87, 90.57, "y", 69.83, 102.83, [h_done])
+    check("N4 through 已为 False（别的通道定过）⇒ 不覆盖",
+          n == 0 and "depth" not in h_done.params, f"n={n}")
+
+    # ---- N5 段长≈整幅 ⇒ 本来就是通孔，不绑 ----
+    h_thru = hole(41, 7.0, at=0.0)
+    n = _bind_axis(d, SimpleNamespace(id="V2"), SimpleNamespace(notes=[]),
+                   [_Cand("v", 15.0, 7.0, 0.5, 32.5)], 0.0, 33.0,
+                   "y", 0.0, 33.0, [h_thru])
+    check("N5 段通到对面（深度≈材料跨度）⇒ 不改通孔",
+          n == 0 and h_thru.params["through"].value is True, f"n={n}")
+
+
 # ============ 主入口 ============
 
 def main() -> int:
@@ -3101,6 +3199,7 @@ def main() -> int:
     test_section_semantics()
     test_section_bore()
     test_face_steps()
+    test_section_depth()
 
     print("\n" + "=" * 72)
     if _failed:

@@ -2,12 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-<!-- 最后同步：2026-10-26 事实复核（正文已含 v0.6.26~v0.6.48 内容；tag 仍 v0.6.25，
+<!-- 最后同步：2026-10-27 事实复核（正文已含 v0.6.26~v0.6.49 内容；tag 仍 v0.6.25，
      HEAD 落后 tag 的提交数见"版本号同步"节、流水见 CHANGELOG「发版簿记」）。本轮复核：
-     selftest 实测 534 项、OCC 验收表 9 绿逐位不变（bracket 三视图 191,978.6 /
-     剖面图 192,198.9 / PF60K 261,940.5）、YZYX 8,544,416.18、盲测 D79307/IMU 命中；
-     CHANGELOG 覆盖范围已到 v0.6.48。其余事实复核项（ruff 158 告警、根目录 `_*.py`
-     567、环境表/PyQt6 缺失/tests 空/CAD 24+27 个 .bas）沿用 2026-10-18 实测。 -->
+     selftest 实测 540 项、OCC 验收表 9 绿逐位不变（bracket 三视图 191,978.6 /
+     剖面图 192,198.9 / PF60K 261,940.5）、YZYX 8,542,952.73（v0.6.49 吸附效应 −0.017%，
+     探针 27/27）、盲测 D79307/IMU 命中；CHANGELOG 覆盖范围已到 v0.6.49。
+     其余事实复核项（ruff 158 告警、根目录 `_*.py` 567、环境表/PyQt6 缺失/tests 空/
+     CAD 24+27 个 .bas）沿用 2026-10-18 实测。 -->
 
 ## 项目概述
 
@@ -19,14 +20,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `src/core/reconstruction/` 已判定过时，**不要填它的 TODO**。
 - **生产可用 = 根目录独立脚本**（`dxf_to_3d_general.py` / `dxf_to_sw_features.py` / `model_to_drawing.py` 等）。
   `src/gui` 与 `src/core/`（除 `sw_automation`）是 GUI 骨架，且三个环境均无 PyQt6，`python main.py` 起不来。
-- **改动后必跑**：`python -m src.rebuild.selftest`（534 项）→ `$PY run_rebuild_acceptance.py`（OCC 表 9 绿）
+- **改动后必跑**：`python -m src.rebuild.selftest`（540 项）→ `$PY run_rebuild_acceptance.py`（OCC 表 9 绿）
   → 涉 SW 发射再加 `--sw` 表；无基准靶子跑 `$PY yz_accept.py`。`$PY` 定义见下方命令区。
 - **当前主线**：内部结构通道已落地（v0.6.45 剖视三刀 + v0.6.46 剖面材料通道——20180425
   气缸前盖 A—A 读出 10 段阶梯孔/交叉孔）；v0.6.47 补上**孔口切穿**（`_open_ends`）
   与**锥孔**（`_taper_of` + MakeCone）；v0.6.48 **端面台阶裁决**（`features/face_steps.py`：
   基体深度由剖面材料定 33→32、Ø70×1 沉台 / Ø75×1 凸台），A—A 多料 521→221（99×172）、
   IoU **0.9694**；同刀修掉一类发射器**静默错误**——近共面 Fuse 静默丢整块材料
-  （`_fuse` 体积护栏 + fuzzy 复算）。下一步：20180425 残余多料里**无圆边界作证**的
+  （`_fuse` 体积护栏 + fuzzy 复算）。v0.6.49 **展开剖孔深通道**
+  （`features/section_bore.bind_section_depths`：B—B 展开剖的 u 轴不对应模型轴 ⇒
+  视图系扫材料 + 孔口面方向投票 ⇒ 6 个 Ø14 由通孔改盲孔深 9，A—A 多料 224/缺 2、
+  IoU **0.9701**）+ 剖面孔口薄膜修复（`_snap_ends`/`_bridge_cones`）+ 发射器
+  **破相切**（`CUT_BREAK_GAP`：刀端落在已空的邻腔上时外扩，防 OCC 相切处 Cut
+  静默不切/填实）。下一步：20180425 残余多料里**无圆边界作证**的
   端面凹面（图纸底部左侧 1mm 深），以及特征角色剩余项（槽 vs 凸台）。优先级以
   `docs/GENERALIZATION_20261017.md` 为准，不以 YZYX 的 HLR 分数为准。
 - **验收判据**：体积吻合不算过——必须实际生成模型，并用视觉链（`_render_dxf.py` / `_make_viewer.py` /
@@ -363,7 +369,7 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 99.5%+ 时局部可见缺陷仍零命中（bracket 三缺陷、YZYX 五处标记全靠目视）——
 历史缺陷已转成自动断言，**每次修复的例行检查序列**：
 
-1. `python -m src.rebuild.selftest` — 534 项
+1. `python -m src.rebuild.selftest` — 540 项
 2. `PYTHONIOENCODING=utf-8 $PY run_rebuild_acceptance.py` — 9 绿 + 体积/bbox
    阈值判红（0.5%/1mm，仅 expect=="ok"）+ bracket 缺陷盒·点断言（PROBES 表：
    三缺陷盒 + 凸台右弧两盒 + 3 点分类；gold/shift 2026-10-11 定标实测，
@@ -402,12 +408,12 @@ resources/styles/ (QSS 主题：light_theme.qss / dark_theme.qss)
 
 ## 项目当前状态
 
-版本 v0.6.25（git tag 为准；**正文内容已写到 v0.6.48 但未收口**——tag 落后的
+版本 v0.6.25（git tag 为准；**正文内容已写到 v0.6.49 但未收口**——tag 落后的
 提交数以 `git rev-list --count v0.6.25..HEAD` 为准，见"版本号同步"节）。
 版本字面量共 9 处（`src/app.py:15` / `src/gui/main_window.py:28` / 同文件 `:535` /
 `dxf_to_3d_general.py:2,9789` / `dxf_to_sw_features.py:2,965,1032` / `README.md:89`），
 均仍为 0.6.25。
-**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.48）——
+**逐版本根因叙事已迁至 `docs/CHANGELOG.md`**（v0.5.4~v0.6.49）——
 本节只留仍在影响决策的部分。
 
 **通用性现状（P0，2026-10-17 首跑）**：held-out 盲测 7 用例 **0/7 命中**——4 个被
@@ -769,14 +775,31 @@ B-rep，体积偏仍是"尺寸对、内容错"。回归：OCC 表 9 绿逐位不
 评分逐位不变：TL 97/缺56多63、BL 160/缺150多116、TR 179/缺47多64）、
 selftest 472→**477**（J8 五条：合成跨缝弧的 ea≥sa 契约与跨度上限、
 D79307-剖面基体无伪弧 + 4 条 <0.1mm 微弧仍在）。
-**内部结构识别（v0.6.45~v0.6.48）**：v0.6.45 剖视三刀 + v0.6.46 剖面材料通道
+**内部结构识别（v0.6.45~v0.6.49）**：v0.6.45 剖视三刀 + v0.6.46 剖面材料通道
 `features/section_bore.py`（剖面 HATCH 空腔 → 恒定区间段 → 直径标注三点几何/
 同轴链证据 → HOLE，20180425 A—A 读出 10 段）；v0.6.47 孔口切穿 `_open_ends` +
 锥孔 `_taper_of`；**v0.6.48 端面台阶裁决 `features/face_steps.py`**（基体深度由
 剖面材料定 33→32、Ø70×1 沉台 / Ø75×1 凸台），A—A 多料 521→221（99×172）、
 IoU 0.9323→**0.9694**，体积 419,736.59→407,323.90。同刀修掉发射器**近共面 Fuse
 静默丢整块材料**（`_fuse` 体积护栏 + fuzzy 1e-6/1e-5 复算）。
-**下一堵墙 = 无圆边界作证的端面结构**——20180425 残余 221 格多料里约一半是
+**v0.6.49 展开剖孔深通道**（`bind_section_depths`，用户标记的 6 处「Ø14 深 9 +
+Ø9」）：B—B/C—C 是展开剖——u 轴是沿弯折剖切线的展开长度、不对应任何模型轴 ⇒
+`corr.frames` 里没有它 ⇒ `section_bores` 整条跳过。对策 = 恒等 ViewFrame 在
+**视图系**扫材料（材料分割对平移不变）+ 只认与基体轴向跨度对得上的轴（V2 的
+v=32.70 ✓、u=59.08 ✗；V3 两轴皆 ✗）+ 方向投票（各段近端到既有孔口面
+`axial_at` 的距离，Ø14 段 0.001 vs 反向 23.70；比值 <3 即歧义不绑）+ **深度
+从孔口面量到该段远端**（Ø9 段长只 23，量到孔口面是 32 = 整幅 ⇒ 保持通孔；
+按段长会把 Ø9 误判盲孔深 23）。只改既有 `through=True` 孔的 `depth/through`，
+不新建（展开剖的轴线位置无证据）。6 个 Ø14 全改 `section:depth_profile` 盲孔
+深 8.9999999…，Ø9 保持通孔；发射后沿 y 扫三条偏心线实锤（轴心全程空、
+r=5.5/6.5 处 y 78.9..101.8 有料）。同版修剖面孔口**薄膜**（`_snap_ends` 端点
+吸附壁线精确端点 + `_bridge_cones` 锥过渡补段）与发射器**破相切**
+（`CUT_BREAK_GAP=0.1` + `_break_tangency`：刀端外侧**已空**时才外扩——z 向
+Ø7 竖孔上端恰在 Ø40 横孔最低母线，OCC 在相切处 `IsDone()=True`/BRepCheck 有效
+却整段不切还把邻腔填实；端点外侧是材料就不动，盲孔底/腔底按读数）。
+A—A **多料 224 / 缺料 2 / IoU 0.9701**（薄膜修复前 487/2/0.9373；v0.6.48
+基线 221/9/0.9694——9 处缺料同刀转好）；selftest 534→**540**（N 组六条）。
+**下一堵墙 = 无圆边界作证的端面结构**——20180425 残余 224 格多料里约一半是
 图纸底部左侧 y≈70..71 的 1mm 凹面（剖面材料有、无半径候选 ⇒ 按 §3 原则二不建），
 其余是孔口边界量化与角部小数格；特征角色剩余项"槽 vs 凸台"未动。
 D79307 / IMU 两个静默错误已在 HEAD 转命中（盲测现为 **3/7 命中**：D79307 −0.01% /
@@ -819,7 +842,7 @@ step=|sldprt=|sw=|force=)`；v0.6.41 起含**发射后自检** `extent_questions
 ```bash
 python -m src.rebuild.inspect <dxf> [--json|--texts|--dims|--views|--explain HANDLE]
 python -m src.rebuild.rebuild <dxf> [--step PATH] [--sldprt PATH|--sw] [--force] [--json]  # 端到端 CLI
-python -m src.rebuild.selftest       # 534 项自检（2026-10-26 v0.6.48 后实测），退出码 0 = 全过（项目无 pytest）
+python -m src.rebuild.selftest       # 540 项自检（2026-10-27 v0.6.49 后实测），退出码 0 = 全过（项目无 pytest）
 # 拿图纸判一个 STEP（阶段 0 验收入口，**需 cad-occt**；退出码 0/1/2/3 = ACCEPT/REJECT/需确认/出错）
 PY=/c/Users/yaoshuo/miniconda3/envs/cad-occt/python.exe
 PYTHONIOENCODING=utf-8 $PY -m src.rebuild.verify_legacy <图纸.dxf> <模型.step> [--json]
@@ -975,8 +998,8 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   惯例：内容按 `v0.6.x:` 前缀提交即可，**tag 只在发版收口时打**——发版 =
   bump 上述全部字符串 + tag 打在收口提交上（2026-10-02 曾"先提交、后收口"致
   tag 落后 HEAD 16 个提交，此后 v0.6.21~v0.6.25 各清一次账）。
-  **当前欠账（截至 v0.6.48，2026-10-26 核对）**：tag 仍 `v0.6.25`，
-  HEAD 已含 v0.6.26~v0.6.48 内容，9 处字面量仍 0.6.25；**实时提交数以
+  **当前欠账（截至 v0.6.49，2026-10-27 核对）**：tag 仍 `v0.6.25`，
+  HEAD 已含 v0.6.26~v0.6.49 内容，9 处字面量仍 0.6.25；**实时提交数以
   `git rev-list --count v0.6.25..HEAD` 输出为准**（v0.6.48 提交后为 30）。
   逐版本内容见 `docs/CHANGELOG.md` 各节；**收口流水账已移至该文件「发版簿记」节，
   本文件不再逐条记录**——此前逐日追加的写法是文档漂移的主要来源。

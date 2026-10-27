@@ -127,6 +127,20 @@ OPEN_MAX_GAP = 3.0
 OPEN_FRAC = 0.1
 #: 开口端向外多切的余量（切穿表面，不正好贴面）
 OPEN_MARGIN = 0.05
+#: 孔端吸附容差：栅格端点 = 空腔首末格 ± GRID/2（±0.15），叠上材料图在边界
+#: 格的判定，实测 0.13~0.49（20180425 的 Ø7 孔端读成 152.31 对图纸 152.20；
+#: Ø7 与 Ø10.7 之间 1.11 长的锥腔被读成 0.30 的平台阶 —— 孔里的一片薄膜）
+END_SNAP_TOL = 2.0 * GRID
+#: 壁线判据：沿轴走向的直线，另一坐标的端点差上限
+WALL_LINE_TOL = 0.01
+#: 壁线到段边界的距离容差。栅格读出的 center/half 各带 ±GRID/2 ⇒ 端点位置
+#: 最多偏 GRID（0.3）；取 1.5 倍余量。再大就会把对面的壁也认进来（最小孔的
+#: 两壁相距 2×MIN_HALF = 1.2）
+WALL_MATCH_TOL = 1.5 * GRID
+#: 锥面斜线端点与「段边界 ± 半宽」的匹配容差（center/half 的量化误差叠加）
+CONE_LINE_TOL = 0.6
+#: 相邻两段之间的最小间隙（更小是同一段的栅格裂缝，不是锥腔）
+MIN_GAP = 0.02
 #: 锥孔判据：段两端的半宽差下限（细化扫描仍有 GRID/6 步长噪声，留余量）。
 #: 实测 A—A 顶部锥孔 Ø11.6（锥底，深 15）→ Ø12.5（顶面），半宽差 0.45
 TAPER_MIN = 0.35
@@ -175,10 +189,13 @@ def section_bores(d, corr, conv, rep, mats: dict | None = None) -> list[Feature]
             continue
         p_axis, p_pos = cut
         us, vs, mat = _scan(fr, mm, view.bbox)
-        cands = _candidates(us, vs, mat)
+        lines = _view_lines(d, view)
+        cands = [_snap_ends(c, _wall_ends(lines, c))
+                 for c in _candidates(us, vs, mat)]
         keep = [c for c in cands
                 if _wall_ok(fr, mm, c)
                 and c.half < MAX_HALF_FRAC * _span_of(c.axis, us, vs)]
+        keep += _bridge_cones(keep, lines)
         tapered: list[_Cand] = []
         for c in keep:
             tp = _taper_of(c, us, vs, mat, fr, mm)
@@ -454,6 +471,144 @@ def _wall_ok(fr, mm, c: _Cand) -> bool:
                 else:
                     hi_side += 1
     return max(lo_side, hi_side) >= WALL_FRAC * n
+
+
+# ---------------------------------------------------------------------------
+# 孔端吸附（栅格量化 → 图纸精确端点）
+# ---------------------------------------------------------------------------
+
+def _view_lines(d, view) -> list[Line2]:
+    """视图里的**可见**直线（视图系图纸坐标）。
+
+    ``_Cand`` 的 lo/hi/center 也在视图系（``_scan`` 的栅格按 ``bbox`` 铺、
+    只把点送进 ``mm()`` 时才经帧映射）⇒ 两者同一坐标系，镜像帧不需要额外
+    处理。
+    """
+    by_h = {e.handle: e for e in d.evidence}
+    out: list[Line2] = []
+    for h in view.evidence:
+        e = by_h.get(h)
+        if e is None or e.role.value != Role.VISIBLE:
+            continue
+        if isinstance(e.geom, Line2):
+            out.append(e.geom)
+    return out
+
+
+def _wall_ends(lines: list[Line2], c: _Cand) -> list[float]:
+    """落在段两侧壁上的直线，其沿轴端点（视图系精确值）。
+
+    栅格端点 = 空腔首末格 ± ``GRID/2``，叠上边界格的材料判定，实测偏
+    0.13~0.49；孔壁线的端点就是图纸坐标。壁线判据：沿轴走向（另一坐标
+    恒定，容 ``WALL_LINE_TOL``），且该坐标落在 ``center ± half`` 上
+    （容 ``WALL_MATCH_TOL`` —— 栅格读出的 center/half 各带 ±GRID/2）。
+    """
+    out: list[float] = []
+    for g in lines:
+        if c.axis == "v":                 # 段沿 v ⇒ 壁是竖线
+            if abs(g.start.x - g.end.x) > WALL_LINE_TOL:
+                continue
+            p = g.start.x
+            ends = (g.start.y, g.end.y)
+        else:
+            if abs(g.start.y - g.end.y) > WALL_LINE_TOL:
+                continue
+            p = g.start.y
+            ends = (g.start.x, g.end.x)
+        if min(abs(p - (c.center - c.half)),
+               abs(p - (c.center + c.half))) > WALL_MATCH_TOL:
+            continue
+        out.extend(ends)
+    return out
+
+
+def _snap_ends(c: _Cand, ends: list[float]) -> _Cand:
+    """把段两端吸附到 ``END_SNAP_TOL`` 内最近的壁线端点。
+
+    不吸附时的实测症状（20180425 A—A）：Ø7 孔端读成 152.31 而图纸 152.20
+    ⇒ 与 z=148.71 的 Ø7 横孔之间留 0.10 的残层；Ø7→Ø10.7 之间的锥腔被读成
+    0.30 的平台阶 ⇒ 孔里 0.30 的薄膜。吸附后两处残层归零。
+    """
+    lo, hi = c.lo, c.hi
+    near = [t for t in ends if abs(t - lo) <= END_SNAP_TOL]
+    if near:
+        lo = min(near, key=lambda t: abs(t - lo))
+    near = [t for t in ends if abs(t - hi) <= END_SNAP_TOL]
+    if near:
+        hi = min(near, key=lambda t: abs(t - hi))
+    if hi - lo < MIN_SEG or (lo == c.lo and hi == c.hi):
+        return c
+    return _Cand(c.axis, c.center, c.half, lo, hi, c.proof, c.tier, c.taper)
+
+
+def _has_line(lines: list[Line2], p1, p2, tol: float = CONE_LINE_TOL):
+    """返回两端点分别落在 p1/p2（± tol，不限方向）的直线，没有则 None。"""
+    for g in lines:
+        s, e = (g.start.x, g.start.y), (g.end.x, g.end.y)
+        for a, b in ((p1, p2), (p2, p1)):
+            if (abs(s[0] - a[0]) <= tol and abs(s[1] - a[1]) <= tol
+                    and abs(e[0] - b[0]) <= tol and abs(e[1] - b[1]) <= tol):
+                return g
+    return None
+
+
+def _bridge_cones(cands: list[_Cand], lines: list[Line2]) -> list[_Cand]:
+    """同轴相邻两段之间的**锥面**：两侧壁各有一条斜线 ⇒ 锥过渡段。
+
+    栅格把短锥腔并进台阶，两段之间留出间隙；图纸在间隙里画的是两条斜线
+    （20180425 的 Ø7→Ø10.7：z 220.569→221.680，r 3.5→5.35）。两条都找到
+    才建 —— 只有一条是倒角/局部斜线，不是整周锥面。半径直接取斜线端点的
+    实测值（栅格半宽有 ±GRID/2 量化）。
+    """
+    out: list[_Cand] = []
+    for i, a in enumerate(cands):
+        for j, b in enumerate(cands):
+            if i == j or a.axis != b.axis:
+                continue
+            if abs(a.center - b.center) > AXIS_TOL:
+                continue
+            gap = b.lo - a.hi
+            if not (MIN_GAP < gap <= TAPER_MAX):
+                continue
+            if abs(b.half - a.half) < TAPER_MIN:
+                continue
+            sides = []
+            for sgn in (-1.0, 1.0):
+                p1 = (a.center + sgn * a.half, a.hi)
+                p2 = (b.center + sgn * b.half, b.lo)
+                g = _has_line(lines, p1, p2)
+                if g is not None:
+                    sides.append(g)
+            if len(sides) < 2:
+                continue
+            # 斜线端点 → 锥的精确两端（沿轴坐标与半宽）
+            v_lo: list[float] = []
+            v_hi: list[float] = []
+            xs_lo: list[float] = []
+            xs_hi: list[float] = []
+            for g in sides:
+                for p in (g.start, g.end):
+                    t = p.y if a.axis == "v" else p.x
+                    q = p.x if a.axis == "v" else p.y
+                    if abs(t - a.hi) <= abs(t - b.lo):
+                        v_lo.append(t)
+                        xs_lo.append(q)
+                    else:
+                        v_hi.append(t)
+                        xs_hi.append(q)
+            if len(v_lo) < 2 or len(v_hi) < 2:
+                continue
+            lo, hi = sum(v_lo) / len(v_lo), sum(v_hi) / len(v_hi)
+            r_lo = (max(xs_lo) - min(xs_lo)) / 2.0
+            r_hi = (max(xs_hi) - min(xs_hi)) / 2.0
+            cen_lo = (max(xs_lo) + min(xs_lo)) / 2.0
+            cen_hi = (max(xs_hi) + min(xs_hi)) / 2.0
+            if abs(cen_lo - cen_hi) > AXIS_TOL or abs(r_lo - r_hi) < TAPER_MIN:
+                continue
+            out.append(_Cand(a.axis, (cen_lo + cen_hi) / 2.0, min(r_lo, r_hi),
+                             lo, hi, "coaxial:cone", Tier.PROJECTION,
+                             (r_lo, r_hi)))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -786,4 +941,288 @@ def _segment_evidence(d, view, c: _Cand) -> tuple[str, ...]:
     return tuple(out)
 
 
-__all__ = ["section_bores", "replace_coaxial"]
+# ---------------------------------------------------------------------------
+# 无定位剖面的深度通道（展开剖）
+# ---------------------------------------------------------------------------
+
+#: 剖面段半宽 ↔ 既有 HOLE 半径的匹配容差。标注段取的是**标注值**（`_prove`
+#: 用 dim 值钉半径），与投影读出的半径只差字面取整（Ø14 → r=7.00 对 r=6.98）。
+BIND_R = 0.4
+#: 剖面材料沿某轴的全局跨度 ↔ 基体轴向跨度的匹配容差。栅格量化 ±GRID（0.3），
+#: 端面台阶还有 1mm（凸台）—— 实测 V2 的 v 跨度 32.70 对「基体 32 + 凸台 1」。
+EXT_TOL = 1.6
+#: 「段的这一端是孔口」判据：到材料全局边界的距离上限（实测 V2 的 Ø14 开口端
+#: 落在 v=57.87 = 全局最小；远端 Ø9 到 89.87，与全局最大 90.87 差的是 1mm 凸台）
+MOUTH_TOL = 1.6
+#: 盲孔判据：段长比本轴材料跨度短至少这么多。差得少的就是通孔（展开剖里
+#: 通孔的两端都落在材料边界上），投影读成通孔本来就是对的。
+MIN_BLIND = 1.5
+
+
+def _named_axis(vec: Vector3) -> str | None:
+    """方向向量的主分量轴名（不与任何坐标轴平行 ⇒ None）。"""
+    ax = max(("x", "y", "z"), key=lambda k: abs(getattr(vec, k)))
+    return ax if abs(getattr(vec, ax)) > 0.999 else None
+
+
+def _span_of_feature(f) -> tuple[float, float] | None:
+    """特征沿自身轴的区间（模型系，按 ``origin + dir·t`` 换算）。"""
+    if f.axis is None or f.axis.value is None:
+        return None
+    o, d = f.axis.value.origin, f.axis.value.direction
+    ax = _named_axis(d)
+    if ax is None:
+        return None
+    if f.type.value == FeatureType.BASE.value:
+        t0, t1 = 0.0, float(f.params["length"].value)
+    elif f.type.value == FeatureType.BOSS.value:
+        #: `axial_at` 在契约里是可选（缺省按 0 起，见 library.OPTIONAL_PARAMS）
+        at = f.params.get("axial_at")
+        t0 = float(at.value) if at is not None else 0.0
+        t1 = t0 + float(f.params["height"].value)
+    else:
+        return None
+    p = getattr(o, ax) + getattr(d, ax) * t0
+    q = getattr(o, ax) + getattr(d, ax) * t1
+    return min(p, q), max(p, q)
+
+
+def axial_extent(part) -> tuple[str, float, float] | None:
+    """基体的拉伸轴与它沿该轴的总跨度（含向外凸出的凸台）。
+
+    基体区间复用 `recognizer._base_emit_range`（BASE 棱柱的 ``origin`` 与
+    REVOLVE 回转体两种口径都在那里收过口）；再把 BOSS 区间并进来 —— 切除
+    伸不到基体外面，凸台会（20180425 右端 Ø75×1 凸台 ⇒ 32 → 33）。剖面上
+    读到的孔深要跟这条跨度比，才判得出通/盲。
+    """
+    from .recognizer import _axis_name, _base_emit_range
+
+    base = next((f for f in part.features
+                 if f.type.value in (FeatureType.BASE.value,
+                                     FeatureType.REVOLVE.value)), None)
+    if base is None:
+        return None
+    if base.type.value == FeatureType.REVOLVE.value:
+        ax3 = base.axis.value if base.axis is not None else None
+        if ax3 is None or _axis_name(ax3.direction)[:1] not in "+−":
+            return None
+        ax = _axis_name(ax3.direction)[-1].lower()
+    else:
+        dirn = base.params.get("dir")
+        if dirn is None:
+            return None
+        ax = str(dirn.value)
+    span = _base_emit_range(base, ax)
+    if span is None:
+        return None
+    lo, hi = span
+    for f in part.features:
+        if (f.type.value != FeatureType.BOSS.value
+                or f.axis is None or f.axis.value is None
+                or _named_axis(f.axis.value.direction) != ax):
+            continue
+        sp = _span_of_feature(f)
+        if sp is not None:
+            lo, hi = min(lo, sp[0]), max(hi, sp[1])
+    return ax, lo, hi
+
+
+def _material_extent(axis: str, us, vs, mat) -> tuple[float, float]:
+    """材料沿某轴的全局跨度（该轴任一垂直列有材料即算）。"""
+    ts = us if axis == "u" else vs
+    have: list[float] = []
+    for k, t in enumerate(ts):
+        col = ([mat[k][j] for j in range(len(vs))] if axis == "u"
+               else [mat[i][k] for i in range(len(us))])
+        if any(col):
+            have.append(t)
+    return (min(have), max(have)) if have else (0.0, 0.0)
+
+
+def _hole_entry(f, ax: str) -> float:
+    """HOLE 的孔口在轴 ``ax`` 上的模型坐标（``origin + dir·axial_at``）。
+
+    ``axial_at`` 在契约里可选（缺省 0 起，与两个发射器的静默默认一致）。
+    """
+    o, d = f.axis.value.origin, f.axis.value.direction
+    at = f.params.get("axial_at")
+    return getattr(o, ax) + getattr(d, ax) * (float(at.value) if at else 0.0)
+
+
+def bind_section_depths(d, corr, conv, part, rep) -> int:
+    """无定位剖面的**深度**通道：剖面读出的孔深压过投影猜的「通孔」。
+
+    展开剖（B—B/C—C 这类沿弯折剖切线展开的剖视）**没有可用视图帧**：水平轴
+    是沿剖切线的展开长度，不对应任何模型轴 ⇒ `corr.frames` 里没有它，
+    `section_bores` 整条跳过。代价是 20180425 的「6×Ø14 深 9 + Ø9 通」被投影
+    读成 Ø14 通孔 —— 孔被钻穿，肉眼一眼可见。
+
+    但空腔沿另一条视图轴（v）的**长度与位置无关**，材料图的**整体跨度**又能
+    认出哪条轴是基体轴向（V2 的 v 跨度 32.70 ≈ 基体 32 + 凸台 1 = 33；V3 的
+    v 跨度 45.34 对不上 ⇒ 不参与）。于是：
+
+    1. 恒等帧（不平移、不翻面）扫掠 —— 材料图的分割对纯平移不变，
+       同一套 `_candidates` / `_prove` 直接可用，坐标留在视图系；
+    2. 只认**轴向对得上**的候选段（另一条轴是展开长度，不是深度）；
+    3. 段两端里落在材料全局边界上的那端是**孔口**；
+    4. 正反两种映射（v 与模型轴同向 / 反向）只有一种能把孔口对到既有 HOLE 的
+       `axial_at`（正交视图的孔口证据，另一条证据通道）——都对不上或都对得上
+       （对称件）就记账不动（原则二：歧义不提前消解）；
+    5. 半径吻合、且段长比本轴跨度短 `MIN_BLIND` 的既有**通孔**改成盲孔，
+       `depth = 段长`。展开剖只画一个代表（它穿过两个同构孔），同一批同直径
+       孔按「同阵列同构」一起改（CONVENTION）。
+
+    只**改既有孔的深度**，不新建特征：展开剖的水平轴不是模型坐标，新建一条孔
+    需要的轴线位置没有任何证据。
+    """
+    ext = axial_extent(part)
+    if ext is None or conv is None:
+        return 0
+    ax_name, ext_lo, ext_hi = ext
+    ext_len = ext_hi - ext_lo
+    if ext_len <= 0.0:
+        return 0
+    holes = [f for f in part.features
+             if f.type.value == FeatureType.HOLE.value
+             and f.axis is not None and f.axis.value is not None
+             and _named_axis(f.axis.value.direction) == ax_name
+             and bool(f.params.get("through")
+                      and f.params["through"].value)]
+    if not holes:
+        return 0
+    from ..views.correspondence import ViewFrame
+
+    n = 0
+    for view in d.views:
+        if view.type.value != ViewType.SECTION.value or view.bbox is None:
+            continue
+        if view.id in corr.frames:
+            continue                       # 有帧的剖面由 section_bores 读
+        #: 恒等帧：u/v 都不平移不翻面 —— 本通道**不需要**模型坐标，只需要
+        #: 材料图在视图系里的分割（深度是长度，平移不变）。
+        idfr = ViewFrame(view.id, ViewType.SECTION, "u", "v", "w")
+        mm = material_map(d, idfr, view.bbox)
+        if not getattr(mm, "has_hatch", False):
+            continue
+        us, vs, mat = _scan(idfr, mm, view.bbox)
+        lines = _view_lines(d, view)
+        cands = [_snap_ends(c, _wall_ends(lines, c))
+                 for c in _candidates(us, vs, mat)]
+        keep = [c for c in cands
+                if _wall_ok(idfr, mm, c)
+                and c.half < MAX_HALF_FRAC * _span_of(c.axis, us, vs)]
+        keep += _bridge_cones(keep, lines)
+        picked = _prove(keep, _dims_geom(d, conv, view, idfr), idfr)
+        for axis in ("u", "v"):
+            lo_v, hi_v = _material_extent(axis, us, vs, mat)
+            if hi_v - lo_v <= 0.0:
+                continue
+            if abs((hi_v - lo_v) - ext_len) > EXT_TOL:
+                rep.notes.append(
+                    f"剖面孔：{view.id} 的 {axis} 向材料跨度 {hi_v - lo_v:.2f} 与"
+                    f"基体轴向跨度 {ext_len:.2f} 不符 ⇒ 该轴不是孔深方向（展开剖"
+                    f"的展开长度），不参与深度绑定")
+                continue
+            segs = [c for c in picked if c.axis == axis]
+            if segs:
+                n += _bind_axis(d, view, rep, segs, lo_v, hi_v,
+                                ax_name, ext_lo, ext_hi, holes)
+    return n
+
+
+def _bind_axis(d, view, rep, segs: list[_Cand], lo_v: float, hi_v: float,
+               ax_name: str, ext_lo: float, ext_hi: float,
+               holes: list) -> int:
+    """一条轴上的全部段 ↔ 既有通孔的深度绑定（判据见 `bind_section_depths`）。
+
+    方向（v 与模型轴同向 / 反向）是**整张剖面共享**的，不能逐段各选一个 ——
+    逐段选会把「Ø14 的孔口在低端面」与「Ø9 的出口在高端面」这两种端点各配
+    一个方向，得到自相矛盾的深度。故先用「近端到孔口面的距离」投票定方向：
+    真正贴着孔口的那一段距离近乎 0（20180425 实测 0.001，另一端 0.70），
+    两种方向接近（比值 < 3）就是对称件、无证据，不绑（原则二）。
+    """
+    span = hi_v - lo_v
+    # 每段能匹配上的既有通孔（半径），半径对不上就不参与本视图
+    match: dict[int, list[_Cand]] = {}
+    for c in segs:
+        hit = [f for f in holes
+               if abs(float(f.params["radius"].value) - c.half) <= BIND_R]
+        for f in hit:
+            match.setdefault(f.id, []).append(c)
+    if not match:
+        return 0
+
+    # ---- 方向投票：对每个候选孔口面，取「各段近端到它」的最小误差 ----
+    best: tuple[float, str, float, float] | None = None    # (err, tag, v_mouth, y_open)
+    scored: list[tuple[float, str, float, float]] = []
+    for tag, flip in (("同向", False), ("反向", True)):
+        for f in holes:
+            if f.id not in match:
+                continue
+            y_open = _hole_entry(f, ax_name)
+            v_mouth = (hi_v - (y_open - ext_lo) if flip
+                       else lo_v + (y_open - ext_lo))
+            if not (lo_v - MOUTH_TOL <= v_mouth <= hi_v + MOUTH_TOL):
+                continue
+            err = min(min(abs(c.lo - v_mouth), abs(c.hi - v_mouth))
+                      for c in match[f.id])
+            if err > MOUTH_TOL:
+                continue
+            scored.append((err, tag, v_mouth, y_open))
+            if best is None or err < best[0]:
+                best = (err, tag, v_mouth, y_open)
+    if best is None:
+        rep.notes.append(
+            f"剖面孔：{view.id} 无定位剖面，读出 {len(match)} 组同直径段，但两种"
+            f"孔口映射都对不上既有通孔的孔口（{ax_name} 向）⇒ 不绑深度（原则二）")
+        return 0
+    err, tag, v_mouth, _ = best
+    rival = sorted(s[0] for s in scored if s[1] != tag)
+    if rival and rival[0] < 3.0 * max(err, 1e-6):
+        rep.notes.append(
+            f"剖面孔：{view.id} 的同向/反向孔口映射误差相近"
+            f"（{err:.2f} vs {rival[0]:.2f} mm）⇒ 正反方向分不清，不绑深度（原则二）")
+        return 0
+
+    # ---- 逐孔绑定：depth = 从孔口面量到该段远端；≈整幅的保持通孔 ----
+    n = 0
+    for f in holes:
+        if f.id not in match:
+            continue
+        cur = f.params.get("through")
+        if not (cur and cur.value):
+            continue                        # 已被别的视图/通道定过，不覆盖
+        depths = []
+        for c in match[f.id]:
+            near = c.lo if abs(c.lo - v_mouth) <= abs(c.hi - v_mouth) else c.hi
+            far = c.hi if near == c.lo else c.lo
+            depths.append(abs(far - v_mouth))
+        if max(depths) - min(depths) > 0.5:
+            rep.notes.append(
+                f"剖面孔：{view.id} 的 Ø{2 * f.params['radius'].value:g} 段给出"
+                f"不相同的深度 {['%.2f' % x for x in depths]} ⇒ 分不清哪个实例，"
+                f"不绑（原则二）")
+            continue
+        depth = sum(depths) / len(depths)
+        if depth >= span - MIN_BLIND:
+            continue                        # 段通到对面 ⇒ 就是通孔，投影读对了
+        ev: tuple = ()
+        for c in match[f.id]:
+            ev += _segment_evidence(d, view, c)
+        if not ev:
+            ev = tuple(f.evidence[:1])   # CONVENTION 级必须带证据（Claim 不变式）
+        f.params["depth"] = Claim(depth, "section:depth_profile",
+                                  Tier.CONVENTION, ev)
+        f.params["through"] = Claim(False, "section:depth_profile",
+                                    Tier.CONVENTION, ev)
+        n += 1
+        rep.notes.append(
+            f"剖面孔：{view.id} 无定位剖面（展开剖），孔深可读 —— "
+            f"Ø{2 * float(f.params['radius'].value):g} 深 {depth:.2f}"
+            f"（孔口面 v={v_mouth:.2f} 按{tag}映射 → {ax_name}="
+            f"{_hole_entry(f, ax_name):.3f}，与投影孔口一致）；"
+            f"特征 #{f.id} 由通孔改为盲孔")
+    return n
+
+
+__all__ = ["bind_section_depths", "section_bores", "replace_coaxial"]

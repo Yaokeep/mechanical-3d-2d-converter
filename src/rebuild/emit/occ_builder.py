@@ -103,8 +103,8 @@ from OCC.Core.Geom import Geom_Circle
 from OCC.Core.GeomAbs import GeomAbs_Circle, GeomAbs_Plane
 from OCC.Core.STEPControl import (STEPControl_AsIs, STEPControl_Reader,
                                   STEPControl_Writer)
-from OCC.Core.TopAbs import (TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_SHELL,
-                             TopAbs_SOLID, TopAbs_WIRE)
+from OCC.Core.TopAbs import (TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_ON,
+                             TopAbs_SHELL, TopAbs_SOLID, TopAbs_WIRE)
 from OCC.Core.TopExp import TopExp_Explorer, topexp
 from OCC.Core.TopTools import (TopTools_IndexedDataMapOfShapeListOfShape,
                                TopTools_IndexedMapOfShape)
@@ -136,6 +136,15 @@ _NEXT: dict[str, str] = {"x": "y", "y": "z", "z": "x"}
 #: 共面布尔是几何核的老坑（SW 侧直接失败）；OCC 一般能吃下，但多切 0.5mm 到空气里
 #: 没有代价，所以照 sw_builder 取同一个值。
 _EPS = 0.5
+
+#: 盲孔/盲腔刀的「破相切」余量（mm）。孔端正好落在另一腔体的切平面/相切母线上
+#: 时，OCC 的精确布尔会**静默**产出错几何（`IsDone()`=True、`BRepCheck` 判有效）：
+#: 实测 20180425 的 Ø7 竖孔顶 176.18 恰是 Ø40 横孔壁的最低母线 —— Cut 之后
+#: 5.5mm 的孔段整段没切掉，还把相邻 0.7mm 的空腔填成材料；另一条孔底 216.18
+#: 在同一位置，切完把横孔中段 20mm 全填实。端点外侧已经是**空**的（别的孔挖走
+#: 的空间，不是图纸材料）时把刀多给这点，相切随之消失；端点外侧是材料就不动 ——
+#: 盲孔底/腔底一律按读数。同 `_fuse` 的体积护栏：防的是核的静默错，不是读数。
+CUT_BREAK_GAP = 0.1
 
 #: "棱上点"定位棱的距离容差（mm）。与 `sw_builder._EDGE_TOL` 同值同量级：
 #: 宽到能容忍调用方把坐标舍到小数点后一位，又窄于任何有意义的几何间隔。
@@ -716,6 +725,32 @@ def _fuse(shape: Any, tool: Any, f: Feature, validate: bool) -> Any:
 
 def _cut(shape: Any, tool: Any, f: Feature, validate: bool) -> Any:
     return _boolean(BRepAlgoAPI_Cut(shape, tool), f, "Cut（去材料）", validate)
+
+
+def _is_empty_at(shape: Any, p: Point3) -> bool:
+    """点是否已在实体之外（零件外的空气，或别的孔挖走的空腔）。"""
+    cls = BRepClass3d_SolidClassifier(shape)
+    cls.Perform(_pnt(p), 1e-6)
+    return cls.State() not in (TopAbs_IN, TopAbs_ON)
+
+
+def _break_tangency(shape: Any, o: Point3, d: Vector3,
+                    t_lo: float, t_hi: float) -> tuple[float, float]:
+    """刀端落在相切/共面的邻腔上时向外多给 ``CUT_BREAK_GAP``（见常量注释）。
+
+    判据只看端点外侧那一点**是否已经是空的**：空了就是别的孔挖走的空间，
+    多切这点不损失图纸材料；是材料就原样返回（盲孔底的读数不许被"加长"）。
+    """
+    for to_hi in (False, True):
+        t = (t_hi + CUT_BREAK_GAP) if to_hi else (t_lo - CUT_BREAK_GAP)
+        if not _is_empty_at(shape, Point3(o.x + d.x * t, o.y + d.y * t,
+                                          o.z + d.z * t)):
+            continue
+        if to_hi:
+            t_hi += CUT_BREAK_GAP
+        else:
+            t_lo -= CUT_BREAK_GAP
+    return t_lo, t_hi
 
 
 def _add_material(shape: Any, tool: Any, f: Feature, validate: bool) -> Any:
@@ -1589,6 +1624,9 @@ def _build_hole(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
         tool = _cone(f, r, float(r_top), t_lo, t_hi, how)
         return _cut(shape, tool, f, validate), \
             f"cut 锥孔 Ø{2 * r:g}→Ø{2 * float(r_top):g} {how}"
+    # 圆柱刀：端点贴着邻腔的相切面时多切 CUT_BREAK_GAP（锥刀不加 —— 改端点会
+    # 改锥度，那是另一笔账；实测出问题的两处都是圆柱）。
+    t_lo, t_hi = _break_tangency(shape, o, d, t_lo, t_hi)
     tool = _cylinder(f, r, t_lo, t_hi, how)
     return _cut(shape, tool, f, validate), f"cut Ø{2 * r:g} {how}"
 

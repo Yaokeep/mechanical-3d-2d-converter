@@ -2210,6 +2210,16 @@ def recognize(d, corr: CorrespondenceResult, conv=None,
     derive_through(part, rep)
     # 轴向起点收口（P1-A）：通孔取零件跨度端、盲孔/凸台无依据即拦路
     bind_axial_positions(part, rep, corr)
+    # 展开剖的**孔深**通道（必须在 `derive_through` 之后：那一步才统一给每条孔
+    # 写上 `through`，此前 `params["through"]` 可能还不存在）：B—B/C—C 这类沿
+    # 弯折剖切线展开的剖视没有可用视图帧（水平轴是展开长度、不是模型轴）⇒
+    # `section_bores` 整条跳过，代价是 20180425 的「6×Ø14 深 9 + Ø9 通」被投影
+    # 读成 Ø14 通孔（孔被钻穿，肉眼一眼可见）。孔深沿另一条视图轴（v）读得出，
+    # 且只**改既有通孔的深度**、不新建 —— 展开剖的轴线位置没有证据（§3 原则二）。
+    from .section_bore import bind_section_depths
+    k = bind_section_depths(d, corr, conv, part, rep)
+    if k:
+        rep.notes.append(f"剖面孔深度：{k} 个投影通孔按展开剖读出的深度改为盲孔")
     # 求解**在层内收尾**：先验/关系/欠定兜底共用同一个待确认清单，
     # 否则调用方忘了传 qs 就会重复报（求解层去重正是靠这份清单）
     rep.solved = solve(part, qs=questions)
