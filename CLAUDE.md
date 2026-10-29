@@ -32,7 +32,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   视图系扫材料 + 孔口面方向投票 ⇒ 6 个 Ø14 由通孔改盲孔深 9，A—A 多料 224/缺 2、
   IoU **0.9701**）+ 剖面孔口薄膜修复（`_snap_ends`/`_bridge_cones`）+ 发射器
   **破相切**（`CUT_BREAK_GAP`：刀端落在已空的邻腔上时外扩，防 OCC 相切处 Cut
-  静默不切/填实）。下一步：20180425 残余多料里**无圆边界作证**的
+  静默不切/填实）。v0.6.50 **孔口楔形根治**（`_reopen_hole_mouths`：全部特征建完后
+  用最终空腔复检每个盲孔端点——孔口搭在**后切**邻腔圆柱面上时第一遍看不到空腔，
+  平端面刀留楔形，实测 #19 1.22 / #39 2.54mm；上限 1.0→3.0、外环采样 0.95r→0.999r；
+  尺寸标注锚定的孔口（`dim_span`）只做基础 0.1 防静默错，防削掉 Ø42↔Ø70 真实台阶面
+  1358.75mm³）。下一步：20180425 残余多料里**无圆边界作证**的
   端面凹面（图纸底部左侧 1mm 深），以及特征角色剩余项（槽 vs 凸台）。优先级以
   `docs/GENERALIZATION_20261017.md` 为准，不以 YZYX 的 HLR 分数为准。
 - **验收判据**：体积吻合不算过——必须实际生成模型，并用视觉链（`_render_dxf.py` / `_make_viewer.py` /
@@ -775,7 +779,7 @@ B-rep，体积偏仍是"尺寸对、内容错"。回归：OCC 表 9 绿逐位不
 评分逐位不变：TL 97/缺56多63、BL 160/缺150多116、TR 179/缺47多64）、
 selftest 472→**477**（J8 五条：合成跨缝弧的 ea≥sa 契约与跨度上限、
 D79307-剖面基体无伪弧 + 4 条 <0.1mm 微弧仍在）。
-**内部结构识别（v0.6.45~v0.6.49）**：v0.6.45 剖视三刀 + v0.6.46 剖面材料通道
+**内部结构识别（v0.6.45~v0.6.50）**：v0.6.45 剖视三刀 + v0.6.46 剖面材料通道
 `features/section_bore.py`（剖面 HATCH 空腔 → 恒定区间段 → 直径标注三点几何/
 同轴链证据 → HOLE，20180425 A—A 读出 10 段）；v0.6.47 孔口切穿 `_open_ends` +
 锥孔 `_taper_of`；**v0.6.48 端面台阶裁决 `features/face_steps.py`**（基体深度由
@@ -799,6 +803,16 @@ r=5.5/6.5 处 y 78.9..101.8 有料）。同版修剖面孔口**薄膜**（`_snap
 却整段不切还把邻腔填实；端点外侧是材料就不动，盲孔底/腔底按读数）。
 A—A **多料 224 / 缺料 2 / IoU 0.9701**（薄膜修复前 487/2/0.9373；v0.6.48
 基线 221/9/0.9694——9 处缺料同刀转好）；selftest 534→**540**（N 组六条）。
+**v0.6.50 孔口楔形根治**（用户第二批 2 处标记 +「孔和孔相交的地方都有薄膜，
+解决问题根源」）：`_mouth_gap` 抽出（`_break_tangency` 与新增的
+`_reopen_hole_mouths` 共用），`_BREAK_MAX` 1.0→**3.0**、`_DISC_RINGS` 外环
+0.95r→**0.999r**（真实刀缘处曾留 0.55mm 月牙）；**复检**在全部特征之后用
+最终空腔逐盲孔端点补切（Cut 幂等）——切割顺序让后切邻腔在第一遍不可见
+（#19 编号在 #36 之前）。新增 `_may_reopen` 门控：`axial_at` 的 method 含
+`dim_span`（图纸尺寸直接锚定）的孔口只做基础 0.1，否则无门控会误削
+#33/#34 的 Ø42↔Ø70 真实台阶面（−1358.75mm³）。20180425 体积
+419,759.44→**419,733.70**（−25.76 = 两处楔形），A—A 网格 7304/224/2/9498
+逐位持平、六孔探针不变；全模型孔口扫描只剩 #33/#34 真结构。
 **下一堵墙 = 无圆边界作证的端面结构**——20180425 残余 224 格多料里约一半是
 图纸底部左侧 y≈70..71 的 1mm 凹面（剖面材料有、无半径候选 ⇒ 按 §3 原则二不建），
 其余是孔口边界量化与角部小数格；特征角色剩余项"槽 vs 凸台"未动。
@@ -833,7 +847,9 @@ linetype 断裂/虚线/**细实线**、section 剖切种类/材料（v0.6.31 起
 实测 YZYX C—C 定性 section/scope=local、52 条尺寸 45 锚上、20/3/120 逐位吻合）、
 `features/`（recognizer + solver + library + prior + taper_scale 锥化 + **revolve 回转体（含 _cone_zone 锥区：锥台 REVOLVE + 帽切）** + **height_zones 高度分解 + roundovers 圆角 + side_channels 侧通道 + callouts 孔标注绑定（v0.6.31 起含**孔口推断** `zone:concentric_mouth`）** + **axis_revolve 轴回转族**（v0.6.34；v0.6.35 起含**剖面补扫** `axis_bore_scan` + **非剖面视图支持门**） + **side_recess 侧凹槽族六件套**（v0.6.33） + **tower_cavity 塔腔**（v0.6.35，YZYX 冠—拱壳 POCKET）+ **inner_profiles 内腔面 / openings 异形开口**（v0.6.45）+ **section_bore 剖面材料通道**（v0.6.46：剖面 HATCH 空腔 → 阶梯孔/交叉孔，标注三点几何 + 同轴链；`replace_coaxial` 取代投影猜测，`annotation:` 不动）+ **face_steps 端面台阶裁决**（v0.6.48：圆边界内外对账 + HATCH 精确层位吸附；基体深度改到主面、正跃变=沉台 HOLE、负跃变=凸台 BOSS；高度分解已降高的基体按设计跳过）+ **material** HATCH 材料判据工具箱（v0.6.48 起含 `hatch_lines` 精确层位） + **`recognizer.bind_axial_positions` 轴向起点收口**（v0.6.39 P1-A：span→axial_at / 通孔按基体材料端 / 盲孔无依据拦路 / 回转体轴向平移）+ **`_choose_extrude_dir` 基体拉伸视图选择**（v0.6.40 P1-B：最薄视图的环是纯矩形时改取非矩形度最大的视图）+ **`_outline_ring_profile` 弧旋向按映射行列式定号**（v0.6.44 P1-D：吸附顶点让微弧的弦叉积变噪声——0.013° 曾被翻成 359.987° 近整圆））、`verify/`（compare/coverage/
 gate/step_probe/box_probe）、`emit/`（occ_builder〔v0.6.48 起 `_fuse` 带**体积护栏**：
-近共面 Fuse 静默丢材料 ⇒ fuzzy 1e-6/1e-5 复算，仍败抛 `OccBuildError`〕 + sw_builder）、`report.py`、`inspect.py`、
+近共面 Fuse 静默丢材料 ⇒ fuzzy 1e-6/1e-5 复算，仍败抛 `OccBuildError`；v0.6.50 起
+`_break_tangency`/`_reopen_hole_mouths` 共用 `_mouth_gap`，孔口楔形复检 + `_may_reopen`
+尺寸门控〕 + sw_builder）、`report.py`、`inspect.py`、
 `rebuild.py`（端到端 CLI）、**`pipeline.py`（唯一入口：`pipeline.rebuild(dxf,
 step=|sldprt=|sw=|force=)`；v0.6.41 起含**发射后自检** `extent_questions` /
 `_extent_selfcheck`——模型 bbox 尺寸 vs 图纸跨度并集，超回转体包络即
@@ -998,9 +1014,9 @@ PDF/图像矢量化整条链：`convert_pdf.py`（Zhang-Suen 骨架化 PDF→DWG
   惯例：内容按 `v0.6.x:` 前缀提交即可，**tag 只在发版收口时打**——发版 =
   bump 上述全部字符串 + tag 打在收口提交上（2026-10-02 曾"先提交、后收口"致
   tag 落后 HEAD 16 个提交，此后 v0.6.21~v0.6.25 各清一次账）。
-  **当前欠账（截至 v0.6.49，2026-10-27 核对）**：tag 仍 `v0.6.25`，
-  HEAD 已含 v0.6.26~v0.6.49 内容，9 处字面量仍 0.6.25；**实时提交数以
-  `git rev-list --count v0.6.25..HEAD` 输出为准**（v0.6.48 提交后为 30）。
+  **当前欠账（截至 v0.6.50，2026-10-29 核对）**：tag 仍 `v0.6.25`，
+  HEAD 已含 v0.6.26~v0.6.50 内容，9 处字面量仍 0.6.25；**实时提交数以
+  `git rev-list --count v0.6.25..HEAD` 输出为准**（v0.6.49 提交后为 31）。
   逐版本内容见 `docs/CHANGELOG.md` 各节；**收口流水账已移至该文件「发版簿记」节，
   本文件不再逐条记录**——此前逐日追加的写法是文档漂移的主要来源。
 - **`.gitignore`**: 自动排除生成的 CAD 输出文件（`*.SLDPRT`, `*.sldprt`, `*.SLDDRW`, `*.step`, `*.stp`, `*.igs`, `*.iges`, `*.svg`, `*.log`）和 CAD 软件锁文件。`CAD/temp_output/` 下的源脚本（`generate_*.py`、验证工具）与测试样本 DXF/DWG 纳入跟踪，仅输出产物被排除。不要将输出文件加入版本控制。

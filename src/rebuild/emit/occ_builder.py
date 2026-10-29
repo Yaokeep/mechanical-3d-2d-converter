@@ -145,6 +145,24 @@ _EPS = 0.5
 #: 的空间，不是图纸材料）时把刀多给这点，相切随之消失；端点外侧是材料就不动 ——
 #: 盲孔底/腔底一律按读数。同 `_fuse` 的体积护栏：防的是核的静默错，不是读数。
 CUT_BREAK_GAP = 0.1
+#: 破相切时**逐环探测**的步长与上限（mm）。固定 `CUT_BREAK_GAP` 只够把刀挪出
+#: 共面位置；但邻腔壁是**圆柱**，刀半径 r 处邻腔表面比相切母线低
+#: ``R − √(R² − r²)``（20180425：Ø40 邻腔 × r3.44 刀 = 0.30mm），只给 0.1 会在
+#: 孔壁边缘留一圈月牙薄片（实测 215.96..216.08 / 176.30..176.40，用户 3D 里
+#: 看得见）。故外扩按「**刀端圆盘整体落进空腔**」判据逐级加，直到满足或到上限；
+#: 到上限仍不满足则保持原值 —— 那是"刀端贴着别的腔壁但不该穿过去"，不赌。
+#: 上限 3.0 的来历：孔口搭在**同行径邻腔**（圆柱面）上时，圆盘要退到
+#: ``R − √(R² − r²)`` 以外才算全空 —— 刀半径≈邻腔半径时该值可达 ~r
+#: （20180425 #39 r3.42 搭 #35 r3.5 需 2.72；#19 r3.5 搭 #36 r5.35 需 1.30）。
+#: 判据本身是安全的：全空意味着刀端整体落在别的孔已挖走的空腔里，伸进去
+#: 不切任何材料；圆盘比空腔大时（YZYX 窄槽）永远不达标、退回基础值。
+_BREAK_STEP = 0.05
+_BREAK_MAX = 3.0
+#: 端面圆盘采样环 ``(半径系数, 点数)``。最外环取 0.999 而不是 0.95：孔口楔形
+#: 沿半径单调增厚，只采到 0.95r 会在真实刀缘（r 处）留下 ``0.05r`` 宽的月牙
+#: （#39 实测 0.55mm），用户 3D 里仍看得见。0.999 距刀缘仅 0.003mm，远大于
+#: 分类器容差（1e-6），既采到边缘又不落到"刀缘正好贴着材料表面"的退化点上。
+_DISC_RINGS = ((0.0, 1), (0.5, 8), (0.95, 16), (0.999, 24))
 
 #: "棱上点"定位棱的距离容差（mm）。与 `sw_builder._EDGE_TOL` 同值同量级：
 #: 宽到能容忍调用方把坐标舍到小数点后一位，又窄于任何有意义的几何间隔。
@@ -734,23 +752,144 @@ def _is_empty_at(shape: Any, p: Point3) -> bool:
     return cls.State() not in (TopAbs_IN, TopAbs_ON)
 
 
-def _break_tangency(shape: Any, o: Point3, d: Vector3,
-                    t_lo: float, t_hi: float) -> tuple[float, float]:
-    """刀端落在相切/共面的邻腔上时向外多给 ``CUT_BREAK_GAP``（见常量注释）。
+def _may_reopen(f: Feature) -> bool:
+    """该孔的孔口是否允许**超过基础值**的深度外扩（防薄膜）。
 
-    判据只看端点外侧那一点**是否已经是空的**：空了就是别的孔挖走的空间，
-    多切这点不损失图纸材料；是材料就原样返回（盲孔底的读数不许被"加长"）。
+    图纸用尺寸直接锚定了跨度的孔（`axial_at` 的 method 含 ``dim_span``）不参与：
+    那种孔口是剖面上画实的台阶面——20180425 #33（Ø42 深 4.8）/ #34（Ø40 深 10）
+    的孔口分别压在 Ø70 沉台的边缘与 Ø36 段的孔底上，圆盘要到 2.55 / 1.70mm 外
+    （Ø70 沉台里）才"整体落进空腔"，外扩会把 Ø42↔Ø70 之间真实的环形台阶面
+    削掉（实测 1358mm³）。
+
+    推断出来的跨度没有独立尺寸佐证，孔口可能只是**搭在邻腔圆柱面上**：
+    #19（Ø7，`projection:outline_pair_span`）孔口搭在 #36 圆柱面、#39
+    （Ø6.8，`coaxial_span`）孔口搭在 #35 圆柱面 —— 那种情况圆盘外扩才是修复
+    （楔形最厚 1.22 / 2.54mm，用户 3D 里看得见）。
+
+    基础值的 0.1 不受此门控：它防的是 OCC 相切处的**静默错**（Cut 报成功却
+    整段不切还把邻腔填实，v0.6.49 实测）。
     """
-    for to_hi in (False, True):
-        t = (t_hi + CUT_BREAK_GAP) if to_hi else (t_lo - CUT_BREAK_GAP)
-        if not _is_empty_at(shape, Point3(o.x + d.x * t, o.y + d.y * t,
-                                          o.z + d.z * t)):
-            continue
-        if to_hi:
-            t_hi += CUT_BREAK_GAP
-        else:
-            t_lo -= CUT_BREAK_GAP
+    c = f.params.get("axial_at")
+    return "dim_span" not in ((c.method if c is not None else "") or "")
+
+
+def _mouth_gap(cls: Any, o: Point3, d: Vector3, t0: float, sign: float,
+               r: float, deep: bool = True) -> float | None:
+    """端点 ``t0`` 沿 ``sign`` 方向要外扩多少，刀端**整张圆盘**才落进空腔。
+
+    返回 ``None`` = 不触发：端点外侧 ``CUT_BREAK_GAP`` 处是**材料**（盲孔底 /
+    腔底，读数就是读数，不许"加长"）。返回 ``CUT_BREAK_GAP`` = 触发了但到
+    ``_BREAK_MAX`` 圆盘仍不能整体落进空腔（刀端贴窄槽；外扩本身仍要打破相切，
+    全空不可达是常态）。返回更大的值 = 圆盘在那一深度整体在实体外。
+
+    ``deep=False`` 时上限压到基础值：只打破相切，不做深度外扩（见
+    ``_may_reopen``——尺寸锚定的孔口是图上的台阶面，不是薄膜）。
+
+    判据是安全的：全空意味着刀端整体落在别的孔已挖走的空腔里，刀往那伸不切
+    任何材料（穿过的只是孔口楔形本身——那正是要切掉的）。
+    """
+    e1 = _perp(d)
+    e2 = d.normalized().cross(e1)
+
+    def empty_at(t: float, a: float, b: float) -> bool:
+        """轴坐标 t + 面内偏移 (a,b) 处是否在实体外。"""
+        cls.Perform(_pnt(Point3(o.x + d.x * t + e1.x * a + e2.x * b,
+                                o.y + d.y * t + e1.y * a + e2.y * b,
+                                o.z + d.z * t + e1.z * a + e2.z * b)), 1e-6)
+        return cls.State() not in (TopAbs_IN, TopAbs_ON)
+
+    def disc_empty(t: float) -> bool:
+        """半径 r 的端面圆盘是否整体在实体外（采样环见 ``_DISC_RINGS``）。"""
+        for ring, n in _DISC_RINGS:
+            for k in range(n):
+                ang = 2.0 * math.pi * k / n
+                if not empty_at(t, math.cos(ang) * ring * r,
+                                math.sin(ang) * ring * r):
+                    return False
+        return True
+
+    if not empty_at(t0 + sign * CUT_BREAK_GAP, 0.0, 0.0):
+        return None                               # 端面外侧是材料 ⇒ 盲孔底，不动
+    # 基础外扩恒为 CUT_BREAK_GAP（v0.6.49 的取值，YZYX 实测有效：TL 多 63→43）。
+    # 只有"圆盘能整体穿出邻腔"时才继续加——那是 20180425 的圆柱邻腔场景，
+    # 0.1 会在孔壁边缘留月牙。到上限仍不全空 ⇒ **退回基础值**，不是不外扩：
+    # 圆盘比邻腔大时（刀端贴窄槽），外扩本身仍要打破相切，全空不可达是常态。
+    if not deep:
+        return CUT_BREAK_GAP
+    limit = _BREAK_MAX
+    gap = CUT_BREAK_GAP
+    while not disc_empty(t0 + sign * gap) and gap + _BREAK_STEP <= limit + 1e-12:
+        gap += _BREAK_STEP
+    if not disc_empty(t0 + sign * gap):
+        gap = CUT_BREAK_GAP
+    return gap
+
+
+def _break_tangency(shape: Any, o: Point3, d: Vector3,
+                    t_lo: float, t_hi: float, r: float,
+                    deep: bool = True) -> tuple[float, float]:
+    """刀端落在相切/共面的邻腔上时向外扩，直到**整张端面圆盘都落进空腔**。
+
+    触发判据不变：端点外侧 ``CUT_BREAK_GAP`` 处**已经是空的**（别的孔挖走的
+    空间，不是图纸材料）才动；是材料就原样返回（盲孔底的读数不许被"加长"）。
+    探测细节见 ``_mouth_gap``；``deep=False`` 时只做基础外扩（尺寸锚定的孔口，
+    见 ``_may_reopen``）。
+
+    ⚠️ 这里只能看到**已经切过**的孔挖出的空腔。切割顺序靠后的邻腔此刻还不
+    存在（20180425 #19 孔口搭在 #36 上，而 #19 先切）——那种孔口楔形由
+    ``_reopen_hole_mouths`` 在全部特征建完后补切。
+    """
+    cls = BRepClass3d_SolidClassifier(shape)     # 逐环探测要查上千点，复用分类器
+    g = _mouth_gap(cls, o, d, t_lo, -1.0, r, deep)
+    if g is not None:
+        t_lo -= g
+    g = _mouth_gap(cls, o, d, t_hi, 1.0, r, deep)
+    if g is not None:
+        t_hi += g
     return t_lo, t_hi
+
+
+def _reopen_hole_mouths(shape: Any, order: list[Feature],
+                        validate: bool) -> tuple[Any, int]:
+    """孔口复检：全部特征建完后，用**最终空腔**重新问一遍每个盲孔端点。
+
+    孔口楔形的另一半根源是**切割顺序**：孔端搭在后切的邻腔圆柱面上时，切它
+    那一刻邻腔还不存在，`_break_tangency` 的触发判据（端点外侧已是空）不成立，
+    平端面刀就在孔口边缘留下一圈随半径增厚的楔形——20180425 #19（r3.5 沿 y）
+    孔口搭在 #36（r5.35 沿 z）圆柱面上，残留最厚 1.22mm；#39 搭在 #35 上最厚
+    2.54mm。全部切除完成后空腔才是最终状态，此时逐端点重算「圆盘何时整体落进
+    空腔」，比基础值深就补切延伸段——Cut 幂等，与已切区域重叠不会多切。
+
+    只处理**圆柱盲孔**：通孔的端点由 `_axial_max` 按当时的材料定（复检时材料
+    已被切走，重算会漂）；锥孔改端点会改锥度，那是另一笔账。尺寸直接锚定
+    跨度的孔口也不动（见 ``_may_reopen``）。
+    """
+    cls = BRepClass3d_SolidClassifier(shape)
+    n = 0
+    for f in order:
+        if FeatureType(f.type.value) != FeatureType.HOLE:
+            continue
+        if bool(_param(f, "through")):
+            continue
+        if _opt(f, "radius_top", None) is not None:
+            continue
+        if not _may_reopen(f):
+            continue
+        r = float(_param(f, "radius"))
+        t0 = _axial_at(f)
+        t_hi = t0 + float(_param(f, "depth"))
+        o, d = _axis_of(f)
+        for sign, t in ((-1.0, t0), (1.0, t_hi)):
+            gap = _mouth_gap(cls, o, d, t, sign, r)
+            if gap is None or gap <= CUT_BREAK_GAP + 1e-9:
+                continue
+            lo, hi = (t - gap, t) if sign < 0 else (t, t + gap)
+            shape = _cut(shape, _cylinder(f, r, lo, hi, "孔口复检"), f, validate)
+            cls = BRepClass3d_SolidClassifier(shape)
+            n += 1
+            print(f"  [孔口] #{f.id:<3} 端点 {t:g} 外扩 {gap:.2f}"
+                  f"（刀端圆盘整体落进邻腔）")
+    return shape, n
 
 
 def _add_material(shape: Any, tool: Any, f: Feature, validate: bool) -> Any:
@@ -1624,9 +1763,9 @@ def _build_hole(shape: Any, f: Feature, validate: bool) -> tuple[Any, str]:
         tool = _cone(f, r, float(r_top), t_lo, t_hi, how)
         return _cut(shape, tool, f, validate), \
             f"cut 锥孔 Ø{2 * r:g}→Ø{2 * float(r_top):g} {how}"
-    # 圆柱刀：端点贴着邻腔的相切面时多切 CUT_BREAK_GAP（锥刀不加 —— 改端点会
-    # 改锥度，那是另一笔账；实测出问题的两处都是圆柱）。
-    t_lo, t_hi = _break_tangency(shape, o, d, t_lo, t_hi)
+    # 圆柱刀：端点贴着邻腔的相切面时外扩到端面圆盘整体落进空腔（锥刀不加 ——
+    # 改端点会改锥度，那是另一笔账；实测出问题的两处都是圆柱）。
+    t_lo, t_hi = _break_tangency(shape, o, d, t_lo, t_hi, r, _may_reopen(f))
     tool = _cylinder(f, r, t_lo, t_hi, how)
     return _cut(shape, tool, f, validate), f"cut Ø{2 * r:g} {how}"
 
@@ -2202,6 +2341,13 @@ def build_shape(part: Part, *, validate: bool = True,
                 pass
     if shape is None:
         raise OccBuildError("建模结束但没有任何实体")
+    # 孔口复检：修补"孔口搭在后切邻腔上"留下的楔形（切割顺序使第一遍看不到
+    # 那个空腔）。放在全部特征之后、清洁之前——此处空腔才是最终状态。
+    if os.environ.get("REBUILD_NO_HOLE_REOPEN", "").strip().lower() not in ("1", "true", "yes"):
+        shape, _reopened = _reopen_hole_mouths(shape, order, validate)
+        if _reopened:
+            print(f"  [孔口] 复检补切 {_reopened} 处孔口楔形"
+                  f"（后切邻腔在第一遍不可见；REBUILD_NO_HOLE_REOPEN=1 可关）")
     if os.environ.get("REBUILD_NO_PRUNE", "").strip().lower() not in ("1", "true", "yes"):
         shape, pruned = _prune_dangling_faces(shape)
         if pruned:
